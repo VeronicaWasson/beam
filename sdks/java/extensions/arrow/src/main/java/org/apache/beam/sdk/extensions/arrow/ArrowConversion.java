@@ -17,7 +17,7 @@
  */
 package org.apache.beam.sdk.extensions.arrow;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -38,7 +38,6 @@ import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.util.Text;
-import org.apache.beam.sdk.annotations.Experimental;
 import org.apache.beam.sdk.schemas.CachingFactory;
 import org.apache.beam.sdk.schemas.Factory;
 import org.apache.beam.sdk.schemas.FieldValueGetter;
@@ -47,6 +46,7 @@ import org.apache.beam.sdk.schemas.Schema.Field;
 import org.apache.beam.sdk.schemas.Schema.FieldType;
 import org.apache.beam.sdk.schemas.logicaltypes.FixedBytes;
 import org.apache.beam.sdk.values.Row;
+import org.apache.beam.sdk.values.TypeDescriptor;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
 
@@ -54,7 +54,6 @@ import org.joda.time.DateTimeZone;
  * Utilities to create {@link Iterable}s of Beam {@link Row} instances backed by Arrow record
  * batches.
  */
-@Experimental(Experimental.Kind.SCHEMAS)
 public class ArrowConversion {
 
   /** Get Beam Field from Arrow Field. */
@@ -277,11 +276,11 @@ public class ArrowConversion {
         new ArrowValueConverterVisitor();
     private final Schema schema;
     private final VectorSchemaRoot vectorSchemaRoot;
-    private final Factory<List<FieldValueGetter>> fieldValueGetters;
+    private final Factory<List<FieldValueGetter<Integer, Object>>> fieldValueGetters;
     private Integer currRowIndex;
 
     private static class FieldVectorListValueGetterFactory
-        implements Factory<List<FieldValueGetter>> {
+        implements Factory<List<FieldValueGetter<Integer, Object>>> {
       private final List<FieldVector> fieldVectors;
 
       static FieldVectorListValueGetterFactory of(List<FieldVector> fieldVectors) {
@@ -293,7 +292,8 @@ public class ArrowConversion {
       }
 
       @Override
-      public List<FieldValueGetter> create(Class<?> clazz, Schema schema) {
+      public List<FieldValueGetter<Integer, Object>> create(
+          TypeDescriptor<?> typeDescriptor, Schema schema) {
         return this.fieldVectors.stream()
             .map(
                 (fieldVector) -> {

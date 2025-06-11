@@ -18,7 +18,7 @@
 package org.apache.beam.sdk.io.snowflake;
 
 import static org.apache.beam.sdk.io.TextIO.readFiles;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import com.google.auto.value.AutoValue;
 import com.opencsv.CSVParser;
@@ -39,7 +39,6 @@ import javax.sql.DataSource;
 import net.snowflake.client.jdbc.SnowflakeBasicDataSource;
 import net.snowflake.ingest.SimpleIngestManager;
 import net.snowflake.ingest.connection.HistoryResponse;
-import org.apache.beam.sdk.annotations.Experimental;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.ListCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
@@ -84,9 +83,9 @@ import org.apache.beam.sdk.transforms.windowing.Window;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PDone;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Joiner;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Splitter;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Joiner;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Splitter;
 import org.joda.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -174,7 +173,6 @@ import org.slf4j.LoggerFactory;
  * <p><b>Important</b> When writing data to Snowflake, firstly data will be saved as CSV files on
  * specified stagingBucketName in directory named 'data' and then into Snowflake.
  */
-@Experimental
 @SuppressWarnings({
   "nullness" // TODO(https://github.com/apache/beam/issues/20497)
 })
@@ -1081,13 +1079,17 @@ public class SnowflakeIO {
                   ParDo.of(new MapObjectsArrayToCsvFn(getQuotationMark())))
               .setCoder(StringUtf8Coder.of());
 
+      String filePrefix = getFileNameTemplate();
+      if (filePrefix == null) {
+        filePrefix = UUID.randomUUID().toString().subSequence(0, 8).toString();
+      }
       WriteFilesResult<Void> filesResult =
           mappedUserData.apply(
               "Write files to specified location",
               FileIO.<String>write()
                   .via(TextIO.sink())
                   .to(stagingBucketDir)
-                  .withPrefix(UUID.randomUUID().toString().subSequence(0, 8).toString())
+                  .withPrefix(filePrefix)
                   .withSuffix(".csv")
                   .withNumShards(numShards)
                   .withCompression(Compression.GZIP));
@@ -1174,8 +1176,11 @@ public class SnowflakeIO {
       for (Object o : context.element()) {
         if (o instanceof String) {
           String field = (String) o;
-          field = field.replace("'", "''");
-          field = quoteField(field);
+          field = field.replace("\\", "\\\\");
+          if (!this.quotationMark.isEmpty()) {
+            field = field.replace(this.quotationMark, "\\" + this.quotationMark);
+          }
+          field = quoteNonEmptyField(field);
 
           csvItems.add(field);
         } else {
@@ -1185,12 +1190,18 @@ public class SnowflakeIO {
       context.output(Joiner.on(",").useForNull("").join(csvItems));
     }
 
-    private String quoteField(String field) {
-      return quoteField(field, this.quotationMark);
+    private String quoteNonEmptyField(String field) {
+      return quoteNonEmptyField(field, this.quotationMark);
     }
 
-    private String quoteField(String field, String quotation) {
-      return String.format("%s%s%s", quotation, field, quotation);
+    private String quoteNonEmptyField(String field, String quotation) {
+      String quoted;
+      if (field.isEmpty()) {
+        quoted = field;
+      } else {
+        quoted = String.format("%s%s%s", quotation, field, quotation);
+      }
+      return quoted;
     }
   }
 

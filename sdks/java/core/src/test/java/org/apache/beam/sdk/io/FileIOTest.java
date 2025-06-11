@@ -18,7 +18,7 @@
 package org.apache.beam.sdk.io;
 
 import static org.apache.beam.sdk.io.fs.ResolveOptions.StandardResolveOptions.RESOLVE_FILE;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.MoreObjects.firstNonNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.MoreObjects.firstNonNull;
 import static org.hamcrest.Matchers.isA;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -31,6 +31,7 @@ import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.Serializable;
 import java.io.Writer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.CopyOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -69,13 +70,13 @@ import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TypeDescriptor;
 import org.apache.beam.sdk.values.TypeDescriptors;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Charsets;
 import org.joda.time.Duration;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 import org.junit.rules.ExpectedException;
 import org.junit.rules.TemporaryFolder;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
@@ -87,6 +88,8 @@ public class FileIOTest implements Serializable {
   @Rule public transient TemporaryFolder tmpFolder = new TemporaryFolder();
 
   @Rule public transient ExpectedException thrown = ExpectedException.none();
+
+  @Rule public transient Timeout globalTimeout = Timeout.seconds(1200);
 
   @Test
   @Category(NeedsRunner.class)
@@ -365,10 +368,10 @@ public class FileIOTest implements Serializable {
   public void testRead() throws IOException {
     final String path = tmpFolder.newFile("file").getAbsolutePath();
     final String pathGZ = tmpFolder.newFile("file.gz").getAbsolutePath();
-    Files.write(new File(path).toPath(), "Hello world".getBytes(Charsets.UTF_8));
+    Files.write(new File(path).toPath(), "Hello world".getBytes(StandardCharsets.UTF_8));
     try (Writer writer =
         new OutputStreamWriter(
-            new GZIPOutputStream(new FileOutputStream(pathGZ)), Charsets.UTF_8)) {
+            new GZIPOutputStream(new FileOutputStream(pathGZ)), StandardCharsets.UTF_8)) {
       writer.write("Hello world");
     }
 
@@ -451,7 +454,7 @@ public class FileIOTest implements Serializable {
 
   @Test
   public void testFilenameFnResolution() throws Exception {
-    FileIO.Write.FileNaming foo = (window, pane, numShards, shardIndex, compression) -> "foo";
+    FileIO.Write.FileNaming foo = (window, paneInfo, numShards, shardIndex, compression) -> "foo";
 
     String expected =
         FileSystems.matchNewResource("test", true).resolve("foo", RESOLVE_FILE).toString();
@@ -523,7 +526,7 @@ public class FileIOTest implements Serializable {
 
     Contextful.Fn<String, FileIO.Write.FileNaming> fileNaming =
         (element, c) ->
-            (window, pane, numShards, shardIndex, compression) ->
+            (window, paneInfo, numShards, shardIndex, compression) ->
                 c.sideInput(outputFileNameView) + "-" + shardIndex;
 
     p.apply(Create.of(""))

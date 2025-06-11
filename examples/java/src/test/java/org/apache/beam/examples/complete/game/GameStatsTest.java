@@ -17,15 +17,6 @@
  */
 package org.apache.beam.examples.complete.game;
 
-// beam-playground:
-//   name: GameStatsTest
-//   description: Unit-test for the GameStats example.
-//   multifile: false
-//   context_line: 51
-//   categories:
-//     - Testing
-//     - Filtering
-
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.List;
@@ -33,13 +24,11 @@ import org.apache.beam.examples.complete.game.GameStats.CalculateSpammyUsers;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
-import org.apache.beam.sdk.testing.ValidatesRunner;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.junit.Rule;
 import org.junit.Test;
-import org.junit.experimental.categories.Category;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
@@ -78,7 +67,6 @@ public class GameStatsTest implements Serializable {
 
   /** Test the calculation of 'spammy users'. */
   @Test
-  @Category(ValidatesRunner.class)
   public void testCalculateSpammyUsers() throws Exception {
     PCollection<KV<String, Integer>> input = p.apply(Create.of(USER_SCORES));
     PCollection<KV<String, Integer>> output = input.apply(new CalculateSpammyUsers());

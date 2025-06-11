@@ -27,7 +27,7 @@ import (
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/util/protox"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/internal/errors"
 	pipepb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/pipeline_v1"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -73,7 +73,7 @@ func knownStandardCoders() []string {
 		urnIntervalWindow,
 		urnRowCoder,
 		urnNullableCoder,
-		// TODO(https://github.com/apache/beam/issues/20510): Add urnTimerCoder once finalized.
+		urnTimerCoder,
 	}
 }
 
@@ -162,7 +162,7 @@ func (b *CoderUnmarshaller) WindowCoder(id string) (*coder.WindowCoder, error) {
 
 	c, err := b.peek(id)
 	if err != nil {
-		return nil, err
+		return nil, errors.Errorf("could not unmarshal window coder: %w", err)
 	}
 
 	w, err := urnToWindowCoder(c.GetSpec().GetUrn())
@@ -216,25 +216,22 @@ func (b *CoderUnmarshaller) makeCoder(id string, c *pipepb.Coder) (*coder.Coder,
 		}
 
 		id := components[1]
-		kind := coder.KV
-		root := typex.KVType
-
 		elm, err := b.peek(id)
 		if err != nil {
-			return nil, err
+			return nil, errors.Errorf("could not unmarshal kv coder value component: %w", err)
 		}
 
 		switch elm.GetSpec().GetUrn() {
 		case urnIterableCoder, urnStateBackedIterableCoder:
-			id = elm.GetComponentCoderIds()[0]
-			kind = coder.CoGBK
-			root = typex.CoGBKType
+			iterElmID := elm.GetComponentCoderIds()[0]
 
 			// TODO(https://github.com/apache/beam/issues/18032): If CoGBK with > 1 input, handle as special GBK. We expect
 			// it to be encoded as CoGBK<K,LP<CoGBKList<V,W,..>>>. Remove this handling once
 			// CoGBK has a first-class representation.
 
-			if ids, ok := b.isCoGBKList(id); ok {
+			// If the value is an iterable, and a special CoGBK type, then expand it to the real
+			// CoGBK signature, instead of the special type.
+			if ids, ok := b.isCoGBKList(iterElmID); ok {
 				// CoGBK<K,V,W,..>
 
 				values, err := b.Coders(ids)
@@ -242,9 +239,11 @@ func (b *CoderUnmarshaller) makeCoder(id string, c *pipepb.Coder) (*coder.Coder,
 					return nil, err
 				}
 
-				t := typex.New(root, append([]typex.FullType{key.T}, coder.Types(values)...)...)
-				return &coder.Coder{Kind: kind, T: t, Components: append([]*coder.Coder{key}, values...)}, nil
+				t := typex.New(typex.CoGBKType, append([]typex.FullType{key.T}, coder.Types(values)...)...)
+				return &coder.Coder{Kind: coder.CoGBK, T: t, Components: append([]*coder.Coder{key}, values...)}, nil
 			}
+			// It's valid to have a KV<k,Iter<v>> without being a CoGBK, and validating if we need to change to
+			// a CoGBK is done at the DataSource, since that's when we can check against the downstream nodes.
 		}
 
 		value, err := b.Coder(id)
@@ -252,8 +251,8 @@ func (b *CoderUnmarshaller) makeCoder(id string, c *pipepb.Coder) (*coder.Coder,
 			return nil, err
 		}
 
-		t := typex.New(root, key.T, value.T)
-		return &coder.Coder{Kind: kind, T: t, Components: []*coder.Coder{key, value}}, nil
+		t := typex.New(typex.KVType, key.T, value.T)
+		return &coder.Coder{Kind: coder.KV, T: t, Components: []*coder.Coder{key, value}}, nil
 
 	case urnLengthPrefixCoder:
 		if len(components) != 1 {
@@ -262,7 +261,7 @@ func (b *CoderUnmarshaller) makeCoder(id string, c *pipepb.Coder) (*coder.Coder,
 
 		sub, err := b.peek(components[0])
 		if err != nil {
-			return nil, err
+			return nil, errors.Errorf("could not unmarshal length prefix coder component: %w", err)
 		}
 
 		// No payload means this coder was length prefixed by the runner
@@ -308,7 +307,7 @@ func (b *CoderUnmarshaller) makeCoder(id string, c *pipepb.Coder) (*coder.Coder,
 		}
 		w, err := b.WindowCoder(components[1])
 		if err != nil {
-			return nil, err
+			return nil, errors.Errorf("could not unmarshal window coder: %w", err)
 		}
 		t := typex.New(typex.WindowedValueType, elm.T)
 		wvc := &coder.Coder{Kind: coder.WindowedValue, T: t, Components: []*coder.Coder{elm}, Window: w}
@@ -338,7 +337,7 @@ func (b *CoderUnmarshaller) makeCoder(id string, c *pipepb.Coder) (*coder.Coder,
 		}
 		return c, nil
 
-	case urnIterableCoder:
+	case urnIterableCoder, urnStateBackedIterableCoder:
 		if len(components) != 1 {
 			return nil, errors.Errorf("could not unmarshal iterable coder from %v, expected one component but got %d", c, len(components))
 		}
@@ -357,7 +356,7 @@ func (b *CoderUnmarshaller) makeCoder(id string, c *pipepb.Coder) (*coder.Coder,
 		}
 		w, err := b.WindowCoder(components[1])
 		if err != nil {
-			return nil, err
+			return nil, errors.Errorf("could not unmarshal window coder for timer: %w", err)
 		}
 		return coder.NewT(elm, w), nil
 	case urnRowCoder:
@@ -379,22 +378,18 @@ func (b *CoderUnmarshaller) makeCoder(id string, c *pipepb.Coder) (*coder.Coder,
 			return nil, err
 		}
 		return coder.NewN(elm), nil
-
-		// Special handling for window coders so they can be treated as
-		// a general coder. Generally window coders are not used outside of
-		// specific contexts, but this enables improved testing.
-		// Window types are not permitted to be fulltypes, so
-		// we use assignably equivalent anonymous struct types.
 	case urnIntervalWindow:
-		w, err := b.WindowCoder(id)
-		if err != nil {
-			return nil, err
-		}
-		return &coder.Coder{Kind: coder.Window, T: typex.New(reflect.TypeOf((*struct{ Start, End int64 })(nil)).Elem()), Window: w}, nil
+		return coder.NewIntervalWindowCoder(), nil
+
+	// Special handling for the global window coder so it can be treated as
+	// a general coder. Generally window coders are not used outside of
+	// specific contexts, but this enables improved testing.
+	// Window types are not permitted to be fulltypes, so
+	// we use assignably equivalent anonymous struct types.
 	case urnGlobalWindow:
 		w, err := b.WindowCoder(id)
 		if err != nil {
-			return nil, err
+			return nil, errors.Errorf("could not unmarshal global window coder: %w", err)
 		}
 		return &coder.Coder{Kind: coder.Window, T: typex.New(reflect.TypeOf((*struct{})(nil)).Elem()), Window: w}, nil
 	default:
@@ -405,7 +400,7 @@ func (b *CoderUnmarshaller) makeCoder(id string, c *pipepb.Coder) (*coder.Coder,
 func (b *CoderUnmarshaller) peek(id string) (*pipepb.Coder, error) {
 	c, ok := b.models[id]
 	if !ok {
-		return nil, errors.Errorf("coder with id %v not found", id)
+		return nil, errors.Errorf("(peek) coder with id %v not found", id)
 	}
 	return c, nil
 }
@@ -451,10 +446,9 @@ func (b *CoderMarshaller) Add(c *coder.Coder) (string, error) {
 	case coder.Custom:
 		ref, err := encodeCustomCoder(c.Custom)
 		if err != nil {
-			typeName := c.Custom.Name
-			return "", errors.SetTopLevelMsgf(err, "failed to encode custom coder for type %s. "+
+			return "", errors.SetTopLevelMsgf(err, "failed to encode custom coder %s for TypeName %s. "+
 				"Make sure the type was registered before calling beam.Init. For example: "+
-				"beam.RegisterType(reflect.TypeOf((*TypeName)(nil)).Elem())", typeName)
+				"beam.RegisterType(reflect.TypeOf((*TypeName)(nil)).Elem()). Some types, like maps, slices, arrays, channels, and functions cannot be registered as types.", c, c.Custom.Type)
 		}
 		data, err := protox.EncodeBase64(ref)
 		if err != nil {
@@ -529,6 +523,9 @@ func (b *CoderMarshaller) Add(c *coder.Coder) (string, error) {
 	case coder.String:
 		return b.internBuiltInCoder(urnStringCoder), nil
 
+	case coder.IW:
+		return b.internBuiltInCoder(urnIntervalWindow), nil
+
 	case coder.Row:
 		rt := c.T.Type()
 		s, err := schema.FromType(rt)
@@ -537,7 +534,28 @@ func (b *CoderMarshaller) Add(c *coder.Coder) (string, error) {
 		}
 		return b.internRowCoder(s), nil
 
-	// TODO(https://github.com/apache/beam/issues/20510): Handle coder.Timer support.
+	case coder.Timer:
+		comp := []string{}
+		ids, err := b.AddMulti(c.Components)
+		if err != nil {
+			return "", errors.SetTopLevelMsgf(err, "failed to marshal timer coder %v", c)
+		}
+		comp = append(comp, ids...)
+
+		id, err := b.AddWindowCoder(c.Window)
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to marshal window coder %v", c)
+		}
+		comp = append(comp, id)
+
+		return b.internBuiltInCoder(urnTimerCoder, comp...), nil
+
+	case coder.Iterable:
+		comp, err := b.AddMulti(c.Components)
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to marshal iterable coder %v", c)
+		}
+		return b.internBuiltInCoder(urnIterableCoder, comp...), nil
 
 	default:
 		err := errors.Errorf("unexpected coder kind: %v", c.Kind)
@@ -597,8 +615,8 @@ func (b *CoderMarshaller) internRowCoder(schema *pipepb.Schema) string {
 }
 
 func (b *CoderMarshaller) internCoder(coder *pipepb.Coder) string {
-	key := proto.MarshalTextString(coder)
-	if id, exists := b.coder2id[key]; exists {
+	key := coder.String()
+	if id, exists := b.coder2id[(key)]; exists {
 		return id
 	}
 
@@ -608,7 +626,7 @@ func (b *CoderMarshaller) internCoder(coder *pipepb.Coder) string {
 	} else {
 		id = fmt.Sprintf("c%v@%v", len(b.coder2id), b.Namespace)
 	}
-	b.coder2id[key] = id
+	b.coder2id[string(key)] = id
 	b.coders[id] = coder
 	return id
 }

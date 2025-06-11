@@ -27,7 +27,12 @@ import {
 } from "./standard_coders";
 import { IterableCoder } from "./required_coders";
 import * as runnerApi from "../proto/beam_runner_api";
+import { requireForSerialization } from "../serialization";
+import { packageName } from "../utils/packageJson";
 
+/**
+ * A Coder<T> that encodes a javascript object with BSON.
+ */
 export class BsonObjectCoder<T> implements Coder<T> {
   static URN = "beam:coder:bsonjs:v1";
 
@@ -88,6 +93,10 @@ class NumberOrFloatCoder implements Coder<number> {
   }
 }
 
+/**
+ * A Coder<T> that encodes common javascript types such as strings, numbers,
+ * nulls, or objects.
+ */
 export class GeneralObjectCoder<T> implements Coder<T> {
   static URN = "beam:coder:genericobjectjs:v1";
   codersByType = {
@@ -152,8 +161,7 @@ export class GeneralObjectCoder<T> implements Coder<T> {
 }
 globalRegistry().register(GeneralObjectCoder.URN, GeneralObjectCoder);
 
-import { requireForSerialization } from "../serialization";
-requireForSerialization("apache-beam/coders/js_coders", exports);
-requireForSerialization("apache-beam/coders/js_coders", {
+requireForSerialization(`${packageName}/coders/js_coders`, exports);
+requireForSerialization(`${packageName}/coders/js_coders`, {
   NumberOrFloatCoder: NumberOrFloatCoder,
 });

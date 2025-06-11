@@ -50,11 +50,12 @@ def kotlin_version = "1.6.10"
 
 dependencies {
   implementation enforcedPlatform(library.java.google_cloud_platform_libraries_bom)
-  implementation library.java.vendored_guava_26_0_jre
+  implementation library.java.vendored_guava_32_1_2_jre
   implementation project(path: ":sdks:java:core", configuration: "shadow")
   // Add the dependency that sdks:java:core that is marked as provided
   implementation library.java.hamcrest
   permitUnusedDeclared library.java.hamcrest
+  implementation project(":sdks:java:extensions:avro")
   implementation project(":sdks:java:extensions:google-cloud-platform-core")
   implementation project(":sdks:java:io:google-cloud-platform")
   implementation library.java.avro
@@ -79,15 +80,13 @@ dependencies {
   for (String runner : preCommitRunners) {
     delegate.add(runner + "PreCommit", project(path: ":examples:kotlin", configuration: "testRuntimeMigration"))
   }
+  directRunnerPreCommit project(project.path)
+  flinkRunnerPreCommit project(project.path)
+  sparkRunnerPreCommit project(project.path)
   directRunnerPreCommit project(path: ":runners:direct-java", configuration: "shadow")
   flinkRunnerPreCommit project(":runners:flink:${project.ext.latestFlinkVersion}")
-  // TODO: Make the netty version used configurable, we add netty-all 4.1.17.Final so it appears on the classpath
-  // before 4.1.8.Final defined by Apache Beam
-  sparkRunnerPreCommit "io.netty:netty-all:4.1.17.Final"
-  sparkRunnerPreCommit project(":runners:spark:2")
+  sparkRunnerPreCommit project(":runners:spark:3")
   sparkRunnerPreCommit project(":sdks:java:io:hadoop-file-system")
-  sparkRunnerPreCommit library.java.spark_streaming
-  sparkRunnerPreCommit library.java.spark_core
 }
 
 /*
@@ -110,10 +109,7 @@ for (String runner : preCommitRunners) {
        "--runner=" + preCommitRunnerClass[runner],
     ]
     classpath = configurations."${runner}PreCommit"
-    include "**/WordCountIT.class"
-    if (!"sparkRunner".equals(runner)) {
-      include "**/WindowedWordCountIT.class"
-    }
+    include "**/kotlin/**/*Test.class"
     forkEvery 1
     maxParallelForks 4
     systemProperty "beamTestPipelineOptions", JsonOutput.toJson(preCommitBeamTestPipelineOptions)
@@ -140,4 +136,3 @@ compileTestKotlin {
 repositories {
   mavenCentral()
 }
-

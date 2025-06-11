@@ -16,15 +16,22 @@
 package redis
 
 import (
-	pb "beam.apache.org/playground/backend/internal/api/v1"
-	"beam.apache.org/playground/backend/internal/cache"
-	"beam.apache.org/playground/backend/internal/logger"
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
+
 	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
-	"time"
+
+	pb "beam.apache.org/playground/backend/internal/api/v1"
+	"beam.apache.org/playground/backend/internal/cache"
+	"beam.apache.org/playground/backend/internal/db/entity"
+	"beam.apache.org/playground/backend/internal/logger"
+)
+
+const (
+	catalogExpire = 5 * time.Minute
 )
 
 type Cache struct {
@@ -102,7 +109,7 @@ func (rc *Cache) SetCatalog(ctx context.Context, catalog []*pb.Categories) error
 		logger.Errorf("Redis Cache: set catalog: error during marshal catalog: %s, err: %s\n", catalog, err.Error())
 		return err
 	}
-	err = rc.Set(ctx, cache.ExamplesCatalog, catalogMarsh, 0).Err()
+	err = rc.Set(ctx, cache.ExamplesCatalog, catalogMarsh, catalogExpire).Err()
 	if err != nil {
 		logger.Errorf("Redis Cache: set catalog: error during Set operation, err: %s\n", err.Error())
 		return err
@@ -114,7 +121,7 @@ func (rc *Cache) SetCatalog(ctx context.Context, catalog []*pb.Categories) error
 func (rc *Cache) GetCatalog(ctx context.Context) ([]*pb.Categories, error) {
 	value, err := rc.Get(ctx, cache.ExamplesCatalog).Result()
 	if err != nil {
-		logger.Errorf("Redis Cache: get catalog: error during Get operation for key: %s, err: %s\n", cache.ExamplesCatalog, err.Error())
+		logger.Warnf("Redis Cache: get catalog: error during Get operation for key: %s, err: %s\n", cache.ExamplesCatalog, err.Error())
 		return nil, err
 	}
 	var result []*pb.Categories
@@ -164,6 +171,35 @@ func (rc *Cache) GetDefaultPrecompiledObject(ctx context.Context, sdk pb.Sdk) (*
 	if err != nil {
 		logger.Errorf("Redis Cache: get default precompiled object: error during unmarshal value, err: %s\n", err.Error())
 	}
+	return result, nil
+}
+
+func (rc *Cache) SetSdkCatalog(ctx context.Context, sdks []*entity.SDKEntity) error {
+	sdksMarsh, err := json.Marshal(sdks)
+	if err != nil {
+		logger.Errorf("Redis Cache: set sdk catalog: error during marshal sdk catalog: %s, err: %s\n", sdks, err.Error())
+		return err
+	}
+	err = rc.Set(ctx, cache.SdksCatalog, sdksMarsh, 0).Err()
+	if err != nil {
+		logger.Errorf("Redis Cache: set sdk catalog: error during Set operation, err: %s\n", err.Error())
+		return err
+	}
+	return nil
+}
+
+func (rc *Cache) GetSdkCatalog(ctx context.Context) ([]*entity.SDKEntity, error) {
+	value, err := rc.Get(ctx, cache.SdksCatalog).Result()
+	if err != nil {
+		logger.Errorf("Redis Cache: get sdk catalog: error during Get operation for key: %s, err: %s\n", cache.SdksCatalog, err.Error())
+		return nil, err
+	}
+	var result []*entity.SDKEntity
+	err = json.Unmarshal([]byte(value), &result)
+	if err != nil {
+		logger.Errorf("Redis Cache: get sdk catalog: error during unmarshal sdk catalog, err: %s\n", err.Error())
+	}
+
 	return result, nil
 }
 

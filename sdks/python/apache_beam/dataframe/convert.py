@@ -15,11 +15,11 @@
 # limitations under the License.
 
 import inspect
+import warnings
 import weakref
-from typing import TYPE_CHECKING
+from collections.abc import Iterable
 from typing import Any
-from typing import Dict
-from typing import Tuple
+from typing import Optional
 from typing import Union
 
 import pandas as pd
@@ -28,22 +28,18 @@ import apache_beam as beam
 from apache_beam import pvalue
 from apache_beam.dataframe import expressions
 from apache_beam.dataframe import frame_base
-from apache_beam.dataframe import schemas
 from apache_beam.dataframe import transforms
-
-if TYPE_CHECKING:
-  # pylint: disable=ungrouped-imports
-  from typing import Optional
+from apache_beam.dataframe.schemas import element_typehint_from_dataframe_proxy
+from apache_beam.dataframe.schemas import generate_proxy
+from apache_beam.typehints.pandas_type_compatibility import dtype_to_fieldtype
 
 
 # TODO: Or should this be called as_dataframe?
 def to_dataframe(
-    pcoll,  # type: pvalue.PCollection
-    proxy=None,  # type: Optional[pd.core.generic.NDFrame]
-    label=None,  # type: Optional[str]
-):
-  # type: (...) -> frame_base.DeferredFrame
-
+    pcoll: pvalue.PCollection,
+    proxy: Optional[pd.core.generic.NDFrame] = None,
+    label: Optional[str] = None,
+) -> frame_base.DeferredFrame:
   """Converts a PCollection to a deferred dataframe-like object, which can
   manipulated with pandas methods like `filter` and `groupby`.
 
@@ -68,8 +64,17 @@ def to_dataframe(
       # Attempt to come up with a reasonable, stable label by retrieving
       # the name of these variables in the calling context.
       label = 'BatchElements(%s)' % _var_name(pcoll, 2)
-    proxy = schemas.generate_proxy(pcoll.element_type)
-    pcoll = pcoll | label >> schemas.BatchRowsAsDataFrame(proxy=proxy)
+    proxy = generate_proxy(pcoll.element_type)
+
+    shim_dofn: beam.DoFn
+    if isinstance(proxy, pd.DataFrame):
+      shim_dofn = RowsToDataFrameFn()
+    elif isinstance(proxy, pd.Series):
+      shim_dofn = ElementsToSeriesFn()
+    else:
+      raise AssertionError("Unknown proxy type: %s" % proxy)
+
+    pcoll = pcoll | label >> beam.ParDo(shim_dofn)
   return frame_base.DeferredFrame.wrap(
       expressions.PlaceholderExpression(proxy, pcoll))
 
@@ -80,10 +85,22 @@ def to_dataframe(
 # Note that the pipeline (indirectly) holds references to the transforms which
 # keeps both the PCollections and expressions alive. This ensures the
 # expression's ids are never accidentally re-used.
-TO_PCOLLECTION_CACHE = weakref.WeakValueDictionary(
-)  # type: weakref.WeakValueDictionary[str, pvalue.PCollection]
-UNBATCHED_CACHE = weakref.WeakValueDictionary(
-)  # type: weakref.WeakValueDictionary[str, pvalue.PCollection]
+TO_PCOLLECTION_CACHE: 'weakref.WeakValueDictionary[str, pvalue.PCollection]' = (
+    weakref.WeakValueDictionary())
+UNBATCHED_CACHE: 'weakref.WeakValueDictionary[str, pvalue.PCollection]' = (
+    weakref.WeakValueDictionary())
+
+
+class RowsToDataFrameFn(beam.DoFn):
+  @beam.DoFn.yields_elements
+  def process_batch(self, batch: pd.DataFrame) -> Iterable[pd.DataFrame]:
+    yield batch
+
+
+class ElementsToSeriesFn(beam.DoFn):
+  @beam.DoFn.yields_elements
+  def process_batch(self, batch: pd.Series) -> Iterable[pd.Series]:
+    yield batch
 
 
 def _make_unbatched_pcoll(
@@ -94,24 +111,66 @@ def _make_unbatched_pcoll(
     label += " with indexes"
 
   if label not in UNBATCHED_CACHE:
-    UNBATCHED_CACHE[label] = pc | label >> schemas.UnbatchPandas(
-        expr.proxy(), include_indexes=include_indexes)
+    proxy = expr.proxy()
+    shim_dofn: beam.DoFn
+    if isinstance(proxy, pd.DataFrame):
+      shim_dofn = DataFrameToRowsFn(proxy, include_indexes)
+    elif isinstance(proxy, pd.Series):
+      if include_indexes:
+        warnings.warn(
+            "Pipeline is converting a DeferredSeries to PCollection "
+            "with include_indexes=True. Note that this parameter is "
+            "_not_ respected for DeferredSeries conversion. To "
+            "include the index with your data, produce a"
+            "DeferredDataFrame instead.")
+
+      shim_dofn = SeriesToElementsFn(proxy)
+    else:
+      raise TypeError(f"Proxy '{proxy}' has unsupported type '{type(proxy)}'")
+
+    UNBATCHED_CACHE[label] = pc | label >> beam.ParDo(shim_dofn)
 
   # Note unbatched cache is keyed by the expression id as well as parameters
   # for the unbatching (i.e. include_indexes)
   return UNBATCHED_CACHE[label]
 
 
+class DataFrameToRowsFn(beam.DoFn):
+  def __init__(self, proxy, include_indexes):
+    self._proxy = proxy
+    self._include_indexes = include_indexes
+
+  @beam.DoFn.yields_batches
+  def process(self, element: pd.DataFrame) -> Iterable[pd.DataFrame]:
+    yield element
+
+  def infer_output_type(self, input_element_type):
+    return element_typehint_from_dataframe_proxy(
+        self._proxy, self._include_indexes)
+
+
+class SeriesToElementsFn(beam.DoFn):
+  def __init__(self, proxy):
+    self._proxy = proxy
+
+  @beam.DoFn.yields_batches
+  def process(self, element: pd.Series) -> Iterable[pd.Series]:
+    yield element
+
+  def infer_output_type(self, input_element_type):
+    return dtype_to_fieldtype(self._proxy.dtype)
+
+
 # TODO: Or should this be called from_dataframe?
 
 
 def to_pcollection(
-    *dataframes,  # type: Union[frame_base.DeferredFrame, pd.DataFrame, pd.Series]
+    *dataframes: Union[frame_base.DeferredFrame, pd.DataFrame, pd.Series],
     label=None,
     always_return_tuple=False,
     yield_elements='schemas',
     include_indexes=False,
-    pipeline=None) -> Union[pvalue.PCollection, Tuple[pvalue.PCollection, ...]]:
+    pipeline=None) -> Union[pvalue.PCollection, tuple[pvalue.PCollection, ...]]:
   """Converts one or more deferred dataframe-like objects back to a PCollection.
 
   This method creates and applies the actual Beam operations that compute
@@ -191,21 +250,21 @@ def to_pcollection(
       df for df in dataframes if df._expr._id not in TO_PCOLLECTION_CACHE
   ]
   if len(new_dataframes):
-    new_results = {p: extract_input(p)
-                   for p in placeholders
-                   } | label >> transforms._DataframeExpressionsTransform({
-                       ix: df._expr
-                       for (ix, df) in enumerate(new_dataframes)
-                   })  # type: Dict[Any, pvalue.PCollection]
+    new_results: dict[Any, pvalue.PCollection] = {
+        p: extract_input(p)
+        for p in placeholders
+    } | label >> transforms._DataframeExpressionsTransform(
+        {ix: df._expr
+         for (ix, df) in enumerate(new_dataframes)})
 
-    TO_PCOLLECTION_CACHE.update(
-        {new_dataframes[ix]._expr._id: pc
-         for ix, pc in new_results.items()})
+    TO_PCOLLECTION_CACHE.update({
+        new_dataframes[ix]._expr._id: pc
+        for ix, pc in new_results.items()
+    })
 
   raw_results = {
       ix: TO_PCOLLECTION_CACHE[df._expr._id]
-      for ix,
-      df in enumerate(dataframes)
+      for ix, df in enumerate(dataframes)
   }
 
   if yield_elements == "schemas":

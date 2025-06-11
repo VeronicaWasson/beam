@@ -18,7 +18,7 @@
 """
 
 import re
-from typing import Mapping
+from collections.abc import Mapping
 
 import pandas as pd
 
@@ -131,14 +131,9 @@ class DeferredPandasModule(object):
         expressions.ComputedExpression(
             'concat',
             lambda *objs: pd.concat(
-                objs,
-                axis=axis,
-                join=join,
-                ignore_index=ignore_index,
-                keys=keys,
-                levels=levels,
-                names=names,
-                verify_integrity=verify_integrity),  # yapf break
+                objs, axis=axis, join=join, ignore_index=ignore_index, keys=
+                keys, levels=levels, names=names, verify_integrity=
+                verify_integrity),  # yapf break
             exprs,
             requires_partition_by=required_partitioning,
             preserves_partition_by=preserves_partitioning))
@@ -162,6 +157,7 @@ class DeferredPandasModule(object):
   period_range = _defer_to_pandas('period_range')
   pivot = _call_on_first_arg('pivot')
   pivot_table = _call_on_first_arg('pivot_table')
+  set_eng_float_format = _defer_to_pandas('set_eng_float_format')
   show_versions = _defer_to_pandas('show_versions')
   test = frame_base.wont_implement_method(
       pd,

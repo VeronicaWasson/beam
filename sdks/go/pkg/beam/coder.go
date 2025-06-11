@@ -30,8 +30,8 @@ import (
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/util/jsonx"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/util/reflectx"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/internal/errors"
-	protov1 "github.com/golang/protobuf/proto"
 	protov2 "google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/protoadapt"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
@@ -51,7 +51,7 @@ type jsonCoder interface {
 	json.Unmarshaler
 }
 
-var protoMessageType = reflect.TypeOf((*protov1.Message)(nil)).Elem()
+var protoMessageType = reflect.TypeOf((*protoadapt.MessageV1)(nil)).Elem()
 var protoReflectMessageType = reflect.TypeOf((*protoreflect.ProtoMessage)(nil)).Elem()
 var jsonCoderType = reflect.TypeOf((*jsonCoder)(nil)).Elem()
 
@@ -105,7 +105,7 @@ type execEncoder struct {
 	coder *coder.Coder
 }
 
-func (e *execEncoder) Encode(element interface{}, w io.Writer) error {
+func (e *execEncoder) Encode(element any, w io.Writer) error {
 	return e.enc.Encode(&exec.FullValue{Elm: element}, w)
 }
 
@@ -129,7 +129,7 @@ type execDecoder struct {
 	coder *coder.Coder
 }
 
-func (d *execDecoder) Decode(r io.Reader) (interface{}, error) {
+func (d *execDecoder) Decode(r io.Reader) (any, error) {
 	fv, err := d.dec.Decode(r)
 	if err != nil {
 		return nil, err
@@ -152,7 +152,23 @@ func NewCoder(t FullType) Coder {
 
 func inferCoder(t FullType) (*coder.Coder, error) {
 	switch t.Class() {
-	case typex.Concrete, typex.Container:
+	case typex.Container:
+		switch t.Type() {
+		case reflectx.ByteSlice:
+			return &coder.Coder{Kind: coder.Bytes, T: t}, nil
+		}
+		switch t.Type().Kind() {
+		case reflect.Slice:
+			c, err := inferCoder(t.Components()[0])
+			if err != nil {
+				return nil, err
+			}
+			return &coder.Coder{Kind: coder.Iterable, T: t, Components: []*coder.Coder{c}}, nil
+
+		default:
+			panic(fmt.Sprintf("inferCoder: unknown container kind %v", t))
+		}
+	case typex.Concrete:
 		switch t.Type() {
 		case reflectx.Int64:
 			// use the beam varint coder.
@@ -182,9 +198,6 @@ func inferCoder(t FullType) (*coder.Coder, error) {
 
 		case reflectx.String:
 			return &coder.Coder{Kind: coder.String, T: t}, nil
-
-		case reflectx.ByteSlice:
-			return &coder.Coder{Kind: coder.Bytes, T: t}, nil
 
 		case reflectx.Bool:
 			return &coder.Coder{Kind: coder.Bool, T: t}, nil
@@ -263,8 +276,8 @@ func protoEnc(in T) ([]byte, error) {
 	switch it := in.(type) {
 	case protoreflect.ProtoMessage:
 		p = it
-	case protov1.Message:
-		p = protov1.MessageV2(it)
+	case protoadapt.MessageV1:
+		p = protoadapt.MessageV2Of(it)
 	}
 	b, err := protov2.MarshalOptions{Deterministic: true}.Marshal(p)
 	if err != nil {
@@ -280,8 +293,8 @@ func protoDec(t reflect.Type, in []byte) (T, error) {
 	switch it := reflect.New(t.Elem()).Interface().(type) {
 	case protoreflect.ProtoMessage:
 		p = it
-	case protov1.Message:
-		p = protov1.MessageV2(it)
+	case protoadapt.MessageV1:
+		p = protoadapt.MessageV2Of(it)
 	}
 	err := protov2.UnmarshalOptions{}.Unmarshal(in, p)
 	if err != nil {
@@ -318,10 +331,10 @@ func newJSONCoder(t reflect.Type) (*coder.CustomCoder, error) {
 // These maps and mutexes are actuated per element, which can be expensive.
 var (
 	encMu      sync.Mutex
-	schemaEncs = map[reflect.Type]func(interface{}, io.Writer) error{}
+	schemaEncs = map[reflect.Type]func(any, io.Writer) error{}
 
 	decMu      sync.Mutex
-	schemaDecs = map[reflect.Type]func(io.Reader) (interface{}, error){}
+	schemaDecs = map[reflect.Type]func(io.Reader) (any, error){}
 )
 
 // schemaEnc encodes the supplied value as beam schema.

@@ -45,6 +45,7 @@ class WordCountIT(unittest.TestCase):
   DEFAULT_CHECKSUM = '33535a832b7db6d78389759577d4ff495980b9c0'
 
   @pytest.mark.it_postcommit
+  @pytest.mark.it_validatescontainer
   def test_wordcount_it(self):
     self._run_wordcount_it(wordcount.run)
 
@@ -66,30 +67,28 @@ class WordCountIT(unittest.TestCase):
     """
     # Credentials need to be reset or this test will fail and credentials
     # from a previous test will be used.
-    auth._Credentials._credentials_init = False
-
-    ACCOUNT_TO_IMPERSONATE = (
-        'allows-impersonation@apache-'
-        'beam-testing.iam.gserviceaccount.com')
-    RUNNER_ACCOUNT = (
-        'impersonation-dataflow-worker@'
-        'apache-beam-testing.iam.gserviceaccount.com')
-    TEMP_DIR = 'gs://impersonation-test-bucket/temp-it'
-    STAGING_LOCATION = 'gs://impersonation-test-bucket/staging-it'
-    extra_options = {
-        'impersonate_service_account': ACCOUNT_TO_IMPERSONATE,
-        'service_account_email': RUNNER_ACCOUNT,
-        'temp_location': TEMP_DIR,
-        'staging_location': STAGING_LOCATION
-    }
-    self._run_wordcount_it(wordcount.run, **extra_options)
-    # Reset credentials for future tests.
-    auth._Credentials._credentials_init = False
-
-  @pytest.mark.it_postcommit
-  @pytest.mark.it_validatescontainer
-  def test_wordcount_fnapi_it(self):
-    self._run_wordcount_it(wordcount.run, experiment='beam_fn_api')
+    with auth._Credentials._credentials_lock:
+      auth._Credentials._credentials_init = False
+    try:
+      ACCOUNT_TO_IMPERSONATE = (
+          'allows-impersonation@apache-'
+          'beam-testing.iam.gserviceaccount.com')
+      RUNNER_ACCOUNT = (
+          'impersonation-dataflow-worker@'
+          'apache-beam-testing.iam.gserviceaccount.com')
+      TEMP_DIR = 'gs://impersonation-test-bucket/temp-it'
+      STAGING_LOCATION = 'gs://impersonation-test-bucket/staging-it'
+      extra_options = {
+          'impersonate_service_account': ACCOUNT_TO_IMPERSONATE,
+          'service_account_email': RUNNER_ACCOUNT,
+          'temp_location': TEMP_DIR,
+          'staging_location': STAGING_LOCATION
+      }
+      self._run_wordcount_it(wordcount.run, **extra_options)
+    finally:
+      # Reset credentials for future tests.
+      with auth._Credentials._credentials_lock:
+        auth._Credentials._credentials_init = False
 
   @pytest.mark.it_validatescontainer
   def test_wordcount_it_with_prebuilt_sdk_container_local_docker(self):
@@ -108,6 +107,11 @@ class WordCountIT(unittest.TestCase):
   def _run_wordcount_it(self, run_wordcount, **opts):
     test_pipeline = TestPipeline(is_integration_test=True)
     extra_opts = {}
+
+    if (test_pipeline.get_option('machine_type') == 't2a-standard-1' and
+        'prebuild_sdk_container_engine' in opts):
+      # TODO(https://github.com/apache/beam/issues/28340)
+      pytest.skip('prebuild_sdk_container_engine not supported on ARM')
 
     # Set extra options to the pipeline for test purpose
     test_output = '/'.join([

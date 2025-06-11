@@ -17,7 +17,7 @@
  */
 package org.apache.beam.runners.fnexecution.translation;
 
-import static org.apache.beam.runners.core.construction.graph.ExecutableStage.DEFAULT_WIRE_CODER_SETTINGS;
+import static org.apache.beam.sdk.util.construction.graph.ExecutableStage.DEFAULT_WIRE_CODER_SETTINGS;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsInAnyOrder;
@@ -31,11 +31,6 @@ import java.util.Collections;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.model.pipeline.v1.RunnerApi.Components;
 import org.apache.beam.model.pipeline.v1.RunnerApi.Environment;
-import org.apache.beam.runners.core.construction.graph.ExecutableStage;
-import org.apache.beam.runners.core.construction.graph.ImmutableExecutableStage;
-import org.apache.beam.runners.core.construction.graph.PipelineNode;
-import org.apache.beam.runners.core.construction.graph.PipelineNode.PCollectionNode;
-import org.apache.beam.runners.core.construction.graph.SideInputReference;
 import org.apache.beam.runners.fnexecution.state.StateRequestHandlers.IterableSideInputHandler;
 import org.apache.beam.runners.fnexecution.state.StateRequestHandlers.MultimapSideInputHandler;
 import org.apache.beam.sdk.coders.KvCoder;
@@ -46,8 +41,13 @@ import org.apache.beam.sdk.transforms.windowing.GlobalWindow;
 import org.apache.beam.sdk.transforms.windowing.IntervalWindow;
 import org.apache.beam.sdk.transforms.windowing.IntervalWindow.IntervalWindowCoder;
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.graph.ExecutableStage;
+import org.apache.beam.sdk.util.construction.graph.ImmutableExecutableStage;
+import org.apache.beam.sdk.util.construction.graph.PipelineNode;
+import org.apache.beam.sdk.util.construction.graph.PipelineNode.PCollectionNode;
+import org.apache.beam.sdk.util.construction.graph.SideInputReference;
 import org.apache.beam.sdk.values.KV;
+import org.apache.beam.sdk.values.WindowedValues;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
 import org.joda.time.Instant;
@@ -55,6 +55,7 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 import org.mockito.Mock;
@@ -77,6 +78,7 @@ public class BatchSideInputHandlerFactoryTest {
                       COLLECTION_ID, RunnerApi.PCollection.getDefaultInstance()))));
 
   @Rule public ExpectedException thrown = ExpectedException.none();
+  @Rule public transient Timeout globalTimeout = Timeout.seconds(600);
 
   @Mock private BatchSideInputHandlerFactory.SideInputGetter context;
 
@@ -119,7 +121,7 @@ public class BatchSideInputHandlerFactoryTest {
   public void singleElementForCollection() {
     when(context.getSideInput(COLLECTION_ID))
         .thenReturn(
-            Arrays.asList(WindowedValue.valueInGlobalWindow(KV.<Void, Integer>of(null, 3))));
+            Arrays.asList(WindowedValues.valueInGlobalWindow(KV.<Void, Integer>of(null, 3))));
 
     BatchSideInputHandlerFactory factory =
         BatchSideInputHandlerFactory.forStage(EXECUTABLE_STAGE, context);
@@ -140,9 +142,9 @@ public class BatchSideInputHandlerFactoryTest {
     when(context.getSideInput(COLLECTION_ID))
         .thenReturn(
             Arrays.asList(
-                WindowedValue.valueInGlobalWindow(KV.of("foo", 2)),
-                WindowedValue.valueInGlobalWindow(KV.of("bar", 3)),
-                WindowedValue.valueInGlobalWindow(KV.of("foo", 5))));
+                WindowedValues.valueInGlobalWindow(KV.of("foo", 2)),
+                WindowedValues.valueInGlobalWindow(KV.of("bar", 3)),
+                WindowedValues.valueInGlobalWindow(KV.of("foo", 5))));
 
     BatchSideInputHandlerFactory factory =
         BatchSideInputHandlerFactory.forStage(EXECUTABLE_STAGE, context);
@@ -168,12 +170,12 @@ public class BatchSideInputHandlerFactoryTest {
     when(context.getSideInput(COLLECTION_ID))
         .thenReturn(
             Arrays.asList(
-                WindowedValue.of(KV.of("foo", 1), instantA, windowA, PaneInfo.NO_FIRING),
-                WindowedValue.of(KV.of("baz", 2), instantA, windowA, PaneInfo.NO_FIRING),
-                WindowedValue.of(KV.of("foo", 3), instantA, windowA, PaneInfo.NO_FIRING),
-                WindowedValue.of(KV.of("foo", 4), instantB, windowB, PaneInfo.NO_FIRING),
-                WindowedValue.of(KV.of("bar", 5), instantB, windowB, PaneInfo.NO_FIRING),
-                WindowedValue.of(KV.of("foo", 6), instantB, windowB, PaneInfo.NO_FIRING)));
+                WindowedValues.of(KV.of("foo", 1), instantA, windowA, PaneInfo.NO_FIRING),
+                WindowedValues.of(KV.of("baz", 2), instantA, windowA, PaneInfo.NO_FIRING),
+                WindowedValues.of(KV.of("foo", 3), instantA, windowA, PaneInfo.NO_FIRING),
+                WindowedValues.of(KV.of("foo", 4), instantB, windowB, PaneInfo.NO_FIRING),
+                WindowedValues.of(KV.of("bar", 5), instantB, windowB, PaneInfo.NO_FIRING),
+                WindowedValues.of(KV.of("foo", 6), instantB, windowB, PaneInfo.NO_FIRING)));
 
     BatchSideInputHandlerFactory factory =
         BatchSideInputHandlerFactory.forStage(EXECUTABLE_STAGE, context);
@@ -204,10 +206,10 @@ public class BatchSideInputHandlerFactoryTest {
     when(context.getSideInput(COLLECTION_ID))
         .thenReturn(
             Arrays.asList(
-                WindowedValue.of(1, instantA, windowA, PaneInfo.NO_FIRING),
-                WindowedValue.of(2, instantA, windowA, PaneInfo.NO_FIRING),
-                WindowedValue.of(3, instantB, windowB, PaneInfo.NO_FIRING),
-                WindowedValue.of(4, instantB, windowB, PaneInfo.NO_FIRING)));
+                WindowedValues.of(1, instantA, windowA, PaneInfo.NO_FIRING),
+                WindowedValues.of(2, instantA, windowA, PaneInfo.NO_FIRING),
+                WindowedValues.of(3, instantB, windowB, PaneInfo.NO_FIRING),
+                WindowedValues.of(4, instantB, windowB, PaneInfo.NO_FIRING)));
 
     BatchSideInputHandlerFactory factory =
         BatchSideInputHandlerFactory.forStage(EXECUTABLE_STAGE, context);

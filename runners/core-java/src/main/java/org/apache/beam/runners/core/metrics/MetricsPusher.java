@@ -30,14 +30,11 @@ import org.apache.beam.sdk.metrics.MetricResults;
 import org.apache.beam.sdk.metrics.MetricsOptions;
 import org.apache.beam.sdk.metrics.MetricsSink;
 import org.apache.beam.sdk.util.InstanceBuilder;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /** Component that regularly merges metrics and pushes them to a metrics sink. */
-@SuppressWarnings({
-  "nullness" // TODO(https://github.com/apache/beam/issues/20497)
-})
 public class MetricsPusher implements Serializable {
 
   private MetricsSink metricsSink;
@@ -76,7 +73,7 @@ public class MetricsPusher implements Serializable {
 
   private void tearDown() {
     pushMetrics();
-    if (!scheduledFuture.isCancelled()) {
+    if (scheduledFuture != null && !scheduledFuture.isCancelled()) {
       scheduledFuture.cancel(true);
     }
   }

@@ -22,9 +22,15 @@ package org.apache.beam.learning.katas.triggers.earlytriggers;
 //   name: EarlyTriggers
 //   description: Task from katas to count events using early triggers
 //   multifile: true
-//   context_line: 42
+//   context_line: 50
 //   categories:
 //     - Streaming
+//   complexity: MEDIUM
+//   tags:
+//     - windowing
+//     - triggers
+//     - event
+
 
 import org.apache.beam.learning.katas.util.Log;
 import org.apache.beam.sdk.Pipeline;

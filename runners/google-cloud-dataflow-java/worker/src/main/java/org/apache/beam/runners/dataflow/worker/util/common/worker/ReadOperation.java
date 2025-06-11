@@ -30,9 +30,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.beam.runners.dataflow.worker.counters.Counter;
 import org.apache.beam.runners.dataflow.worker.counters.CounterName;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.MoreObjects;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.MoreObjects;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -225,8 +225,16 @@ public class ReadOperation extends Operation {
         if (!scheduler.isTerminated()) {
           LOG.error(
               "Failed to terminate periodic progress reporting in 1 minute. "
-                  + "Waiting for it to terminate indefinitely...");
-          scheduler.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);
+                  + "Waiting for it to terminate 10 minutes before forcing");
+          scheduler.awaitTermination(10, TimeUnit.MINUTES);
+          if (!scheduler.isTerminated()) {
+            LOG.error(
+                "Failed to terminate periodic progress reporting in 10 "
+                    + "minutes. Trying to force termination then waiting "
+                    + "indefinitely...");
+            scheduler.shutdownNow();
+            scheduler.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);
+          }
           LOG.info("Periodic progress reporting terminated.");
         }
       }

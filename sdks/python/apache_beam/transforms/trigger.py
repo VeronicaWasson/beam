@@ -49,8 +49,6 @@ from apache_beam.utils.timestamp import MAX_TIMESTAMP
 from apache_beam.utils.timestamp import MIN_TIMESTAMP
 from apache_beam.utils.timestamp import TIME_GRANULARITY
 
-# AfterCount is experimental. No backwards compatibility guarantees.
-
 __all__ = [
     'AccumulationMode',
     'TriggerFn',
@@ -183,8 +181,7 @@ class DataLossReason(Flag):
 # to `reason & flag == flag`
 
 
-def _IncludesMayFinish(reason):
-  # type: (DataLossReason) -> bool
+def _IncludesMayFinish(reason: DataLossReason) -> bool:
   return reason & DataLossReason.MAY_FINISH == DataLossReason.MAY_FINISH
 
 
@@ -269,9 +266,7 @@ class TriggerFn(metaclass=ABCMeta):
     """Clear any state and timers used by this TriggerFn."""
     pass
 
-  def may_lose_data(self, unused_windowing):
-    # type: (core.Windowing) -> DataLossReason
-
+  def may_lose_data(self, unused_windowing: core.Windowing) -> DataLossReason:
     """Returns whether or not this trigger could cause data loss.
 
     A trigger can cause data loss in the following scenarios:
@@ -373,10 +368,10 @@ class DefaultTrigger(TriggerFn):
 
 
 class AfterProcessingTime(TriggerFn):
-  """Fire exactly once after a specified delay from processing time.
+  """Fire exactly once after a specified delay from processing time."""
 
-  AfterProcessingTime is experimental. No backwards compatibility guarantees.
-  """
+  STATE_TAG = _SetStateTag('has_timer')
+
   def __init__(self, delay=0):
     """Initialize a processing time trigger with a delay in seconds."""
     self.delay = delay
@@ -385,8 +380,10 @@ class AfterProcessingTime(TriggerFn):
     return 'AfterProcessingTime(delay=%d)' % self.delay
 
   def on_element(self, element, window, context):
-    context.set_timer(
-        '', TimeDomain.REAL_TIME, context.get_current_time() + self.delay)
+    if not context.get_state(self.STATE_TAG):
+      context.set_timer(
+          '', TimeDomain.REAL_TIME, context.get_current_time() + self.delay)
+    context.add_state(self.STATE_TAG, True)
 
   def on_merge(self, to_be_merged, merge_result, context):
     # timers will be kept through merging
@@ -400,7 +397,7 @@ class AfterProcessingTime(TriggerFn):
     return True
 
   def reset(self, window, context):
-    pass
+    context.clear_state(self.STATE_TAG)
 
   def may_lose_data(self, unused_windowing):
     """AfterProcessingTime may finish."""
@@ -645,10 +642,7 @@ class AfterWatermark(TriggerFn):
 
 
 class AfterCount(TriggerFn):
-  """Fire when there are at least count elements in this window pane.
-
-  AfterCount is experimental. No backwards compatibility guarantees.
-  """
+  """Fire when there are at least count elements in this window pane."""
 
   COUNT_TAG = _CombiningValueStateTag('count', combiners.CountCombineFn())
 
@@ -780,8 +774,7 @@ class _ParallelTriggerFn(TriggerFn, metaclass=ABCMeta):
     return self.combine_op(
         trigger.should_fire(
             time_domain, watermark, window, self._sub_context(context, ix))
-        for ix,
-        trigger in enumerate(self.triggers))
+        for ix, trigger in enumerate(self.triggers))
 
   def on_fire(self, watermark, window, context):
     finished = []
@@ -1425,8 +1418,8 @@ class GeneralTriggerDriver(TriggerDriver):
           (
               element_output_time for element_output_time in (
                   self.timestamp_combiner_impl.assign_output_time(
-                      window, timestamp) for unused_value,
-                  timestamp in elements)
+                      window, timestamp)
+                  for unused_value, timestamp in elements)
               if element_output_time >= output_watermark))
       if output_time is not None:
         state.add_state(window, self.WATERMARK_HOLD, output_time)

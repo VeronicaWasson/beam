@@ -38,11 +38,15 @@ jcip-annotations:
   '1.0':
     license: "https://raw.githubusercontent.com/stephenc/jcip-annotations/master/LICENSE.txt"
     type: "Apache License 2.0"
+guava-parent:
+  '32.1.2-jre':
+    license: "https://raw.githubusercontent.com/google/guava/master/LICENSE"
+    type: "Apache License 2.0"
 jaxen:
   '1.1.6':
     type: "3-Clause BSD"
 libraries-bom:
-  '25.2.0':
+  '26.60.0':
     license: "https://raw.githubusercontent.com/GoogleCloudPlatform/cloud-opensource-java/master/LICENSE"
     type: "Apache License 2.0"
 paranamer:
@@ -54,7 +58,7 @@ xz:
   '1.5': # The original repo is down. This license is taken from https://tukaani.org/xz/java.html.
     license: "file://{}/xz/COPYING"
 jackson-bom:
-  '2.13.0':
+  '2.15.4':
     license: "https://raw.githubusercontent.com/FasterXML/jackson-bom/master/LICENSE"
     type: "Apache License 2.0"
 junit-dep:
@@ -65,3 +69,7 @@ org.eclipse.jgit:
   '4.4.1.201607150455-r':
     license: "https://www.eclipse.org/org/documents/edl-v10.html"
     type: "Eclipse Distribution License - v1.0"
+zstd-jni:
+  '1.5.2-5':
+    license: "https://raw.githubusercontent.com/luben/zstd-jni/master/LICENSE"
+    type: "2-Clause BSD"

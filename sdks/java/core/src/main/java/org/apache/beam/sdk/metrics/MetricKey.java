@@ -18,13 +18,11 @@
 package org.apache.beam.sdk.metrics;
 
 import com.google.auto.value.AutoValue;
+import com.google.auto.value.extension.memoized.Memoized;
 import java.io.Serializable;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /** Metrics are keyed by the step name they are associated with and the name of the metric. */
-@Experimental(Kind.METRICS)
 @AutoValue
 public abstract class MetricKey implements Serializable {
 
@@ -35,7 +33,8 @@ public abstract class MetricKey implements Serializable {
   public abstract MetricName metricName();
 
   @Override
-  public final String toString() {
+  @Memoized
+  public String toString() {
     return stepName() + ":" + metricName();
   }
 

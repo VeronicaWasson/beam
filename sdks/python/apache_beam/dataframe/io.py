@@ -58,8 +58,35 @@ _DEFAULT_LINES_CHUNKSIZE = 10_000
 _DEFAULT_BYTES_CHUNKSIZE = 1 << 20
 
 
+def read_gbq(
+    table, dataset=None, project_id=None, use_bqstorage_api=False, **kwargs):
+  """This function reads data from a BigQuery table and produces a
+  :class:`~apache_beam.dataframe.frames.DeferredDataFrame.
+
+  Args:
+    table (str): Please specify a table. This can be done in the format
+      'PROJECT:dataset.table' if one would not wish to utilize
+      the parameters below.
+    dataset (str): Please specify the dataset
+      (can omit if table was specified as 'PROJECT:dataset.table').
+    project_id (str): Please specify the project ID
+      (can omit if table was specified as 'PROJECT:dataset.table').
+    use_bqstorage_api (bool): If you would like to utilize
+      the BigQuery Storage API in ReadFromBigQuery, please set
+      this flag to true. Otherwise, please set flag
+      to false or leave it unspecified.
+      """
+  if table is None:
+    raise ValueError("Please specify a BigQuery table to read from.")
+  elif len(kwargs) > 0:
+    raise ValueError(
+        f"Encountered unsupported parameter(s) in read_gbq: {kwargs.keys()!r}"
+        "")
+  return _ReadGbq(table, dataset, project_id, use_bqstorage_api)
+
+
 @frame_base.with_docs_from(pd)
-def read_csv(path, *args, splittable=False, **kwargs):
+def read_csv(path, *args, splittable=False, binary=True, **kwargs):
   """If your files are large and records do not contain quoted newlines, you may
   pass the extra argument ``splittable=True`` to enable dynamic splitting for
   this read on newlines. Using this option for records that do contain quoted
@@ -72,6 +99,7 @@ def read_csv(path, *args, splittable=False, **kwargs):
       args,
       kwargs,
       incremental=True,
+      binary=binary,
       splitter=_TextFileSplitter(args, kwargs) if splittable else None)
 
 
@@ -143,8 +171,7 @@ def to_json(df, path, orient=None, *args, **kwargs):
 @frame_base.with_docs_from(pd)
 def read_html(path, *args, **kwargs):
   return _ReadFromPandas(
-      lambda *args,
-      **kwargs: pd.read_html(*args, **kwargs)[0],
+      lambda *args, **kwargs: pd.read_html(*args, **kwargs)[0],
       path,
       args,
       kwargs)
@@ -165,8 +192,8 @@ def to_html(df, path, *args, **kwargs):
 
 def _binary_reader(format):
   func = getattr(pd, 'read_%s' % format)
-  result = lambda path, *args, **kwargs: _ReadFromPandas(func, path, args,
-                                                         kwargs)
+  result = lambda path, *args, **kwargs: _ReadFromPandas(
+      func, path, args, kwargs)
   result.__name__ = f'read_{format}'
 
   return result
@@ -174,10 +201,8 @@ def _binary_reader(format):
 
 def _binary_writer(format):
   result = (
-      lambda df,
-      path,
-      *args,
-      **kwargs: _as_pc(df) | _WriteToPandas(f'to_{format}', path, args, kwargs))
+      lambda df, path, *args, **kwargs: _as_pc(df) | _WriteToPandas(
+          f'to_{format}', path, args, kwargs))
   result.__name__ = f'to_{format}'
   return result
 
@@ -252,10 +277,12 @@ class _ReadFromPandas(beam.PTransform):
     first_path = match.metadata_list[0].path
     with io.filesystems.FileSystems.open(first_path) as handle:
       if not self.binary:
-        handle = TextIOWrapper(handle)
+        handle = TextIOWrapper(
+            handle, encoding=self.kwargs.get("encoding", None))
       if self.incremental:
-        sample = next(
-            self.reader(handle, *self.args, **dict(self.kwargs, chunksize=100)))
+        with self.reader(handle, *self.args, **dict(self.kwargs,
+                                                    chunksize=100)) as stream:
+          sample = next(stream)
       else:
         sample = self.reader(handle, *self.args, **self.kwargs)
 
@@ -264,9 +291,10 @@ class _ReadFromPandas(beam.PTransform):
         matches_pcoll.pipeline
         | 'DoOnce' >> beam.Create([None])
         | beam.Map(
-            lambda _,
-            paths: {path: ix
-                    for ix, path in enumerate(sorted(paths))},
+            lambda _, paths: {
+                path: ix
+                for ix, path in enumerate(sorted(paths))
+            },
             paths=beam.pvalue.AsList(
                 matches_pcoll | beam.Map(lambda match: match.path))))
 
@@ -464,6 +492,10 @@ class _TruncatingFileHandle(object):
           self._buffer, self._underlying)
       self._buffer_start_pos += len(skip)
 
+  @property
+  def mode(self):
+    return getattr(self._underlying, "mode", "r")
+
   def readable(self):
     return True
 
@@ -543,6 +575,9 @@ class _TruncatingFileHandle(object):
       self._done = True
     return res
 
+  def flush(self):
+    self._underlying.flush()
+
 
 class _ReadFromPandasDoFn(beam.DoFn, beam.RestrictionProvider):
   def __init__(self, reader, args, kwargs, binary, incremental, splitter):
@@ -598,7 +633,8 @@ class _ReadFromPandasDoFn(beam.DoFn, beam.RestrictionProvider):
             splitter=self.splitter or
             _DelimSplitter(b'\n', _DEFAULT_BYTES_CHUNKSIZE))
       if not self.binary:
-        handle = TextIOWrapper(handle)
+        handle = TextIOWrapper(
+            handle, encoding=self.kwargs.get("encoding", None))
       if self.incremental:
         if 'chunksize' not in self.kwargs:
           self.kwargs['chunksize'] = _DEFAULT_LINES_CHUNKSIZE
@@ -625,10 +661,15 @@ class _WriteToPandas(beam.PTransform):
     self.binary = binary
 
   def expand(self, pcoll):
-    dir, name = io.filesystems.FileSystems.split(self.path)
+    if 'file_naming' in self.kwargs:
+      dir, name = self.path, ''
+    else:
+      dir, name = io.filesystems.FileSystems.split(self.path)
     return pcoll | fileio.WriteToFiles(
         path=dir,
-        file_naming=fileio.default_file_naming(name),
+        shards=self.kwargs.pop('num_shards', None),
+        file_naming=self.kwargs.pop(
+            'file_naming', fileio.default_file_naming(name)),
         sink=lambda _: _WriteToPandasFileSink(
             self.writer, self.args, self.kwargs, self.incremental, self.binary))
 
@@ -654,7 +695,8 @@ class _WriteToPandasFileSink(fileio.FileSink):
     self.buffer = []
     self.empty = self.header = self.footer = None
     if not self.binary:
-      file_handle = TextIOWrapper(file_handle)
+      file_handle = TextIOWrapper(
+          file_handle, encoding=self.kwargs.get("encoding", None))
     self.file_handle = file_handle
 
   def write_to(self, df, file_handle=None):
@@ -756,3 +798,59 @@ class WriteViaPandas(beam.PTransform):
         | beam.Map(lambda file_result: file_result.file_name).with_output_types(
             str)
     }
+
+
+class _ReadGbq(beam.PTransform):
+  """Read data from BigQuery with output type 'BEAM_ROW',
+  then convert it into a deferred dataframe.
+
+    This PTransform wraps the Python ReadFromBigQuery PTransform,
+    and sets the output_type as 'BEAM_ROW' to convert
+    into a Beam Schema. Once applied to a pipeline object,
+    it is passed into the to_dataframe() function to convert the
+    PCollection into a deferred dataframe.
+
+    This PTransform currently does not support queries.
+
+  Args:
+    table (str): The ID of the table. The ID must contain only
+      letters ``a-z``, ``A-Z``,
+      numbers ``0-9``, underscores ``_`` or white spaces.
+      Note that the table argument must contain the entire table
+      reference specified as: ``'PROJECT:DATASET.TABLE'``.
+    use_bq_storage_api (bool): The method to use to read from BigQuery.
+      It may be 'EXPORT' or
+      'DIRECT_READ'. EXPORT invokes a BigQuery export request
+      (https://cloud.google.com/bigquery/docs/exporting-data).
+      'DIRECT_READ' reads
+      directly from BigQuery storage using the BigQuery Read API
+      (https://cloud.google.com/bigquery/docs/reference/storage). If
+      unspecified or set to false, the default is currently utilized (EXPORT).
+      If the flag is set to true,
+      'DIRECT_READ' will be utilized."""
+  def __init__(
+      self,
+      table=None,
+      dataset_id=None,
+      project_id=None,
+      use_bqstorage_api=None):
+
+    self.table = table
+    self.dataset_id = dataset_id
+    self.project_id = project_id
+    self.use_bqstorage_api = use_bqstorage_api
+
+  def expand(self, root):
+    from apache_beam.dataframe import convert  # avoid circular import
+    if self.use_bqstorage_api:
+      method = 'DIRECT_READ'
+    else:
+      method = 'EXPORT'
+    return convert.to_dataframe(
+        root
+        | '_DataFrame_Read_From_BigQuery' >> beam.io.ReadFromBigQuery(
+            table=self.table,
+            dataset=self.dataset_id,
+            project=self.project_id,
+            method=method,
+            output_type='BEAM_ROW'))

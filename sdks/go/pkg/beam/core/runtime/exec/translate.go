@@ -21,17 +21,19 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/funcx"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph/coder"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph/window"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/runtime/graphx"
 	v1pb "github.com/apache/beam/sdks/v2/go/pkg/beam/core/runtime/graphx/v1"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/timers"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/typex"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/util/protox"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/internal/errors"
 	fnpb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/fnexecution_v1"
 	pipepb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/pipeline_v1"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // TODO(lostluck): 2018/05/28 Extract these from the canonical enums in beam_runner_api.proto
@@ -49,8 +51,8 @@ const (
 )
 
 // UnmarshalPlan converts a model bundle descriptor into an execution Plan.
-func UnmarshalPlan(desc *fnpb.ProcessBundleDescriptor) (*Plan, error) {
-	b, err := newBuilder(desc)
+func UnmarshalPlan(desc *fnpb.ProcessBundleDescriptor, dataSampler *DataSampler) (*Plan, error) {
+	b, err := newBuilder(desc, dataSampler)
 	if err != nil {
 		return nil, err
 	}
@@ -95,9 +97,65 @@ func UnmarshalPlan(desc *fnpb.ProcessBundleDescriptor) (*Plan, error) {
 			b.units = b.units[:len(b.units)-1]
 		}
 
+		mayFixDataSourceCoder(u)
 		b.units = append(b.units, u)
 	}
 	return b.build()
+}
+
+// mayFixDataSourceCoder checks the node downstream of the DataSource and if applicable, changes
+// a KV<k, Iter<V>> coder to a CoGBK<k, v>. This requires knowledge of the downstream node because
+// coder interpretation is ambiguous to received types in DoFns, and we can only interpret it right
+// at execution time with knowledge of both.
+func mayFixDataSourceCoder(u *DataSource) {
+	if !coder.IsKV(coder.SkipW(u.Coder)) {
+		return // If it's not a KV, there's nothing to do here.
+	}
+	if coder.SkipW(u.Coder).Components[1].Kind != coder.Iterable {
+		return // If the V is not an iterable, we don't care.
+	}
+	out := u.Out
+	if mp, ok := out.(*Multiplex); ok {
+		// Here we trust that the Multiplex Outs are all the same signature, since we've validated
+		// that at construction time.
+		out = mp.Out[0]
+	}
+
+	switch n := out.(type) {
+	// These nodes always expect CoGBK behavior.
+	case *Expand, *MergeAccumulators, *ReshuffleOutput, *Combine:
+		u.Coder = convertToCoGBK(u.Coder)
+		return
+	case *ParDo:
+		// So we now know we have a KV<k, Iter<V>>. So we need to validate whether the DoFn has an
+		// iter function in the value slot. If it does, we need to use a CoGBK coder.
+		sig := n.Fn.ProcessElementFn()
+		// Get all valid inputs and side inputs.
+		in := sig.Params(funcx.FnValue | funcx.FnIter | funcx.FnReIter)
+
+		if len(in) < 2 {
+			return // Somehow there's only a single value, so we're done. (Defense against generic KVs)
+		}
+		// It's an iterator, so we can assume it's a GBK, due to previous pre-conditions.
+		if sig.Param[in[1]].Kind == funcx.FnIter {
+			u.Coder = convertToCoGBK(u.Coder)
+			return
+		}
+	}
+}
+
+func convertToCoGBK(oc *coder.Coder) *coder.Coder {
+	ocnw := coder.SkipW(oc)
+	// Validate that all values from the coder are iterables.
+	comps := make([]*coder.Coder, 0, len(ocnw.Components))
+	comps = append(comps, ocnw.Components[0])
+	for _, c := range ocnw.Components[1:] {
+		if c.Kind != coder.Iterable {
+			panic(fmt.Sprintf("want all values to be iterables: %v", oc))
+		}
+		comps = append(comps, c.Components[0])
+	}
+	return coder.NewW(coder.NewCoGBK(comps), oc.Window)
 }
 
 type builder struct {
@@ -111,8 +169,9 @@ type builder struct {
 	nodes     map[string]*PCollection // PCollectionID -> Node (cache)
 	links     map[linkID]Node         // linkID -> Node (cache)
 
-	units []Unit // result
-	idgen *GenID
+	units       []Unit // result
+	idgen       *GenID
+	dataSampler *DataSampler
 }
 
 // linkID represents an incoming data link to an Node.
@@ -121,7 +180,7 @@ type linkID struct {
 	input int    // input index. If > 0, it's a side input.
 }
 
-func newBuilder(desc *fnpb.ProcessBundleDescriptor) (*builder, error) {
+func newBuilder(desc *fnpb.ProcessBundleDescriptor, dataSampler *DataSampler) (*builder, error) {
 	// Preprocess graph structure to allow insertion of Multiplex,
 	// Flatten and Discard.
 
@@ -135,7 +194,11 @@ func newBuilder(desc *fnpb.ProcessBundleDescriptor) (*builder, error) {
 
 		input := unmarshalKeyedValues(transform.GetInputs())
 		for i, from := range input {
-			succ[from] = append(succ[from], linkID{id, i})
+			// We don't need to multiplex successors for pardo side inputs.
+			// so we only do so for SDK side Flattens.
+			if i == 0 || transform.GetSpec().GetUrn() == graphx.URNFlatten {
+				succ[from] = append(succ[from], linkID{id, i})
+			}
 		}
 		output := unmarshalKeyedValues(transform.GetOutputs())
 		for _, to := range output {
@@ -154,7 +217,8 @@ func newBuilder(desc *fnpb.ProcessBundleDescriptor) (*builder, error) {
 		nodes:     make(map[string]*PCollection),
 		links:     make(map[linkID]Node),
 
-		idgen: &GenID{},
+		idgen:       &GenID{},
+		dataSampler: dataSampler,
 	}
 	return b, nil
 }
@@ -303,7 +367,7 @@ func (b *builder) makeCoderForPCollection(id string) (*coder.Coder, *coder.Windo
 	}
 	wc, err := b.coders.WindowCoder(ws.GetWindowCoderId())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Errorf("could not unmarshal window coder for pcollection %v: %w", id, err)
 	}
 	return c, wc, nil
 }
@@ -349,11 +413,11 @@ func (b *builder) makePCollection(id string) (*PCollection, error) {
 }
 
 func (b *builder) newPCollectionNode(id string, out Node) (*PCollection, error) {
-	ec, _, err := b.makeCoderForPCollection(id)
+	ec, wc, err := b.makeCoderForPCollection(id)
 	if err != nil {
 		return nil, err
 	}
-	u := &PCollection{UID: b.idgen.New(), Out: out, PColID: id, Coder: ec, Seed: rand.Int63()}
+	u := &PCollection{UID: b.idgen.New(), Out: out, PColID: id, Coder: ec, WindowCoder: wc, Seed: rand.Int63(), dataSampler: b.dataSampler}
 	b.nodes[id] = u
 	b.units = append(b.units, u)
 	return u, nil
@@ -404,6 +468,8 @@ func (b *builder) makeLink(from string, id linkID) (Node, error) {
 		urnTruncateSizedRestrictions:
 		var data string
 		var sides map[string]*pipepb.SideInput
+		var userState map[string]*pipepb.StateSpec
+		var userTimers map[string]*pipepb.TimerFamilySpec
 		switch urn {
 		case graphx.URNParDo,
 			urnPairWithRestriction,
@@ -416,6 +482,8 @@ func (b *builder) makeLink(from string, id linkID) (Node, error) {
 			}
 			data = string(pardo.GetDoFn().GetPayload())
 			sides = pardo.GetSideInputs()
+			userState = pardo.GetStateSpecs()
+			userTimers = pardo.GetTimerFamilySpecs()
 		case urnPerKeyCombinePre, urnPerKeyCombineMerge, urnPerKeyCombineExtract, urnPerKeyCombineConvert:
 			var cmb pipepb.CombinePayload
 			if err := proto.Unmarshal(payload, &cmb); err != nil {
@@ -459,9 +527,91 @@ func (b *builder) makeLink(from string, id linkID) (Node, error) {
 					u = &TruncateSizedRestriction{UID: b.idgen.New(), Fn: dofn, Out: out[0]}
 				default:
 					n := &ParDo{UID: b.idgen.New(), Fn: dofn, Inbound: in, Out: out}
-					n.PID = transform.GetUniqueName()
+					n.PID = id.to
 
 					input := unmarshalKeyedValues(transform.GetInputs())
+
+					if len(userState) > 0 {
+						stateIDToCoder := make(map[string]*coder.Coder)
+						stateIDToKeyCoder := make(map[string]*coder.Coder)
+						stateIDToCombineFn := make(map[string]*graph.CombineFn)
+						for key, spec := range userState {
+							var cID string
+							var kcID string
+							if rmw := spec.GetReadModifyWriteSpec(); rmw != nil {
+								cID = rmw.CoderId
+							} else if bs := spec.GetBagSpec(); bs != nil {
+								cID = bs.ElementCoderId
+							} else if cs := spec.GetCombiningSpec(); cs != nil {
+								cID = cs.AccumulatorCoderId
+								cmbData := string(cs.GetCombineFn().GetPayload())
+								var cmbTp v1pb.TransformPayload
+								if err := protox.DecodeBase64(cmbData, &cmbTp); err != nil {
+									return nil, errors.Wrapf(err, "invalid transform payload %v for %v", cmbData, transform)
+								}
+								_, fn, _, _, _, err := graphx.DecodeMultiEdge(cmbTp.GetEdge())
+								if err != nil {
+									return nil, err
+								}
+								cfn, err := graph.AsCombineFn(fn)
+								if err != nil {
+									return nil, err
+								}
+								stateIDToCombineFn[key] = cfn
+							} else if ms := spec.GetMapSpec(); ms != nil {
+								cID = ms.ValueCoderId
+								kcID = ms.KeyCoderId
+							} else if ss := spec.GetSetSpec(); ss != nil {
+								kcID = ss.ElementCoderId
+							} else {
+								return nil, errors.Errorf("Unrecognized state type %v", spec)
+							}
+							if cID != "" {
+								c, err := b.coders.Coder(cID)
+								if err != nil {
+									return nil, err
+								}
+								stateIDToCoder[key] = c
+							} else {
+								// If no value coder is provided, we are in a keyed state with no values (aka a set).
+								// We represent a set as an element mapping to a bool representing if it is present or not.
+								stateIDToCoder[key] = &coder.Coder{Kind: coder.Bool}
+							}
+							if kcID != "" {
+								kc, err := b.coders.Coder(kcID)
+								if err != nil {
+									return nil, err
+								}
+								stateIDToKeyCoder[key] = kc
+							}
+							sid := StreamID{
+								Port:         Port{URL: b.desc.GetStateApiServiceDescriptor().GetUrl()},
+								PtransformID: id.to,
+							}
+
+							ec, wc, err := b.makeCoderForPCollection(input[0])
+							if err != nil {
+								return nil, err
+							}
+							n.UState = NewUserStateAdapter(sid, coder.NewW(ec, wc), stateIDToCoder, stateIDToKeyCoder, stateIDToCombineFn)
+						}
+					}
+
+					if len(userTimers) > 0 {
+						sID := StreamID{Port: Port{URL: b.desc.GetTimerApiServiceDescriptor().GetUrl()}, PtransformID: id.to}
+
+						familyToSpec := map[string]timerFamilySpec{}
+						for fam, spec := range userTimers {
+							domain := timers.TimeDomain(spec.GetTimeDomain())
+							timerCoder, err := b.coders.Coder(spec.GetTimerFamilyCoderId())
+							if err != nil {
+								return nil, errors.WithContextf(err, "couldn't retreive coder for timer %v in DoFn %v, ID %v", fam, dofn.Name(), n.PID)
+							}
+							familyToSpec[fam] = newTimerFamilySpec(domain, timerCoder)
+						}
+						n.TimerTracker = newUserTimerAdapter(sID, familyToSpec)
+					}
+
 					for i := 1; i < len(input); i++ {
 						// TODO(https://github.com/apache/beam/issues/18602) Handle ViewFns for side inputs
 
@@ -510,7 +660,7 @@ func (b *builder) makeLink(from string, id linkID) (Node, error) {
 				}
 				cn.UsesKey = typex.IsKV(in[0].Type)
 
-				cn.PID = transform.GetUniqueName()
+				cn.PID = id.to
 
 				switch urn {
 				case urnPerKeyCombinePre:
@@ -528,11 +678,13 @@ func (b *builder) makeLink(from string, id linkID) (Node, error) {
 					u = &LiftedCombine{Combine: cn, KeyCoder: ec.Components[0], WindowCoder: wc}
 				case urnPerKeyCombineMerge:
 					ma := &MergeAccumulators{Combine: cn}
-					if eo, ok := ma.Out.(*PCollection).Out.(*ExtractOutput); ok {
-						// Strip PCollections from between MergeAccumulators and ExtractOutputs
-						// as it's a synthetic PCollection.
-						b.units = b.units[:len(b.units)-1]
-						ma.Out = eo
+					if pc, ok := ma.Out.(*PCollection); ok {
+						if eo, ok := pc.Out.(*ExtractOutput); ok {
+							// Strip PCollections from between MergeAccumulators and ExtractOutputs
+							// as it's a synthetic PCollection.
+							b.units = b.units[:len(b.units)-1]
+							ma.Out = eo
+						}
 					}
 					u = ma
 				case urnPerKeyCombineExtract:
@@ -585,7 +737,10 @@ func (b *builder) makeLink(from string, id linkID) (Node, error) {
 			}
 			// Strip PCollections from Expand nodes, as CoGBK metrics are handled by
 			// the DataSource that preceeds them.
-			trueOut := out[0].(*PCollection).Out
+			trueOut := out[0]
+			if pcol, ok := trueOut.(*PCollection); ok {
+				trueOut = pcol.Out
+			}
 			b.units = b.units[:len(b.units)-1]
 			u = &Expand{UID: b.idgen.New(), ValueDecoders: decoders, Out: trueOut}
 
@@ -634,6 +789,17 @@ func (b *builder) makeLink(from string, id linkID) (Node, error) {
 		}
 		u = &WindowInto{UID: b.idgen.New(), Fn: wfn, Out: out[0]}
 
+	case graphx.URNMapWindows:
+		var fn pipepb.FunctionSpec
+		if err := proto.Unmarshal(payload, &fn); err != nil {
+			return nil, errors.Wrapf(err, "invalid SideInput payload for %v", transform)
+		}
+		mapper, err := unmarshalAndMakeWindowMapping(&fn)
+		if err != nil {
+			return nil, err
+		}
+		u = &MapWindows{UID: b.idgen.New(), Fn: mapper, Out: out[0], FnUrn: fn.GetUrn()}
+
 	case graphx.URNFlatten:
 		u = &Flatten{UID: b.idgen.New(), N: len(transform.Inputs), Out: out[0]}
 
@@ -658,6 +824,9 @@ func (b *builder) makeLink(from string, id linkID) (Node, error) {
 			return nil, errors.Errorf("unwindowed coder %v on DataSink %v: %v", cid, id, sink.Coder)
 		}
 		u = sink
+
+	case graphx.URNToString:
+		u = &ToString{UID: b.idgen.New(), Out: out[0]}
 
 	default:
 		panic(fmt.Sprintf("Unexpected transform URN: %v", urn))

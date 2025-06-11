@@ -17,13 +17,17 @@
  */
 package org.apache.beam.runners.spark;
 
+import static org.apache.beam.sdk.transforms.Contextful.fn;
+import static org.apache.beam.sdk.transforms.Requirements.requiresSideInputs;
 import static org.hamcrest.MatcherAssert.assertThat;
 
+import java.util.Arrays;
 import java.util.Collections;
 import org.apache.beam.runners.spark.examples.WordCount;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
+import org.apache.beam.sdk.coders.VarIntCoder;
 import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.io.kafka.KafkaIO;
 import org.apache.beam.sdk.options.PipelineOptions;
@@ -39,12 +43,15 @@ import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.transforms.SimpleFunction;
 import org.apache.beam.sdk.transforms.Sum;
+import org.apache.beam.sdk.transforms.View;
 import org.apache.beam.sdk.transforms.WithKeys;
 import org.apache.beam.sdk.transforms.windowing.FixedWindows;
 import org.apache.beam.sdk.transforms.windowing.Window;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionList;
+import org.apache.beam.sdk.values.PCollectionView;
+import org.apache.beam.sdk.values.TypeDescriptor;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.hamcrest.Matchers;
@@ -83,17 +90,19 @@ public class SparkRunnerDebuggerTest {
         .apply(TextIO.write().to("!!PLACEHOLDER-OUTPUT-DIR!!").withNumShards(3).withSuffix(".txt"));
 
     final String expectedPipeline =
-        "sparkContext.<readFrom(org.apache.beam.sdk.transforms.Create$Values$CreateSource)>()\n"
+        "sparkContext.<impulse>()\n"
+            + "_.mapPartitions(new org.apache.beam.sdk.transforms.FlatMapElements$3())\n"
             + "_.mapPartitions("
             + "new org.apache.beam.runners.spark.examples.WordCount$ExtractWordsFn())\n"
-            + "_.mapPartitions(new org.apache.beam.sdk.transforms.Contextful())\n"
+            + "_.mapPartitions(new org.apache.beam.sdk.transforms.Count$PerElement$1())\n"
             + "_.combineByKey(..., new org.apache.beam.sdk.transforms.Count$CountFn(), ...)\n"
             + "_.groupByKey()\n"
             + "_.map(new org.apache.beam.sdk.transforms.Sum$SumLongFn())\n"
-            + "_.mapPartitions(new org.apache.beam.sdk.transforms.Contextful())\n"
+            + "_.mapPartitions("
+            + "new org.apache.beam.runners.spark.SparkRunnerDebuggerTest$PlusOne())\n"
             + "sparkContext.union(...)\n"
             + "_.mapPartitions("
-            + "new org.apache.beam.sdk.transforms.Contextful())\n"
+            + "new org.apache.beam.runners.spark.examples.WordCount$FormatAsTextFn())\n"
             + "_.<org.apache.beam.sdk.io.TextIO$Write>";
 
     SparkRunnerDebugger.DebugSparkPipelineResult result =
@@ -109,7 +118,7 @@ public class SparkRunnerDebuggerTest {
   public void debugStreamingPipeline() {
     PipelineOptions options = contextRule.configure(PipelineOptionsFactory.create());
     options.setRunner(SparkRunnerDebugger.class);
-    options.as(TestSparkPipelineOptions.class).setForceStreaming(true);
+    options.as(TestSparkPipelineOptions.class).setStreaming(true);
     Pipeline pipeline = Pipeline.create(options);
 
     KafkaIO.Read<String, String> read =
@@ -142,15 +151,49 @@ public class SparkRunnerDebuggerTest {
             + "_.map(new org.apache.beam.sdk.transforms.windowing.FixedWindows())\n"
             + "_.mapPartitions(new org.apache.beam.runners.spark."
             + "SparkRunnerDebuggerTest$FormatKVFn())\n"
-            + "_.mapPartitions(new org.apache.beam.sdk.transforms.Contextful())\n"
+            + "_.mapPartitions(new org.apache.beam.sdk.transforms.Distinct$1())\n"
             + "_.groupByKey()\n"
             + "_.map(new org.apache.beam.sdk.transforms.Combine$IterableCombineFn())\n"
             + "_.mapPartitions(new org.apache.beam.sdk.transforms.Distinct$3())\n"
-            + "_.mapPartitions(new org.apache.beam.sdk.transforms.Contextful())\n"
+            + "_.mapPartitions(new org.apache.beam.sdk.transforms.WithKeys$1())\n"
             + "_.<org.apache.beam.sdk.io.kafka.AutoValue_KafkaIO_Write>";
 
     SparkRunnerDebugger.DebugSparkPipelineResult result =
         (SparkRunnerDebugger.DebugSparkPipelineResult) pipeline.run();
+
+    assertThat(
+        "Debug pipeline did not equal expected",
+        result.getDebugString(),
+        Matchers.equalTo(expectedPipeline));
+  }
+
+  @Test
+  public void debugBatchPipelineWithContextfulTransform() {
+    PipelineOptions options = contextRule.configure(PipelineOptionsFactory.create());
+    options.setRunner(SparkRunnerDebugger.class);
+    Pipeline pipeline = Pipeline.create(options);
+
+    final PCollectionView<Integer> view =
+        pipeline.apply("Dummy", Create.of(0)).apply(View.asSingleton());
+
+    pipeline
+        .apply(Create.of(Arrays.asList(0)))
+        .setCoder(VarIntCoder.of())
+        .apply(
+            MapElements.into(new TypeDescriptor<Integer>() {})
+                .via(fn((element, c) -> element, requiresSideInputs(view))));
+
+    SparkRunnerDebugger.DebugSparkPipelineResult result =
+        (SparkRunnerDebugger.DebugSparkPipelineResult) pipeline.run();
+
+    final String expectedPipeline =
+        "sparkContext.<impulse>()\n"
+            + "_.mapPartitions(new org.apache.beam.sdk.transforms.Create$Values$2())\n"
+            + "_.aggregate(..., new org.apache.beam.sdk.transforms.View$SingletonCombineFn(), ...)\n"
+            + "_.<createPCollectionView>\n"
+            + "sparkContext.<impulse>()\n"
+            + "_.mapPartitions(new org.apache.beam.sdk.transforms.Create$Values$2())\n"
+            + "_.mapPartitions(new org.apache.beam.sdk.transforms.Contextful())";
 
     assertThat(
         "Debug pipeline did not equal expected",

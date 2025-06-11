@@ -25,11 +25,6 @@ model for building both batch and streaming parallel data processing pipelines.
 The Apache Beam SDK for Python provides access to Apache Beam capabilities
 from the Python programming language.
 
-Status
-------
-The SDK is still early in its development, and significant changes
-should be expected before the first stable version.
-
 Overview
 --------
 The key concepts in this programming model are
@@ -75,7 +70,7 @@ import sys
 import warnings
 
 if sys.version_info.major == 3:
-  if sys.version_info.minor <= 6 or sys.version_info.minor >= 10:
+  if sys.version_info.minor <= 8 or sys.version_info.minor >= 14:
     warnings.warn(
         'This version of Apache Beam has not been sufficiently tested on '
         'Python %s.%s. You may encounter bugs or missing features.' %
@@ -94,11 +89,19 @@ from apache_beam import io
 from apache_beam import metrics
 from apache_beam import typehints
 from apache_beam import version
-from apache_beam.pipeline import Pipeline
+from apache_beam.pipeline import *
 from apache_beam.transforms import *
 from apache_beam.pvalue import PCollection
 from apache_beam.pvalue import Row
 from apache_beam.pvalue import TaggedOutput
+
+try:
+  # Add mitigation for CVE-2023-47248 while Beam allows affected versions
+  # of pyarrow. (https://github.com/apache/beam/issues/29392)
+  import pyarrow_hotfix
+except ImportError:
+  pass
+
 # pylint: enable=wrong-import-position
 
 __version__ = version.__version__

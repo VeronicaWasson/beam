@@ -20,8 +20,10 @@ package org.apache.beam.sdk.io.text;
 import static org.apache.beam.sdk.io.FileIO.ReadMatches.DirectoryTreatment;
 import static org.apache.beam.sdk.io.common.FileBasedIOITHelper.appendTimestampSuffix;
 import static org.apache.beam.sdk.io.common.FileBasedIOITHelper.readFileBasedIOITPipelineOptions;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 
-import com.google.cloud.Timestamp;
+import java.time.Instant;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
@@ -35,6 +37,7 @@ import org.apache.beam.sdk.io.common.FileBasedIOITHelper;
 import org.apache.beam.sdk.io.common.FileBasedIOITHelper.DeleteFileFn;
 import org.apache.beam.sdk.io.common.FileBasedIOTestPipelineOptions;
 import org.apache.beam.sdk.io.common.HashingFn;
+import org.apache.beam.sdk.metrics.Lineage;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.testutils.NamedTestResult;
@@ -150,20 +153,32 @@ public class TextIOIT {
             .withSideInputs(consolidatedHashcode.apply(View.asSingleton())));
 
     PipelineResult result = pipeline.run();
-    result.waitUntilFinish();
+    PipelineResult.State pipelineState = result.waitUntilFinish();
+
+    Set<String> sources = Lineage.query(result.metrics(), Lineage.Type.SOURCE);
+    Set<String> sinks = Lineage.query(result.metrics(), Lineage.Type.SINK);
+    if (numShards != null && numShards <= 100) {
+      // both should be the full files, if supported by the runner
+      assertEquals(sources, sinks);
+    } else {
+      // if supported by runner, both should be non-empty
+      assertEquals(sources.isEmpty(), sinks.isEmpty());
+    }
 
     collectAndPublishMetrics(result);
+    // Fail the test if pipeline failed.
+    assertNotEquals(pipelineState, PipelineResult.State.FAILED);
   }
 
   private void collectAndPublishMetrics(PipelineResult result) {
     String uuid = UUID.randomUUID().toString();
-    Timestamp timestamp = Timestamp.now();
+    String timestamp = Instant.now().toString();
 
     Set<Function<MetricsReader, NamedTestResult>> metricSuppliers =
-        fillMetricSuppliers(uuid, timestamp.toString());
+        fillMetricSuppliers(uuid, timestamp);
 
     final IOITMetrics metrics =
-        new IOITMetrics(metricSuppliers, result, FILEIOIT_NAMESPACE, uuid, timestamp.toString());
+        new IOITMetrics(metricSuppliers, result, FILEIOIT_NAMESPACE, uuid, timestamp);
     metrics.publishToInflux(settings);
   }
 
@@ -203,11 +218,11 @@ public class TextIOIT {
           reader -> {
             MetricsReader actualReader =
                 reader.withNamespace("org.apache.beam.sdk.extensions.gcp.storage.GcsFileSystem");
-            long numCopies = actualReader.getCounterMetric("num_copies");
-            long copyTimeMsec = actualReader.getCounterMetric("copy_time_msec");
-            double copiesPerSec =
-                (numCopies < 0 || copyTimeMsec < 0) ? -1 : numCopies / (copyTimeMsec / 1e3);
-            return NamedTestResult.create(uuid, timestamp, "copies_per_sec", copiesPerSec);
+            long numRenames = actualReader.getCounterMetric("num_renames");
+            long renameTimeMsec = actualReader.getCounterMetric("rename_time_msec");
+            double remamePerSec =
+                (numRenames < 0 || renameTimeMsec < 0) ? -1 : numRenames / (renameTimeMsec / 1e3);
+            return NamedTestResult.create(uuid, timestamp, "rename_per_sec", remamePerSec);
           });
     }
     return metricSuppliers;

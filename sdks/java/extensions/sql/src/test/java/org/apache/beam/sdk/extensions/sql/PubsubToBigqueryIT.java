@@ -31,8 +31,8 @@ import org.apache.beam.sdk.io.gcp.pubsub.TestPubsub;
 import org.apache.beam.sdk.schemas.Schema;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.values.Row;
-import org.apache.beam.vendor.calcite.v1_28_0.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.calcite.v1_28_0.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
 import org.junit.Rule;
@@ -52,6 +52,8 @@ public class PubsubToBigqueryIT implements Serializable {
 
   @Test
   public void testSimpleInsert() throws Exception {
+    String createCatalog = "CREATE CATALOG my_catalog TYPE `local`";
+    String setCatalog = "SET CATALOG my_catalog";
     String pubsubTableString =
         "CREATE EXTERNAL TABLE pubsub_topic (\n"
             + "event_timestamp TIMESTAMP, \n"
@@ -83,6 +85,8 @@ public class PubsubToBigqueryIT implements Serializable {
             + "FROM pubsub_topic";
     pipeline.apply(
         SqlTransform.query(insertStatement)
+            .withDdlString(createCatalog)
+            .withDdlString(setCatalog)
             .withDdlString(pubsubTableString)
             .withDdlString(bqTableString));
     pipeline.run();

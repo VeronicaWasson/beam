@@ -19,13 +19,17 @@
 #   description: Task from katas to implement a CoGroupByKey transform that join words by its first
 #     alphabetical letter, and then produces the string representation of the WordsAlphabet model.
 #   multifile: false
-#   context_line: 31
+#   context_line: 62
 #   categories:
 #     - Combiners
+#   complexity: MEDIUM
+#   tags:
+#     - join
+#     - map
+#     - group
+#     - strings
 
 import apache_beam as beam
-
-from log_elements import LogElements
 
 
 class WordsAlphabet:
@@ -61,5 +65,4 @@ with beam.Pipeline() as p:
   countries = p | 'Countries' >> beam.Create(['australia', 'brazil', 'canada'])
 
   (apply_transforms(fruits, countries)
-   | LogElements())
-
+   | beam.LogElements())

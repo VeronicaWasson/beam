@@ -20,9 +20,13 @@
 # pytype: skip-file
 
 import logging
+import os
 from functools import partial
+from typing import TYPE_CHECKING
 from typing import Any
+from typing import Dict
 from typing import Optional
+from typing import Union
 
 from apache_beam import typehints
 from apache_beam.coders import coders
@@ -36,12 +40,19 @@ from apache_beam.io.iobase import Write
 from apache_beam.transforms import PTransform
 from apache_beam.transforms.display import DisplayDataItem
 
+if TYPE_CHECKING:
+  from apache_beam.io import fileio
+
 __all__ = [
     'ReadFromText',
     'ReadFromTextWithFilename',
     'ReadAllFromText',
     'ReadAllFromTextContinuously',
-    'WriteToText'
+    'WriteToText',
+    'ReadFromCsv',
+    'WriteToCsv',
+    'ReadFromJson',
+    'WriteToJson',
 ]
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,8 +64,9 @@ class _TextSource(filebasedsource.FileBasedSource):
   Parses a text file as newline-delimited elements. Supports newline delimiters
   '\n' and '\r\n.
 
-  This implementation only supports reading text encoded using UTF-8 or
-  ASCII.
+  This implementation reads encoded text and uses the input coder's encoding to
+  decode from bytes to str. This does not support ``UTF-16`` or ``UTF-32``
+  encodings.
   """
 
   DEFAULT_READ_BUFFER_SIZE = 8192
@@ -93,18 +105,19 @@ class _TextSource(filebasedsource.FileBasedSource):
       self.data = b''
       self.position = 0
 
-  def __init__(self,
-               file_pattern,
-               min_bundle_size,
-               compression_type,
-               strip_trailing_newlines,
-               coder,  # type: coders.Coder
-               buffer_size=DEFAULT_READ_BUFFER_SIZE,
-               validate=True,
-               skip_header_lines=0,
-               header_processor_fns=(None, None),
-               delimiter=None,
-               escapechar=None):
+  def __init__(
+      self,
+      file_pattern,
+      min_bundle_size,
+      compression_type,
+      strip_trailing_newlines,
+      coder: coders.Coder,
+      buffer_size=DEFAULT_READ_BUFFER_SIZE,
+      validate=True,
+      skip_header_lines=0,
+      header_processor_fns=(None, None),
+      delimiter=None,
+      escapechar=None):
     """Initialize a _TextSource
 
     Args:
@@ -424,21 +437,21 @@ class _TextSourceWithFilename(_TextSource):
 
 class _TextSink(filebasedsink.FileBasedSink):
   """A sink to a GCS or local text file or files."""
-
-  def __init__(self,
-               file_path_prefix,
-               file_name_suffix='',
-               append_trailing_newlines=True,
-               num_shards=0,
-               shard_name_template=None,
-               coder=coders.ToBytesCoder(),  # type: coders.Coder
-               compression_type=CompressionTypes.AUTO,
-               header=None,
-               footer=None,
-               *,
-               max_records_per_shard=None,
-               max_bytes_per_shard=None,
-               skip_if_empty=False):
+  def __init__(
+      self,
+      file_path_prefix,
+      file_name_suffix='',
+      append_trailing_newlines=True,
+      num_shards=0,
+      shard_name_template=None,
+      coder: coders.Coder = coders.ToBytesCoder(),
+      compression_type=CompressionTypes.AUTO,
+      header=None,
+      footer=None,
+      *,
+      max_records_per_shard=None,
+      max_bytes_per_shard=None,
+      skip_if_empty=False):
     """Initialize a _TextSink.
 
     Args:
@@ -563,8 +576,12 @@ class ReadAllFromText(PTransform):
   similar to ``ReadFromTextWithFilename`` but this ``PTransform`` can be placed
   anywhere in the pipeline.
 
-  This implementation only supports reading text encoded using UTF-8 or ASCII.
-  This does not support other encodings such as UTF-16 or UTF-32.
+  If reading from a text file that that requires a different encoding, you may
+  provide a custom :class:`~apache_beam.coders.coders.Coder` that encodes and
+  decodes with the appropriate codec. For example, see the implementation of
+  :class:`~apache_beam.coders.coders.StrUtf8Coder`.
+
+  This does not support ``UTF-16`` or ``UTF-32`` encodings.
 
   This implementation is only tested with batch pipeline. In streaming,
   reading may happen with delay due to the limitation in ReShuffle involved.
@@ -578,7 +595,7 @@ class ReadAllFromText(PTransform):
       compression_type=CompressionTypes.AUTO,
       strip_trailing_newlines=True,
       validate=False,
-      coder=coders.StrUtf8Coder(),  # type: coders.Coder
+      coder: coders.Coder = coders.StrUtf8Coder(),
       skip_header_lines=0,
       with_filename=False,
       delimiter=None,
@@ -711,11 +728,14 @@ class ReadFromText(PTransform):
 
   Parses a text file as newline-delimited elements, by default assuming
   ``UTF-8`` encoding. Supports newline delimiters ``\n`` and ``\r\n``
-  or specified delimiter .
+  or specified delimiter.
 
-  This implementation only supports reading text encoded using ``UTF-8`` or
-  ``ASCII``.
-  This does not support other encodings such as ``UTF-16`` or ``UTF-32``.
+  If reading from a text file that that requires a different encoding, you may
+  provide a custom :class:`~apache_beam.coders.coders.Coder` that encodes and
+  decodes with the appropriate codec. For example, see the implementation of
+  :class:`~apache_beam.coders.coders.StrUtf8Coder`.
+
+  This does not support ``UTF-16`` or ``UTF-32`` encodings.
   """
 
   _source_class = _TextSource
@@ -726,7 +746,7 @@ class ReadFromText(PTransform):
       min_bundle_size=0,
       compression_type=CompressionTypes.AUTO,
       strip_trailing_newlines=True,
-      coder=coders.StrUtf8Coder(),  # type: coders.Coder
+      coder: coders.Coder = coders.StrUtf8Coder(),
       validate=True,
       skip_header_lines=0,
       delimiter=None,
@@ -762,6 +782,13 @@ class ReadFromText(PTransform):
     """
 
     super().__init__(**kwargs)
+    if file_pattern:
+      try:
+        if not os.path.dirname(file_pattern):
+          file_pattern = os.path.join('.', file_pattern)
+      except TypeError:
+        pass
+
     self._source = self._source_class(
         file_pattern,
         min_bundle_size,
@@ -792,15 +819,14 @@ class ReadFromTextWithFilename(ReadFromText):
 class WriteToText(PTransform):
   """A :class:`~apache_beam.transforms.ptransform.PTransform` for writing to
   text files."""
-
   def __init__(
       self,
-      file_path_prefix,  # type: str
+      file_path_prefix: str,
       file_name_suffix='',
       append_trailing_newlines=True,
       num_shards=0,
-      shard_name_template=None,  # type: Optional[str]
-      coder=coders.ToBytesCoder(),  # type: coders.Coder
+      shard_name_template: Optional[str] = None,
+      coder: coders.Coder = coders.ToBytesCoder(),
       compression_type=CompressionTypes.AUTO,
       header=None,
       footer=None,
@@ -855,6 +881,8 @@ class WriteToText(PTransform):
         to exceed this value.  This also tracks the uncompressed,
         not compressed, size of the shard.
       skip_if_empty: Don't write any shards if the PCollection is empty.
+        In case of an empty PCollection, this will still delete existing
+        files having same file path and not create new ones.
     """
 
     self._sink = _TextSink(
@@ -873,3 +901,170 @@ class WriteToText(PTransform):
 
   def expand(self, pcoll):
     return pcoll | Write(self._sink)
+
+
+try:
+  import pandas
+
+  def append_pandas_args(src, exclude):
+    def append(dest):
+      state = None
+      skip = False
+      extra_lines = []
+      for line in src.__doc__.split('\n'):
+        if line.strip() == 'Parameters':
+          indent = len(line) - len(line.lstrip())
+          extra_lines = ['\n\nPandas Parameters']
+          state = 'append'
+          continue
+        elif line.strip().startswith('Returns'):
+          break
+
+        if state == 'append':
+          if skip:
+            if line and not line[indent:].startswith(' '):
+              skip = False
+          if any(line.strip().startswith(arg + ' : ') for arg in exclude):
+            skip = True
+          if not skip:
+            extra_lines.append(line[indent:])
+      # Expand title underline due to Parameters -> Pandas Parameters.
+      extra_lines[1] += '-------'
+      dest.__doc__ += '\n'.join(extra_lines)
+      return dest
+
+    return append
+
+  @append_pandas_args(
+      pandas.read_csv, exclude=['filepath_or_buffer', 'iterator'])
+  def ReadFromCsv(path: str, *, splittable: bool = True, **kwargs):
+    """A PTransform for reading comma-separated values (csv) files into a
+    PCollection.
+
+    Args:
+      path (str): The file path to read from.  The path can contain glob
+        characters such as ``*`` and ``?``.
+      splittable (bool): Whether the csv files are splittable at line
+        boundaries, i.e. each line of this file represents a complete record.
+        This should be set to False if single records span multiple lines (e.g.
+        a quoted field has a newline inside of it).  Setting this to false may
+        disable liquid sharding.
+      **kwargs: Extra arguments passed to `pandas.read_csv` (see below).
+    """
+    from apache_beam.dataframe.io import ReadViaPandas
+    return 'ReadFromCsv' >> ReadViaPandas(
+        'csv', path, splittable=splittable, **kwargs)
+
+  @append_pandas_args(
+      pandas.DataFrame.to_csv, exclude=['path_or_buf', 'index', 'index_label'])
+  def WriteToCsv(
+      path: str,
+      num_shards: Optional[int] = None,
+      file_naming: Optional['fileio.FileNaming'] = None,
+      **kwargs):
+    # pylint: disable=line-too-long
+
+    """A PTransform for writing a schema'd PCollection as a (set of)
+    comma-separated values (csv) files.
+
+    Args:
+      path (str): The file path to write to. The files written will
+        begin with this prefix, followed by a shard identifier (see
+        `num_shards`) according to the `file_naming` parameter.
+      num_shards (optional int): The number of shards to use in the distributed
+        write. Defaults to None, letting the system choose an optimal value.
+      file_naming (optional callable): A file-naming strategy, determining the
+        actual shard names given their shard number, etc.
+        See the section on `file naming
+        <https://beam.apache.org/releases/pydoc/current/apache_beam.io.fileio.html#file-naming>`_
+        Defaults to `fileio.default_file_naming`, which names files as
+        `path-XXXXX-of-NNNNN`.
+      **kwargs: Extra arguments passed to `pandas.Dataframe.to_csv` (see below).
+    """
+    from apache_beam.dataframe.io import WriteViaPandas
+    if num_shards is not None:
+      kwargs['num_shards'] = num_shards
+    if file_naming is not None:
+      kwargs['file_naming'] = file_naming
+    return 'WriteToCsv' >> WriteViaPandas('csv', path, index=False, **kwargs)
+
+  @append_pandas_args(pandas.read_json, exclude=['path_or_buf'])
+  def ReadFromJson(
+      path: str,
+      *,
+      orient: str = 'records',
+      lines: bool = True,
+      dtype: Union[bool, Dict[str, Any]] = False,
+      **kwargs):
+    """A PTransform for reading json values from files into a PCollection.
+
+    Args:
+      path (str): The file path to read from.  The path can contain glob
+        characters such as ``*`` and ``?``.
+      orient (str): Format of the json elements in the file.
+        Default to 'records', meaning the file is expected to contain a list
+        of json objects like `{field1: value1, field2: value2, ...}`.
+      lines (bool): Whether each line should be considered a separate record,
+        as opposed to the entire file being a valid JSON object or list.
+        Defaults to True (unlike Pandas).
+      dtype (bool): If True, infer dtypes; if a dict of column to dtype,
+        then use those; if False, then don’t infer dtypes at all.
+        Defaults to False (unlike Pandas).
+      **kwargs: Extra arguments passed to `pandas.read_json` (see below).
+    """
+    from apache_beam.dataframe.io import ReadViaPandas
+    return 'ReadFromJson' >> ReadViaPandas(
+        'json', path, orient=orient, lines=lines, dtype=dtype, **kwargs)
+
+  @append_pandas_args(
+      pandas.DataFrame.to_json, exclude=['path_or_buf', 'index'])
+  def WriteToJson(
+      path: str,
+      *,
+      num_shards: Optional[int] = None,
+      file_naming: Optional['fileio.FileNaming'] = None,
+      orient: str = 'records',
+      lines: Optional[bool] = None,
+      **kwargs):
+    # pylint: disable=line-too-long
+
+    """A PTransform for writing a PCollection as json values to files.
+
+    Args:
+      path (str): The file path to write to. The files written will
+        begin with this prefix, followed by a shard identifier (see
+        `num_shards`) according to the `file_naming` parameter.
+      num_shards (optional int): The number of shards to use in the distributed
+        write. Defaults to None, letting the system choose an optimal value.
+      file_naming (optional callable): A file-naming strategy, determining the
+        actual shard names given their shard number, etc.
+        See the section on `file naming
+        <https://beam.apache.org/releases/pydoc/current/apache_beam.io.fileio.html#file-naming>`_
+        Defaults to `fileio.default_file_naming`, which names files as
+        `path-XXXXX-of-NNNNN`.
+      orient (str): Format of the json elements in the file.
+        Default to 'records', meaning the file will to contain a list
+        of json objects like `{field1: value1, field2: value2, ...}`.
+      lines (bool): Whether each line should be considered a separate record,
+        as opposed to the entire file being a valid JSON object or list.
+        Defaults to True if orient is 'records' (unlike Pandas).
+      **kwargs: Extra arguments passed to `pandas.Dataframe.to_json`
+        (see below).
+    """
+    from apache_beam.dataframe.io import WriteViaPandas
+    if num_shards is not None:
+      kwargs['num_shards'] = num_shards
+    if file_naming is not None:
+      kwargs['file_naming'] = file_naming
+    if lines is None:
+      lines = orient == 'records'
+    return 'WriteToJson' >> WriteViaPandas(
+        'json', path, orient=orient, lines=lines, **kwargs)
+
+except ImportError:
+
+  def no_pandas(*args, **kwargs):
+    raise ImportError('Please install apache_beam[dataframe]')
+
+  for transform in ('ReadFromCsv', 'WriteToCsv', 'ReadFromJson', 'WriteToJson'):
+    globals()[transform] = no_pandas

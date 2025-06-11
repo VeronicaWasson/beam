@@ -25,20 +25,20 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.stream.Collectors;
-import org.apache.beam.sdk.util.WindowedValue;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
-/** Unit tests for {@linkplain org.apache.beam.runners.samza.runtime.DoFnOp.FutureCollectorImpl}. */
+/** Unit tests for {@linkplain FutureCollectorImpl}. */
 public final class FutureCollectorImplTest {
   private static final List<String> RESULTS = ImmutableList.of("hello", "world");
-  private FutureCollector<String> futureCollector = new DoFnOp.FutureCollectorImpl<>();
+  private FutureCollector<String> futureCollector = new FutureCollectorImpl<>();
 
   @Before
   public void setup() {
-    futureCollector = new DoFnOp.FutureCollectorImpl<>();
+    futureCollector = new FutureCollectorImpl<>();
   }
 
   @Test(expected = IllegalStateException.class)

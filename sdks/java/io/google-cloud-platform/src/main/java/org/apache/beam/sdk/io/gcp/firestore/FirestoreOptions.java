@@ -17,6 +17,8 @@
  */
 package org.apache.beam.sdk.io.gcp.firestore;
 
+import org.apache.beam.sdk.extensions.gcp.options.GcpOptions;
+import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.checkerframework.checker.nullness.qual.Nullable;
@@ -45,4 +47,43 @@ public interface FirestoreOptions extends PipelineOptions {
    * @see com.google.cloud.firestore.FirestoreOptions.Builder#setEmulatorHost(java.lang.String)
    */
   void setEmulatorHost(String host);
+
+  /**
+   * The Firestore database ID to connect to. Note: named database is currently an internal feature
+   * in Firestore. Do not set this to anything other than "(default)".
+   */
+  @Description("Firestore database ID")
+  @Default.String("(default)")
+  String getFirestoreDb();
+
+  /** Set the Firestore database ID to connect to. */
+  void setFirestoreDb(String firestoreDb);
+
+  /**
+   * A host port pair to allow connecting to a Cloud Firestore instead of the default live service.
+   *
+   * @return the string representation of a host and port pair to be used when constructing Cloud
+   *     Firestore clients.
+   */
+  @Description("Firestore endpoint (host and port)")
+  @Default.String("batch-firestore.googleapis.com:443")
+  String getFirestoreHost();
+
+  /**
+   * Define a host port pair to allow connecting to a Cloud Firestore instead of the default live
+   * service.
+   *
+   * @param host the host and port to connect to
+   */
+  void setFirestoreHost(String host);
+
+  /** The Firestore project ID to connect to. */
+  @Description("Firestore project ID")
+  @Nullable
+  String getFirestoreProject();
+
+  /**
+   * Set the Firestore project ID, it will override the value from {@link GcpOptions#getProject()}.
+   */
+  void setFirestoreProject(String firestoreProject);
 }

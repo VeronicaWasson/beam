@@ -18,13 +18,11 @@
 package org.apache.beam.sdk.schemas;
 
 import java.io.Serializable;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.annotations.Internal;
+import org.apache.beam.sdk.values.TypeDescriptor;
 
 /** A Factory interface for schema-related objects for a specific Java type. */
-@Experimental(Kind.SCHEMAS)
 @Internal
 public interface Factory<T> extends Serializable {
-  T create(Class<?> clazz, Schema schema);
+  T create(TypeDescriptor<?> typeDescriptor, Schema schema);
 }

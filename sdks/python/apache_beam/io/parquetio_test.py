@@ -30,6 +30,7 @@ import pytest
 from parameterized import param
 from parameterized import parameterized
 
+import apache_beam as beam
 from apache_beam import Create
 from apache_beam import Map
 from apache_beam.io import filebasedsource
@@ -40,6 +41,7 @@ from apache_beam.io.parquetio import ReadAllFromParquetBatched
 from apache_beam.io.parquetio import ReadFromParquet
 from apache_beam.io.parquetio import ReadFromParquetBatched
 from apache_beam.io.parquetio import WriteToParquet
+from apache_beam.io.parquetio import WriteToParquetBatched
 from apache_beam.io.parquetio import _create_parquet_sink
 from apache_beam.io.parquetio import _create_parquet_source
 from apache_beam.testing.test_pipeline import TestPipeline
@@ -284,8 +286,6 @@ class TestParquet(unittest.TestCase):
         file_name,
         self.SCHEMA,
         'none',
-        1024 * 1024,
-        1000,
         False,
         False,
         '.end',
@@ -299,7 +299,6 @@ class TestParquet(unittest.TestCase):
             'file_pattern',
             'some_parquet_sink-%(shard_num)05d-of-%(num_shards)05d.end'),
         DisplayDataItemMatcher('codec', 'none'),
-        DisplayDataItemMatcher('row_group_buffer_size', str(1024 * 1024)),
         DisplayDataItemMatcher('compression', 'uncompressed')
     ]
     hc.assert_that(dd.items, hc.contains_inanyorder(*expected_items))
@@ -308,6 +307,7 @@ class TestParquet(unittest.TestCase):
     file_name = 'some_parquet_sink'
     write = WriteToParquet(file_name, self.SCHEMA)
     dd = DisplayData.create_from(write)
+
     expected_items = [
         DisplayDataItemMatcher('codec', 'none'),
         DisplayDataItemMatcher('schema', str(self.SCHEMA)),
@@ -319,6 +319,24 @@ class TestParquet(unittest.TestCase):
     ]
     hc.assert_that(dd.items, hc.contains_inanyorder(*expected_items))
 
+  def test_write_batched_display_data(self):
+    file_name = 'some_parquet_sink'
+    write = WriteToParquetBatched(file_name, self.SCHEMA)
+    dd = DisplayData.create_from(write)
+
+    expected_items = [
+        DisplayDataItemMatcher('codec', 'none'),
+        DisplayDataItemMatcher('schema', str(self.SCHEMA)),
+        DisplayDataItemMatcher(
+            'file_pattern',
+            'some_parquet_sink-%(shard_num)05d-of-%(num_shards)05d'),
+        DisplayDataItemMatcher('compression', 'uncompressed')
+    ]
+    hc.assert_that(dd.items, hc.contains_inanyorder(*expected_items))
+
+  @unittest.skipIf(
+      ARROW_MAJOR_VERSION >= 13,
+      'pyarrow 13.x and above does not throw ArrowInvalid error')
   def test_sink_transform_int96(self):
     with tempfile.NamedTemporaryFile() as dst:
       path = dst.name
@@ -339,6 +357,22 @@ class TestParquet(unittest.TestCase):
         _ = p \
         | Create(self.RECORDS) \
         | WriteToParquet(
+            path, self.SCHEMA, num_shards=1, shard_name_template='')
+      with TestPipeline() as p:
+        # json used for stable sortability
+        readback = \
+            p \
+            | ReadFromParquet(path) \
+            | Map(json.dumps)
+        assert_that(readback, equal_to([json.dumps(r) for r in self.RECORDS]))
+
+  def test_sink_transform_batched(self):
+    with TemporaryDirectory() as tmp_dirname:
+      path = os.path.join(tmp_dirname + "tmp_filename")
+      with TestPipeline() as p:
+        _ = p \
+        | Create([self._records_as_arrow()]) \
+        | WriteToParquetBatched(
             path, self.SCHEMA, num_shards=1, shard_name_template='')
       with TestPipeline() as p:
         # json used for stable sortability
@@ -369,6 +403,20 @@ class TestParquet(unittest.TestCase):
             | Map(json.dumps)
         assert_that(
             readback, equal_to([json.dumps(r) for r in self.RECORDS_NESTED]))
+
+  def test_schema_read_write(self):
+    with TemporaryDirectory() as tmp_dirname:
+      path = os.path.join(tmp_dirname, 'tmp_filename')
+      rows = [beam.Row(a=1, b='x'), beam.Row(a=2, b='y')]
+      stable_repr = lambda row: json.dumps(row._asdict())
+      with TestPipeline() as p:
+        _ = p | Create(rows) | WriteToParquet(path)
+      with TestPipeline() as p:
+        readback = (
+            p
+            | ReadFromParquet(path + '*', as_rows=True)
+            | Map(stable_repr))
+        assert_that(readback, equal_to([stable_repr(r) for r in rows]))
 
   def test_batched_read(self):
     with TemporaryDirectory() as tmp_dirname:
@@ -439,7 +487,11 @@ class TestParquet(unittest.TestCase):
     self._run_parquet_test(file_name, None, 10000, True, expected_result)
 
   def test_dynamic_work_rebalancing(self):
-    file_name = self._write_data(count=120, row_group_size=20)
+    # This test depends on count being sufficiently large + the ratio of
+    # count to row_group_size also being sufficiently large (but the required
+    # ratio to pass varies for values of row_group_size and, somehow, the
+    # version of pyarrow being tested against.)
+    file_name = self._write_data(count=280, row_group_size=20)
     source = _create_parquet_source(file_name)
 
     splits = [split for split in source.split(desired_bundle_size=float('inf'))]

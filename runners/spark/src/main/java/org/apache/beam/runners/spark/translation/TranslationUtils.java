@@ -26,6 +26,8 @@ import javax.annotation.Nonnull;
 import org.apache.beam.runners.core.InMemoryStateInternals;
 import org.apache.beam.runners.core.StateInternals;
 import org.apache.beam.runners.core.StateInternalsFactory;
+import org.apache.beam.runners.core.construction.SerializablePipelineOptions;
+import org.apache.beam.runners.spark.SparkPipelineOptions;
 import org.apache.beam.runners.spark.SparkRunner;
 import org.apache.beam.runners.spark.coders.CoderHelpers;
 import org.apache.beam.runners.spark.util.ByteArray;
@@ -38,15 +40,16 @@ import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.GlobalWindows;
 import org.apache.beam.sdk.transforms.windowing.Window;
 import org.apache.beam.sdk.transforms.windowing.WindowFn;
-import org.apache.beam.sdk.util.WindowedValue;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TupleTag;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
 import org.apache.beam.sdk.values.WindowingStrategy;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterators;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Maps;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterators;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Maps;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function;
@@ -54,8 +57,10 @@ import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.api.java.function.VoidFunction;
 import org.apache.spark.storage.StorageLevel;
+import org.apache.spark.streaming.Duration;
 import org.apache.spark.streaming.api.java.JavaDStream;
 import org.apache.spark.streaming.api.java.JavaPairDStream;
+import org.apache.spark.streaming.dstream.DStream;
 import scala.Tuple2;
 
 /** A set of utilities to help translating Beam transformations into Spark transformations. */
@@ -98,14 +103,14 @@ public final class TranslationUtils {
     @Override
     public WindowedValue<KV<K, OutputT>> call(WindowedValue<KV<K, Iterable<InputT>>> windowedKv)
         throws Exception {
-      return WindowedValue.of(
+      return WindowedValues.of(
           KV.of(
               windowedKv.getValue().getKey(),
               fn.getCombineFn()
                   .apply(windowedKv.getValue().getValue(), fn.ctxtForValue(windowedKv))),
           windowedKv.getTimestamp(),
           windowedKv.getWindows(),
-          windowedKv.getPane());
+          windowedKv.getPaneInfo());
     }
   }
 
@@ -150,7 +155,7 @@ public final class TranslationUtils {
   /** A pair to {@link KV} function . */
   static class FromPairFunction<K, V>
       implements Function<Tuple2<K, V>, KV<K, V>>,
-          org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Function<
+          org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Function<
               Tuple2<K, V>, KV<K, V>> {
     @Override
     public KV<K, V> call(Tuple2<K, V> t2) {
@@ -184,7 +189,7 @@ public final class TranslationUtils {
   /** Extract window from a {@link KV} with {@link WindowedValue} value. */
   static class ToKVByWindowInValueFunction<K, V>
       implements Function<KV<K, WindowedValue<V>>, WindowedValue<KV<K, V>>>,
-          org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Function<
+          org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Function<
               KV<K, WindowedValue<V>>, WindowedValue<KV<K, V>>> {
 
     @Override
@@ -255,6 +260,52 @@ public final class TranslationUtils {
         sideInputs.put(view.getTagInternal(), KV.of(windowingStrategy, helper));
       }
       return sideInputs;
+    }
+  }
+
+  /**
+   * Retrieves the batch duration in milliseconds from Spark pipeline options.
+   *
+   * @param options The serializable pipeline options containing Spark-specific settings
+   * @return The checkpoint duration in milliseconds as specified in SparkPipelineOptions
+   */
+  public static Long getBatchDuration(final SerializablePipelineOptions options) {
+    return options.get().as(SparkPipelineOptions.class).getCheckpointDurationMillis();
+  }
+
+  /**
+   * Reject timers {@link DoFn}.
+   *
+   * @param doFn the {@link DoFn} to possibly reject.
+   */
+  public static void rejectTimers(DoFn<?, ?> doFn) {
+    DoFnSignature signature = DoFnSignatures.getSignature(doFn.getClass());
+    if (signature.timerDeclarations().size() > 0
+        || signature.timerFamilyDeclarations().size() > 0) {
+      throw new UnsupportedOperationException(
+          String.format(
+              "Found %s annotations on %s, but %s cannot yet be used with timers in the %s.",
+              DoFn.TimerId.class.getSimpleName(),
+              doFn.getClass().getName(),
+              DoFn.class.getSimpleName(),
+              SparkRunner.class.getSimpleName()));
+    }
+  }
+
+  /**
+   * Checkpoints the given DStream if checkpointing is enabled in the pipeline options.
+   *
+   * @param dStream The DStream to be checkpointed
+   * @param options The SerializablePipelineOptions containing configuration settings including
+   *     batch duration
+   */
+  public static void checkpointIfNeeded(
+      final DStream<?> dStream, final SerializablePipelineOptions options) {
+
+    final Long checkpointDurationMillis = getBatchDuration(options);
+
+    if (checkpointDurationMillis > 0) {
+      dStream.checkpoint(new Duration(checkpointDurationMillis));
     }
   }
 
@@ -364,7 +415,7 @@ public final class TranslationUtils {
           pCollection.getWindowingStrategy().getWindowFn().windowCoder();
       @SuppressWarnings("unchecked")
       Coder<WindowedValue<?>> windowedValueCoder =
-          (Coder<WindowedValue<?>>) (Coder<?>) WindowedValue.getFullCoder(coder, wCoder);
+          (Coder<WindowedValue<?>>) (Coder<?>) WindowedValues.getFullCoder(coder, wCoder);
       coderMap.put(output.getKey(), windowedValueCoder);
     }
     return coderMap;

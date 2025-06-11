@@ -17,7 +17,7 @@
  */
 package org.apache.beam.runners.spark;
 
-import org.apache.beam.runners.core.construction.resources.PipelineResources;
+import org.apache.beam.runners.spark.structuredstreaming.SparkStructuredStreamingRunner;
 import org.apache.beam.sdk.annotations.Internal;
 import org.apache.beam.sdk.options.ApplicationNameOptions;
 import org.apache.beam.sdk.options.Default;
@@ -26,6 +26,7 @@ import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.FileStagingOptions;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.StreamingOptions;
+import org.apache.beam.sdk.util.construction.resources.PipelineResources;
 
 /**
  * Spark runner {@link PipelineOptions} handles Spark execution-related configurations, such as the
@@ -50,11 +51,26 @@ public interface SparkCommonPipelineOptions
 
   void setCheckpointDir(String checkpointDir);
 
+  @Description("Batch default storage level")
+  @Default.InstanceFactory(StorageLevelFactory.class)
+  String getStorageLevel();
+
+  void setStorageLevel(String storageLevel);
+
   @Description("Enable/disable sending aggregator values to Spark's metric sinks")
   @Default.Boolean(true)
   Boolean getEnableSparkMetricSinks();
 
   void setEnableSparkMetricSinks(Boolean enableSparkMetricSinks);
+
+  @Description(
+      "When set to true, runner will try to prefer GroupByKey translation which can handle huge values and "
+          + "does not require them to fit into memory. This will most likely have performance impact "
+          + "for pipelines which does not work with huge values, hence it is disabled by default.")
+  @Default.Boolean(false)
+  Boolean getPreferGroupByKeyToHandleHugeValues();
+
+  void setPreferGroupByKeyToHandleHugeValues(Boolean preferGroupByKeyToHandleHugeValues);
 
   /**
    * Returns the default checkpoint directory of /tmp/${job.name}. For testing purposes only.
@@ -76,6 +92,19 @@ public interface SparkCommonPipelineOptions
   static void prepareFilesToStage(SparkCommonPipelineOptions options) {
     if (!options.getSparkMaster().matches("local\\[?\\d*]?")) {
       PipelineResources.prepareFilesForStaging(options);
+    }
+  }
+
+  /**
+   * Returns Spark's default storage level for the Dataset or RDD API based on the respective
+   * runner.
+   */
+  class StorageLevelFactory implements DefaultValueFactory<String> {
+    @Override
+    public String create(PipelineOptions options) {
+      return SparkStructuredStreamingRunner.class.equals(options.getRunner())
+          ? "MEMORY_AND_DISK"
+          : "MEMORY_ONLY";
     }
   }
 }

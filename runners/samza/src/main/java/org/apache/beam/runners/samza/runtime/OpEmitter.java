@@ -19,7 +19,7 @@ package org.apache.beam.runners.samza.runtime;
 
 import java.util.Collection;
 import java.util.concurrent.CompletionStage;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValue;
 import org.joda.time.Instant;
 
 /** Output emitter for Samza {@link Op}. */
@@ -32,4 +32,10 @@ public interface OpEmitter<OutT> {
   void emitWatermark(Instant watermark);
 
   <T> void emitView(String id, WindowedValue<Iterable<T>> elements);
+
+  Collection<OpMessage<OutT>> collectOutput();
+
+  CompletionStage<Collection<OpMessage<OutT>>> collectFuture();
+
+  Long collectWatermark();
 }

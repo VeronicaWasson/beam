@@ -26,9 +26,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloud.google.com/go/profiler"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/metrics"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/runtime/exec"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/runtime/graphx"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/runtime/harness/statecache"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/util/hooks"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/internal/errors"
@@ -36,33 +38,41 @@ import (
 	fnpb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/fnexecution_v1"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/util/diagnostics"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/util/grpcx"
-	"github.com/golang/protobuf/proto"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // URNMonitoringInfoShortID is a URN indicating support for short monitoring info IDs.
 const URNMonitoringInfoShortID = "beam:protocol:monitoring_info_short_ids:v1"
 
-// TODO(herohde) 2/8/2017: for now, assume we stage a full binary (not a plugin).
+// Options for harness.Main that affect execution of the harness, such as runner capabilities.
+type Options struct {
+	RunnerCapabilities []string // URNs for what runners are able to understand over the FnAPI.
+	StatusEndpoint     string   // Endpoint for worker status reporting.
+}
 
 // Main is the main entrypoint for the Go harness. It runs at "runtime" -- not
 // "pipeline-construction time" -- on each worker. It is a FnAPI client and
 // ultimately responsible for correctly executing user code.
+//
+// Deprecated: Prefer MainWithOptions instead.
 func Main(ctx context.Context, loggingEndpoint, controlEndpoint string) error {
+	return MainWithOptions(ctx, loggingEndpoint, controlEndpoint, Options{})
+}
+
+// MainWithOptions is the main entrypoint for the Go harness. It runs at "runtime" -- not
+// "pipeline-construction time" -- on each worker. It is a FnAPI client and
+// ultimately responsible for correctly executing user code.
+//
+// Options are optional configurations for interfacing with the runner or similar.
+func MainWithOptions(ctx context.Context, loggingEndpoint, controlEndpoint string, opts Options) error {
 	hooks.DeserializeHooksFromOptions(ctx)
 
-	// Extract environment variables. These are optional runner supported capabilities.
-	// Expected env variables:
-	// RUNNER_CAPABILITIES : list of runner supported capability urn.
-	// STATUS_ENDPOINT : Endpoint to connect to status server used for worker status reporting.
-	statusEndpoint := os.Getenv("STATUS_ENDPOINT")
-	runnerCapabilities := strings.Split(os.Getenv("RUNNER_CAPABILITIES"), " ")
 	rcMap := make(map[string]bool)
-	if len(runnerCapabilities) > 0 {
-		for _, capability := range runnerCapabilities {
-			rcMap[capability] = true
-		}
+	for _, capability := range opts.RunnerCapabilities {
+		rcMap[capability] = true
 	}
 
 	// Pass in the logging endpoint for use w/the default remote logging hook.
@@ -72,11 +82,22 @@ func Main(ctx context.Context, loggingEndpoint, controlEndpoint string) error {
 		return err
 	}
 
+	// Check for environment variables for cloud profiling.
+	// If both present, start running profiler.
+	if name, id := os.Getenv("CLOUD_PROF_JOB_NAME"), os.Getenv("CLOUD_PROF_JOB_ID"); name != "" && id != "" {
+		log.Debugf(ctx, "enabling cloud profiling for job name: %v, job id: %v", name, id)
+		cfg := profiler.Config{
+			Service:        name,
+			ServiceVersion: id,
+		}
+		if err := profiler.Start(cfg); err != nil {
+			log.Errorf(ctx, "failed to start cloud profiler, got %v", err)
+		}
+	}
+
 	if tempLocation := beam.PipelineOptions.Get("temp_location"); tempLocation != "" && samplingFrequencySeconds > 0 {
 		go diagnostics.SampleForHeapProfile(ctx, samplingFrequencySeconds, maxTimeBetweenDumpsSeconds)
 	}
-
-	recordHeader()
 
 	// Connect to FnAPI control server. Receive and execute work.
 	conn, err := dial(ctx, controlEndpoint, "control", 60*time.Second)
@@ -88,9 +109,7 @@ func Main(ctx context.Context, loggingEndpoint, controlEndpoint string) error {
 	client := fnpb.NewBeamFnControlClient(conn)
 
 	lookupDesc := func(id bundleDescriptorID) (*fnpb.ProcessBundleDescriptor, error) {
-		pbd, err := client.GetProcessBundleDescriptor(ctx, &fnpb.GetProcessBundleDescriptorRequest{ProcessBundleDescriptorId: string(id)})
-		log.Debugf(ctx, "GPBD RESP [%v]: %v, err %v", id, pbd, err)
-		return pbd, err
+		return client.GetProcessBundleDescriptor(ctx, &fnpb.GetProcessBundleDescriptorRequest{ProcessBundleDescriptorId: string(id)})
 	}
 
 	stub, err := client.Control(ctx)
@@ -112,7 +131,8 @@ func Main(ctx context.Context, loggingEndpoint, controlEndpoint string) error {
 	go func() {
 		defer wg.Done()
 		for resp := range respc {
-			log.Debugf(ctx, "RESP: %v", proto.MarshalTextString(resp))
+			// TODO(lostluck): 2023/03/29 fix debug level logging to be flagged.
+			// log.Debugf(ctx, "RESP: %v", proto.MarshalTextString(resp))
 
 			if err := stub.Send(resp); err != nil {
 				log.Errorf(ctx, "control.Send: Failed to respond: %v", err)
@@ -139,9 +159,14 @@ func Main(ctx context.Context, loggingEndpoint, controlEndpoint string) error {
 		runnerCapabilities:   rcMap,
 	}
 
+	if enabled, ok := rcMap[graphx.URNDataSampling]; ok && enabled {
+		ctrl.dataSampler = exec.NewDataSampler(ctx)
+		go ctrl.dataSampler.Process()
+	}
+
 	// if the runner supports worker status api then expose SDK harness status
-	if statusEndpoint != "" {
-		statusHandler, err := newWorkerStatusHandler(ctx, statusEndpoint, ctrl.cache, func(statusInfo *strings.Builder) { ctrl.metStoreToString(statusInfo) })
+	if opts.StatusEndpoint != "" {
+		statusHandler, err := newWorkerStatusHandler(ctx, opts.StatusEndpoint, ctrl.cache, func(statusInfo *strings.Builder) { ctrl.metStoreToString(statusInfo) })
 		if err != nil {
 			log.Errorf(ctx, "error establishing connection to worker status API: %v", err)
 		} else {
@@ -164,24 +189,20 @@ func Main(ctx context.Context, loggingEndpoint, controlEndpoint string) error {
 			close(respc)
 			wg.Wait()
 			if err == io.EOF {
-				recordFooter()
 				return nil
 			}
 			return errors.Wrapf(err, "control.Recv failed")
 		}
 
 		// Launch a goroutine to handle the control message.
-		// TODO(wcn): implement a rate limiter for 'heavy' messages?
 		fn := func(ctx context.Context, req *fnpb.InstructionRequest) {
-			log.Debugf(ctx, "RECV: %v", proto.MarshalTextString(req))
-			recordInstructionRequest(req)
-
+			// TODO(lostluck): 2023/03/29 fix debug level logging to be flagged.
+			// log.Debugf(ctx, "RECV: %v", proto.MarshalTextString(req))
 			ctx = hooks.RunRequestHooks(ctx, req)
 			resp := ctrl.handleInstruction(ctx, req)
 
 			hooks.RunResponseHooks(ctx, req, resp)
 
-			recordInstructionResponse(resp)
 			if resp != nil && atomic.LoadInt32(&shutdown) == 0 {
 				respc <- resp
 			}
@@ -265,7 +286,9 @@ type awaitingFinalization struct {
 }
 
 type control struct {
-	lookupDesc  func(bundleDescriptorID) (*fnpb.ProcessBundleDescriptor, error)
+	lookupDesc     func(bundleDescriptorID) (*fnpb.ProcessBundleDescriptor, error)
+	bundleGetGroup singleflight.Group
+
 	descriptors map[bundleDescriptorID]*fnpb.ProcessBundleDescriptor // protected by mu
 	// plans that are candidates for execution.
 	plans map[bundleDescriptorID][]*exec.Plan // protected by mu
@@ -288,6 +311,7 @@ type control struct {
 	// TODO(BEAM-11097): Cache is currently unused.
 	cache              *statecache.SideInputCache
 	runnerCapabilities map[string]bool
+	dataSampler        *exec.DataSampler
 }
 
 func (c *control) metStoreToString(statusInfo *strings.Builder) {
@@ -303,36 +327,42 @@ func (c *control) metStoreToString(statusInfo *strings.Builder) {
 func (c *control) getOrCreatePlan(bdID bundleDescriptorID) (*exec.Plan, error) {
 	c.mu.Lock()
 	plans, ok := c.plans[bdID]
-	var plan *exec.Plan
+	// If we have a spare plan for this bdID, we're done.
+	// Remove it from the cache, and return it.
 	if ok && len(plans) > 0 {
-		plan = plans[len(plans)-1]
+		plan := plans[len(plans)-1]
 		c.plans[bdID] = plans[:len(plans)-1]
-	} else {
-		desc, ok := c.descriptors[bdID]
-		if !ok {
-			c.mu.Unlock() // Unlock to make the lookup.
+		c.mu.Unlock()
+		return plan, nil
+	}
+	desc, ok := c.descriptors[bdID]
+	c.mu.Unlock() // Unlock to make the lookup or build the descriptor.
+	if !ok {
+		newDesc, err, _ := c.bundleGetGroup.Do(string(bdID), func() (any, error) {
 			newDesc, err := c.lookupDesc(bdID)
 			if err != nil {
 				return nil, errors.WithContextf(err, "execution plan for %v not found", bdID)
 			}
 			c.mu.Lock()
 			c.descriptors[bdID] = newDesc
-			desc = newDesc
-		}
-		newPlan, err := exec.UnmarshalPlan(desc)
-		if err != nil {
 			c.mu.Unlock()
-			return nil, errors.WithContextf(err, "invalid bundle desc: %v\n%v\n", bdID, desc.String())
+			return newDesc, nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		plan = newPlan
+		desc = newDesc.(*fnpb.ProcessBundleDescriptor)
 	}
-	c.mu.Unlock()
-	return plan, nil
+	newPlan, err := exec.UnmarshalPlan(desc, c.dataSampler)
+	if err != nil {
+		return nil, errors.WithContextf(err, "invalid bundle desc: %v\n%v\n", bdID, desc.String())
+	}
+	return newPlan, nil
 }
 
 func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRequest) *fnpb.InstructionResponse {
 	instID := instructionID(req.GetInstructionId())
-	ctx = setInstID(ctx, instID)
+	ctx = metrics.SetBundleID(ctx, string(instID))
 
 	switch {
 	case req.GetRegister() != nil:
@@ -355,9 +385,10 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 		msg := req.GetProcessBundle()
 
 		// NOTE: the harness sends a 0-length process bundle request to sources (changed?)
-
 		bdID := bundleDescriptorID(msg.GetProcessBundleDescriptorId())
-		log.Debugf(ctx, "PB [%v]: %v", instID, msg)
+
+		// TODO(lostluck): 2023/03/29 fix debug level logging to be flagged.
+		// log.Debugf(ctx, "PB [%v]: %v", instID, msg)
 		plan, err := c.getOrCreatePlan(bdID)
 
 		// Make the plan active.
@@ -365,13 +396,13 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 		c.inactive.Remove(instID)
 		c.active[instID] = plan
 		// Get the user metrics store for this bundle.
-		ctx = metrics.SetBundleID(ctx, string(instID))
 		store := metrics.GetStore(ctx)
 		c.metStore[instID] = store
 		c.mu.Unlock()
 
 		if err != nil {
-			return fail(ctx, instID, "Failed: %v", err)
+			c.failed[instID] = err
+			return fail(ctx, instID, "ProcessBundle failed: %v", err)
 		}
 
 		tokens := msg.GetCacheTokens()
@@ -387,19 +418,25 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 
 		sampler.stop()
 
-		data.Close()
+		dataError := data.Close()
 		state.Close()
 
 		c.cache.CompleteBundle(tokens...)
 
-		mons, pylds := monitoring(plan, store, c.runnerCapabilities[URNMonitoringInfoShortID])
+		mons, pylds, _ := monitoring(plan, store, c.runnerCapabilities[URNMonitoringInfoShortID])
 
+		checkpoints := plan.Checkpoint()
 		requiresFinalization := false
 		// Move the plan back to the candidate state
 		c.mu.Lock()
 		// Mark the instruction as failed.
 		if err != nil {
 			c.failed[instID] = err
+		} else if dataError != io.EOF && dataError != nil {
+			// If there was an error on the data channel reads, fail this bundle
+			// since we may have had a short read.
+			c.failed[instID] = dataError
+			err = dataError
 		} else {
 			// Non failure plans should either be moved to the finalized state
 			// or to plans so they can be re-used.
@@ -426,21 +463,19 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 			}
 		}
 
-		// Check if the underlying DoFn self-checkpointed.
-		sr, delay, checkpointed, checkErr := plan.Checkpoint()
-
 		var rRoots []*fnpb.DelayedBundleApplication
-		if checkpointed {
-			rRoots = make([]*fnpb.DelayedBundleApplication, len(sr.RS))
-			for i, r := range sr.RS {
-				rRoots[i] = &fnpb.DelayedBundleApplication{
-					Application: &fnpb.BundleApplication{
-						TransformId:      sr.TId,
-						InputId:          sr.InId,
-						Element:          r,
-						OutputWatermarks: sr.OW,
-					},
-					RequestedTimeDelay: durationpb.New(delay),
+		if len(checkpoints) > 0 {
+			for _, cp := range checkpoints {
+				for _, r := range cp.SR.RS {
+					rRoots = append(rRoots, &fnpb.DelayedBundleApplication{
+						Application: &fnpb.BundleApplication{
+							TransformId:      cp.SR.TId,
+							InputId:          cp.SR.InId,
+							Element:          r,
+							OutputWatermarks: cp.SR.OW,
+						},
+						RequestedTimeDelay: durationpb.New(cp.Reapply),
+					})
 				}
 			}
 		}
@@ -456,11 +491,6 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 		if err != nil {
 			return fail(ctx, instID, "process bundle failed for instruction %v using plan %v : %v", instID, bdID, err)
 		}
-
-		if checkErr != nil {
-			return fail(ctx, instID, "process bundle failed at checkpointing for instruction %v using plan %v : %v", instID, bdID, checkErr)
-		}
-
 		return &fnpb.InstructionResponse{
 			InstructionId: string(instID),
 			Response: &fnpb.InstructionResponse_ProcessBundle{
@@ -516,14 +546,15 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 			}
 		}
 
-		mons, pylds := monitoring(plan, store, c.runnerCapabilities[URNMonitoringInfoShortID])
+		mons, pylds, consumingReceivedData := monitoring(plan, store, c.runnerCapabilities[URNMonitoringInfoShortID])
 
 		return &fnpb.InstructionResponse{
 			InstructionId: string(instID),
 			Response: &fnpb.InstructionResponse_ProcessBundleProgress{
 				ProcessBundleProgress: &fnpb.ProcessBundleProgressResponse{
-					MonitoringData:  pylds,
-					MonitoringInfos: mons,
+					MonitoringData:        pylds,
+					MonitoringInfos:       mons,
+					ConsumingReceivedData: &consumingReceivedData,
 				},
 			},
 		}
@@ -531,7 +562,8 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 	case req.GetProcessBundleSplit() != nil:
 		msg := req.GetProcessBundleSplit()
 
-		log.Debugf(ctx, "PB Split: %v", msg)
+		// TODO(lostluck): 2023/03/29 fix debug level logging to be flagged.
+		// log.Debugf(ctx, "PB Split: %v", msg)
 		ref := instructionID(msg.GetInstructionId())
 
 		plan, _, resp := c.getPlanOrResponse(ctx, "split", instID, ref)
@@ -552,7 +584,7 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 		if ds == nil {
 			return fail(ctx, instID, "failed to split: desired splits for root of %v was empty.", ref)
 		}
-		sr, err := plan.Split(exec.SplitPoints{
+		sr, err := plan.Split(ctx, exec.SplitPoints{
 			Splits:  ds.GetAllowedSplitPoints(),
 			Frac:    ds.GetFractionOfRemainder(),
 			BufSize: ds.GetEstimatedInputElements(),
@@ -562,9 +594,20 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 			return fail(ctx, instID, "unable to split %v: %v", ref, err)
 		}
 
+		// Unsuccessful splits without errors indicate we should return an empty response,
+		// as processing can continue.
+		if sr.Unsuccessful {
+			return &fnpb.InstructionResponse{
+				InstructionId: string(instID),
+				Response: &fnpb.InstructionResponse_ProcessBundleSplit{
+					ProcessBundleSplit: &fnpb.ProcessBundleSplitResponse{},
+				},
+			}
+		}
+
 		var pRoots []*fnpb.BundleApplication
 		var rRoots []*fnpb.DelayedBundleApplication
-		if sr.PS != nil && len(sr.PS) > 0 && sr.RS != nil && len(sr.RS) > 0 {
+		if len(sr.PS) > 0 && len(sr.RS) > 0 {
 			pRoots = make([]*fnpb.BundleApplication, len(sr.PS))
 			for i, p := range sr.PS {
 				pRoots[i] = &fnpb.BundleApplication{
@@ -620,7 +663,30 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 				},
 			},
 		}
+	case req.GetSampleData() != nil:
+		msg := req.GetSampleData()
+		var samples = make(map[string]*fnpb.SampleDataResponse_ElementList)
+		if c.dataSampler != nil {
+			var elementsMap = c.dataSampler.GetSamples(msg.GetPcollectionIds())
+			for pid, elements := range elementsMap {
+				var elementList fnpb.SampleDataResponse_ElementList
+				for i := range elements {
+					var sampledElement = &fnpb.SampledElement{
+						Element:         elements[i].Element,
+						SampleTimestamp: timestamppb.New(elements[i].Timestamp),
+					}
+					elementList.Elements = append(elementList.Elements, sampledElement)
+				}
+				samples[pid] = &elementList
+			}
+		}
 
+		return &fnpb.InstructionResponse{
+			InstructionId: string(instID),
+			Response: &fnpb.InstructionResponse_SampleData{
+				SampleData: &fnpb.SampleDataResponse{ElementSamples: samples},
+			},
+		}
 	default:
 		return fail(ctx, instID, "Unexpected request: %v", req)
 	}
@@ -660,7 +726,7 @@ func (c *control) getPlanOrResponse(ctx context.Context, kind string, instID, re
 	return plan, store, nil
 }
 
-func fail(ctx context.Context, id instructionID, format string, args ...interface{}) *fnpb.InstructionResponse {
+func fail(ctx context.Context, id instructionID, format string, args ...any) *fnpb.InstructionResponse {
 	log.Output(ctx, log.SevError, 1, fmt.Sprintf(format, args...))
 	dummy := &fnpb.InstructionResponse_Register{Register: &fnpb.RegisterResponse{}}
 
@@ -674,6 +740,6 @@ func fail(ctx context.Context, id instructionID, format string, args ...interfac
 // dial to the specified endpoint. if timeout <=0, call blocks until
 // grpc.Dial succeeds.
 func dial(ctx context.Context, endpoint, purpose string, timeout time.Duration) (*grpc.ClientConn, error) {
-	log.Infof(ctx, "Connecting via grpc @ %s for %s ...", endpoint, purpose)
+	log.Output(ctx, log.SevDebug, 1, fmt.Sprintf("Connecting via grpc @ %s for %s ...", endpoint, purpose))
 	return grpcx.Dial(ctx, endpoint, timeout)
 }

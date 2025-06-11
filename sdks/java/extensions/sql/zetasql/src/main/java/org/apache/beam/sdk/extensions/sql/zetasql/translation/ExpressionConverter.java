@@ -29,7 +29,7 @@ import static org.apache.beam.sdk.extensions.sql.zetasql.BeamZetaSqlCatalog.PRE_
 import static org.apache.beam.sdk.extensions.sql.zetasql.BeamZetaSqlCatalog.USER_DEFINED_JAVA_SCALAR_FUNCTIONS;
 import static org.apache.beam.sdk.extensions.sql.zetasql.BeamZetaSqlCatalog.USER_DEFINED_SQL_FUNCTIONS;
 import static org.apache.beam.sdk.extensions.sql.zetasql.BeamZetaSqlCatalog.ZETASQL_FUNCTION_GROUP_NAME;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import com.google.common.base.Ascii;
 import com.google.common.base.Preconditions;
@@ -37,6 +37,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.zetasql.TVFRelation;
+import com.google.zetasql.TVFRelation.Column;
 import com.google.zetasql.TableValuedFunction;
 import com.google.zetasql.TableValuedFunction.FixedOutputSchemaTVF;
 import com.google.zetasql.Type;
@@ -65,6 +66,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import org.apache.beam.repackaged.core.org.apache.commons.lang3.reflect.FieldUtils;
 import org.apache.beam.sdk.annotations.Internal;
 import org.apache.beam.sdk.extensions.sql.impl.QueryPlanner.QueryParameters;
 import org.apache.beam.sdk.extensions.sql.impl.ZetaSqlUserDefinedSQLNativeTableValuedFunction;
@@ -495,9 +497,16 @@ public class ExpressionConverter {
                   new ZetaSqlUserDefinedSQLNativeTableValuedFunction(
                       new SqlIdentifier(tvf.getName(), SqlParserPos.ZERO),
                       opBinding -> {
+                        TVFRelation rel = fixedOutputSchemaTVF.getOutputSchema();
+                        // TODO(yathu) revert this workaround when ZetaSQL adds back this API.
+                        List<Column> cols;
+                        try {
+                          cols = (List<Column>) FieldUtils.readField(rel, "columns", true);
+                        } catch (IllegalAccessException e) {
+                          throw new RuntimeException(e);
+                        }
                         List<RelDataTypeField> relDataTypeFields =
-                            convertTVFRelationColumnsToRelDataTypeFields(
-                                fixedOutputSchemaTVF.getOutputSchema().getColumns());
+                            convertTVFRelationColumnsToRelDataTypeFields(cols);
                         return new RelRecordType(relDataTypeFields);
                       },
                       null,

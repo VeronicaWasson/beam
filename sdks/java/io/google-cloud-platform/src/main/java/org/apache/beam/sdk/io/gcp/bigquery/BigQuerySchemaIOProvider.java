@@ -21,8 +21,10 @@ import com.google.api.services.bigquery.model.TableRow;
 import com.google.auto.service.AutoService;
 import java.io.Serializable;
 import java.util.HashMap;
-import org.apache.beam.sdk.annotations.Experimental;
 import org.apache.beam.sdk.annotations.Internal;
+import org.apache.beam.sdk.io.gcp.testing.FakeBigQueryServices;
+import org.apache.beam.sdk.io.gcp.testing.FakeDatasetService;
+import org.apache.beam.sdk.io.gcp.testing.FakeJobService;
 import org.apache.beam.sdk.schemas.Schema;
 import org.apache.beam.sdk.schemas.Schema.FieldType;
 import org.apache.beam.sdk.schemas.io.SchemaIO;
@@ -34,16 +36,14 @@ import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PDone;
 import org.apache.beam.sdk.values.Row;
 import org.checkerframework.checker.nullness.qual.Nullable;
+import org.joda.time.Duration;
 
 /**
  * An implementation of {@link SchemaIOProvider} for reading and writing to BigQuery with {@link
  * BigQueryIO}. For a description of configuration options and other defaults, see {@link
  * BigQuerySchemaIOProvider#configurationSchema()}.
- *
- * <p>This transform is still experimental, and is still subject to breaking changes.
  */
 @Internal
-@Experimental
 @AutoService(SchemaIOProvider.class)
 public class BigQuerySchemaIOProvider implements SchemaIOProvider {
 
@@ -90,6 +90,8 @@ public class BigQuerySchemaIOProvider implements SchemaIOProvider {
         .addNullableField("query", FieldType.STRING)
         .addNullableField("queryLocation", FieldType.STRING)
         .addNullableField("createDisposition", FieldType.STRING)
+        .addNullableField("useTestingBigQueryServices", FieldType.BOOLEAN)
+        .addNullableField("autoSharding", FieldType.BOOLEAN)
         .build();
   }
 
@@ -194,7 +196,27 @@ public class BigQuerySchemaIOProvider implements SchemaIOProvider {
           BigQueryIO.Write<Row> write =
               BigQueryIO.<Row>write()
                   .useBeamSchema()
-                  .withMethod(BigQueryIO.Write.Method.STORAGE_WRITE_API);
+                  .withMethod(BigQueryIO.Write.Method.STORAGE_WRITE_API)
+                  .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_APPEND);
+
+          final Boolean autoSharding = config.getBoolean("autoSharding");
+          // use default value true for autoSharding if not configured for STORAGE_WRITE_API
+          if (input.isBounded() == PCollection.IsBounded.UNBOUNDED) {
+            write = write.withTriggeringFrequency(Duration.standardSeconds(5));
+            if (autoSharding == null || autoSharding) {
+              write = write.withAutoSharding();
+            }
+          }
+
+          final Boolean useTestingBigQueryServices =
+              config.getBoolean("useTestingBigQueryServices");
+          if (useTestingBigQueryServices != null && useTestingBigQueryServices) {
+            FakeBigQueryServices fbqs =
+                new FakeBigQueryServices()
+                    .withDatasetService(new FakeDatasetService())
+                    .withJobService(new FakeJobService());
+            write = write.withTestServices(fbqs);
+          }
 
           String table = config.getString("table");
           if (table != null) {

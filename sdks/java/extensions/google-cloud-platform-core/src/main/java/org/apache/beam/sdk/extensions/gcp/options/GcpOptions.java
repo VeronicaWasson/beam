@@ -17,8 +17,8 @@
  */
 package org.apache.beam.sdk.extensions.gcp.options;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Strings.isNullOrEmpty;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Strings.isNullOrEmpty;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.google.api.client.http.HttpRequestInitializer;
@@ -27,6 +27,7 @@ import com.google.api.client.util.Sleeper;
 import com.google.api.services.cloudresourcemanager.CloudResourceManager;
 import com.google.api.services.cloudresourcemanager.model.Project;
 import com.google.api.services.storage.model.Bucket;
+import com.google.api.services.storage.model.Bucket.SoftDeletePolicy;
 import com.google.auth.Credentials;
 import com.google.auth.http.HttpCredentialsAdapter;
 import com.google.cloud.hadoop.util.ChainingHttpRequestInitializer;
@@ -37,16 +38,19 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.security.GeneralSecurityException;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import org.apache.beam.sdk.annotations.Experimental;
 import org.apache.beam.sdk.extensions.gcp.auth.CredentialFactory;
 import org.apache.beam.sdk.extensions.gcp.auth.GcpCredentialFactory;
 import org.apache.beam.sdk.extensions.gcp.auth.NullCredentialInitializer;
 import org.apache.beam.sdk.extensions.gcp.storage.PathValidator;
 import org.apache.beam.sdk.extensions.gcp.util.BackOffAdapter;
+import org.apache.beam.sdk.extensions.gcp.util.GcsUtil;
 import org.apache.beam.sdk.extensions.gcp.util.RetryHttpRequestInitializer;
 import org.apache.beam.sdk.extensions.gcp.util.Transport;
 import org.apache.beam.sdk.extensions.gcp.util.gcsfs.GcsPath;
@@ -57,9 +61,9 @@ import org.apache.beam.sdk.options.ExperimentalOptions;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.util.FluentBackoff;
 import org.apache.beam.sdk.util.InstanceBuilder;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.io.Files;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.io.Files;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Duration;
 import org.slf4j.Logger;
@@ -141,6 +145,43 @@ public interface GcpOptions extends GoogleApiDebugOptions, PipelineOptions {
   void setWorkerZone(String workerZone);
 
   /**
+   * Controls the OAuth scopes that will be requested when creating {@link Credentials} with the
+   * {@link GcpCredentialFactory} (which is the default {@link CredentialFactory}). If the {@link
+   * #setGcpCredential credential} or {@link #setCredentialFactoryClass credential factory} have
+   * been set then this field may do nothing.
+   */
+  @Default.InstanceFactory(GcpOAuthScopesFactory.class)
+  @Description(
+      "Controls the OAuth scopes that will be requested when creating credentials with the GcpCredentialFactory (which is the default credential factory). If the GCP credential or credential factory have been set then this property may do nothing.")
+  List<String> getGcpOauthScopes();
+
+  void setGcpOauthScopes(List<String> oauthScopes);
+
+  /** Returns the default set of OAuth scopes. */
+  class GcpOAuthScopesFactory implements DefaultValueFactory<List<String>> {
+
+    @Override
+    public List<String> create(PipelineOptions options) {
+      /**
+       * The scope cloud-platform provides access to all Cloud Platform resources. cloud-platform
+       * isn't sufficient yet for talking to datastore so we request those resources separately.
+       *
+       * <p>Note that trusted scope relationships don't apply to OAuth tokens, so for services we
+       * access directly (GCS) as opposed to through the backend (BigQuery, GCE), we need to
+       * explicitly request that scope.
+       */
+      return Arrays.asList(
+          "https://www.googleapis.com/auth/cloud-platform",
+          "https://www.googleapis.com/auth/devstorage.full_control",
+          "https://www.googleapis.com/auth/userinfo.email",
+          "https://www.googleapis.com/auth/datastore",
+          "https://www.googleapis.com/auth/bigquery",
+          "https://www.googleapis.com/auth/bigquery.insertdata",
+          "https://www.googleapis.com/auth/pubsub");
+    }
+  }
+
+  /**
    * The class of the credential factory that should be created and used to create credentials. If
    * gcpCredential has not been set explicitly, an instance of this class will be constructed and
    * used as a credential factory.
@@ -182,7 +223,6 @@ public interface GcpOptions extends GoogleApiDebugOptions, PipelineOptions {
           + " either a single service account as the impersonator, or a"
           + " comma-separated list of service accounts to create an"
           + " impersonation delegation chain.")
-  @JsonIgnore
   @Nullable
   String getImpersonateServiceAccount();
 
@@ -203,7 +243,7 @@ public interface GcpOptions extends GoogleApiDebugOptions, PipelineOptions {
 
   /**
    * Attempts to infer the default project based upon the environment this application is executing
-   * within. Currently this only supports getting the default project from gcloud.
+   * within. Currently this only supports getting the active project from gcloud.
    */
   class DefaultProjectFactory implements DefaultValueFactory<String> {
     private static final Logger LOG = LoggerFactory.getLogger(DefaultProjectFactory.class);
@@ -218,9 +258,19 @@ public interface GcpOptions extends GoogleApiDebugOptions, PipelineOptions {
           configFile = new File(getEnvironment().get("APPDATA"), "gcloud/properties");
         } else {
           // New versions of gcloud use this file
+          String activeConfig;
+          File activeConfigFile =
+              new File(System.getProperty("user.home"), ".config/gcloud/active_config");
+          if (activeConfigFile.exists()) {
+            activeConfig =
+                Files.asCharSource(activeConfigFile, StandardCharsets.UTF_8).readFirstLine();
+          } else {
+            activeConfig = "default";
+          }
           configFile =
               new File(
-                  System.getProperty("user.home"), ".config/gcloud/configurations/config_default");
+                  System.getProperty("user.home"),
+                  ".config/gcloud/configurations/config_" + activeConfig);
           if (!configFile.exists()) {
             // Old versions of gcloud use this file
             configFile = new File(System.getProperty("user.home"), ".config/gcloud/properties");
@@ -291,7 +341,7 @@ public interface GcpOptions extends GoogleApiDebugOptions, PipelineOptions {
     }
   }
 
-  /** EneableStreamingEngine defaults to false unless one of the two experiments is set. */
+  /** EnableStreamingEngine defaults to false unless one of the two experiments is set. */
   class EnableStreamingEngineFactory implements DefaultValueFactory<Boolean> {
     @Override
     public Boolean create(PipelineOptions options) {
@@ -342,7 +392,62 @@ public interface GcpOptions extends GoogleApiDebugOptions, PipelineOptions {
               e);
         }
       }
+
+      if (isSoftDeletePolicyEnabled(options, tempLocation)) {
+        LOG.warn(
+            String.format(
+                "The bucket of gcpTempLocation %s has soft delete policy enabled."
+                    + " Dataflow jobs use Cloud Storage to store temporary files during pipeline"
+                    + " execution. To avoid being billed for unnecessary storage costs, turn off the soft"
+                    + " delete feature on buckets that your Dataflow jobs use for temporary storage."
+                    + " For more information, see"
+                    + " https://cloud.google.com/storage/docs/use-soft-delete#remove-soft-delete-policy.",
+                tempLocation));
+      }
+
       return tempLocation;
+    }
+
+    @VisibleForTesting
+    static boolean isSoftDeletePolicyEnabled(PipelineOptions options, String tempLocation) {
+      GcsOptions gcsOptions = options.as(GcsOptions.class);
+      GcsUtil gcsUtil = gcsOptions.getGcsUtil();
+      try {
+        SoftDeletePolicy policy =
+            Objects.requireNonNull(gcsUtil.getBucket(GcsPath.fromUri(tempLocation)))
+                .getSoftDeletePolicy();
+        if (policy != null && policy.getRetentionDurationSeconds() > 0) {
+          return true;
+        }
+      } catch (Exception e) {
+        LOG.warn(
+            String.format(
+                "Failed to access bucket for gcpTempLocation: %s.%nCaused by %s", tempLocation, e));
+      }
+      return false;
+    }
+
+    @VisibleForTesting
+    static ImmutableList<String> getDefaultBucketNameStubs(
+        PipelineOptions options, CloudResourceManager crmClient, String bucketNamePrefix) {
+      GcsOptions gcsOptions = options.as(GcsOptions.class);
+
+      final String projectId = gcsOptions.getProject();
+      checkArgument(!isNullOrEmpty(projectId), "--project is a required option.");
+
+      long projectNumber = 0L;
+      try {
+        projectNumber = getProjectNumber(projectId, crmClient);
+      } catch (IOException e) {
+        throw new RuntimeException("Unable to verify project with ID " + projectId, e);
+      }
+
+      String region = DEFAULT_REGION;
+      if (!isNullOrEmpty(gcsOptions.getZone())) {
+        region = getRegionFromZone(gcsOptions.getZone());
+      }
+
+      return ImmutableList.of(bucketNamePrefix, region, String.valueOf(projectNumber));
     }
 
     /**
@@ -351,34 +456,38 @@ public interface GcpOptions extends GoogleApiDebugOptions, PipelineOptions {
      */
     @VisibleForTesting
     static String tryCreateDefaultBucket(PipelineOptions options, CloudResourceManager crmClient) {
+      return tryCreateDefaultBucketWithPrefix(options, crmClient, "dataflow-staging");
+    }
+
+    @VisibleForTesting
+    static String tryCreateDefaultBucketWithPrefix(
+        PipelineOptions options, CloudResourceManager crmClient, String bucketNamePrefix) {
       GcsOptions gcsOptions = options.as(GcsOptions.class);
 
       checkArgument(
           isNullOrEmpty(gcsOptions.getDataflowKmsKey()),
           "Cannot create a default bucket when --dataflowKmsKey is set.");
 
-      final String projectId = gcsOptions.getProject();
-      checkArgument(!isNullOrEmpty(projectId), "--project is a required option.");
-
-      // Look up the project number, to create a default bucket with a stable
-      // name with no special characters.
-      long projectNumber = 0L;
-      try {
-        projectNumber = getProjectNumber(projectId, crmClient);
-      } catch (IOException e) {
-        throw new RuntimeException("Unable to verify project with ID " + projectId, e);
-      }
-      String region = DEFAULT_REGION;
-      if (!isNullOrEmpty(gcsOptions.getZone())) {
-        region = getRegionFromZone(gcsOptions.getZone());
-      }
-      final String bucketName = "dataflow-staging-" + region + "-" + projectNumber;
+      final List<String> bucketNameStubs =
+          getDefaultBucketNameStubs(options, crmClient, bucketNamePrefix);
+      final String region = bucketNameStubs.get(1);
+      final long projectNumber = Long.parseLong(bucketNameStubs.get(2));
+      final String bucketName = String.join("-", bucketNameStubs);
       LOG.info("No tempLocation specified, attempting to use default bucket: {}", bucketName);
-      Bucket bucket = new Bucket().setName(bucketName).setLocation(region);
+
+      // Disable soft delete policy for a bucket.
+      // Reference: https://cloud.google.com/storage/docs/soft-delete
+      SoftDeletePolicy softDeletePolicy = new SoftDeletePolicy().setRetentionDurationSeconds(0L);
+
+      Bucket bucket =
+          new Bucket()
+              .setName(bucketName)
+              .setLocation(region)
+              .setSoftDeletePolicy(softDeletePolicy);
       // Always try to create the bucket before checking access, so that we do not
       // race with other pipelines that may be attempting to do the same thing.
       try {
-        gcsOptions.getGcsUtil().createBucket(projectId, bucket);
+        gcsOptions.getGcsUtil().createBucket(gcsOptions.getProject(), bucket);
       } catch (FileAlreadyExistsException e) {
         LOG.debug("Bucket '{}'' already exists, verifying access.", bucketName);
       } catch (IOException e) {
@@ -486,7 +595,6 @@ public interface GcpOptions extends GoogleApiDebugOptions, PipelineOptions {
       "GCP Cloud KMS key for Dataflow pipelines. Also used by gcpTempLocation as the default key "
           + "for new buckets. Key format is: "
           + "projects/<project>/locations/<location>/keyRings/<keyring>/cryptoKeys/<key>")
-  @Experimental
   @Nullable
   String getDataflowKmsKey();
 

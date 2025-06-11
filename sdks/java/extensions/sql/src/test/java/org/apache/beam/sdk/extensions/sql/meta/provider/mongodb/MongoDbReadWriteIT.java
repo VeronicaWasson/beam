@@ -38,9 +38,8 @@ import com.mongodb.client.model.Filters;
 import de.flapdoodle.embed.mongo.MongodExecutable;
 import de.flapdoodle.embed.mongo.MongodProcess;
 import de.flapdoodle.embed.mongo.MongodStarter;
-import de.flapdoodle.embed.mongo.config.IMongodConfig;
-import de.flapdoodle.embed.mongo.config.MongoCmdOptionsBuilder;
-import de.flapdoodle.embed.mongo.config.MongodConfigBuilder;
+import de.flapdoodle.embed.mongo.config.MongoCmdOptions;
+import de.flapdoodle.embed.mongo.config.MongodConfig;
 import de.flapdoodle.embed.mongo.config.Net;
 import de.flapdoodle.embed.mongo.config.Storage;
 import de.flapdoodle.embed.mongo.distribution.Version;
@@ -57,7 +56,7 @@ import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.Row;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.bson.Document;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -112,19 +111,19 @@ public class MongoDbReadWriteIT {
   public static void setUp() throws Exception {
     int port = NetworkTestHelper.getAvailableLocalPort();
     LOG.info("Starting MongoDB embedded instance on {}", port);
-    IMongodConfig mongodConfig =
-        new MongodConfigBuilder()
+    MongodConfig mongodConfig =
+        MongodConfig.builder()
             .version(Version.Main.PRODUCTION)
-            .configServer(false)
+            .isConfigServer(false)
             .replication(new Storage(MONGODB_LOCATION.getRoot().getPath(), null, 0))
             .net(new Net(hostname, port, Network.localhostIsIPv6()))
             .cmdOptions(
-                new MongoCmdOptionsBuilder()
+                MongoCmdOptions.builder()
                     .syncDelay(10)
                     .useNoPrealloc(true)
                     .useSmallFiles(true)
                     .useNoJournal(true)
-                    .verbose(false)
+                    .isVerbose(false)
                     .build())
             .build();
     mongodExecutable = mongodStarter.prepare(mongodConfig);
@@ -303,10 +302,9 @@ public class MongoDbReadWriteIT {
             .append(
                 "$or",
                 ImmutableList.of(
-                        new Document("c_varchar", "varchar"),
-                        new Document(
-                            "c_varchar", new Document("$not", new Document("$eq", "fakeString"))))
-                    .asList())
+                    new Document("c_varchar", "varchar"),
+                    new Document(
+                        "c_varchar", new Document("$not", new Document("$eq", "fakeString")))))
             .append("c_boolean", true)
             .append("c_integer", 2147483647);
     final Schema expectedSchema =

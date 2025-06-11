@@ -19,9 +19,6 @@ package org.apache.beam.runners.samza.translation;
 
 import com.google.auto.service.AutoService;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
-import org.apache.beam.runners.core.construction.NativeTransforms;
-import org.apache.beam.runners.core.construction.graph.PipelineNode;
-import org.apache.beam.runners.core.construction.graph.QueryablePipeline;
 import org.apache.beam.runners.samza.runtime.OpMessage;
 import org.apache.beam.runners.samza.util.SamzaCoders;
 import org.apache.beam.runners.samza.util.WindowUtils;
@@ -29,9 +26,13 @@ import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.runners.TransformHierarchy;
 import org.apache.beam.sdk.transforms.PTransform;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.NativeTransforms;
+import org.apache.beam.sdk.util.construction.graph.PipelineNode;
+import org.apache.beam.sdk.util.construction.graph.QueryablePipeline;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
 import org.apache.samza.operators.MessageStream;
 import org.apache.samza.serializers.KVSerde;
 
@@ -41,6 +42,16 @@ import org.apache.samza.serializers.KVSerde;
  */
 public class ReshuffleTranslator<K, InT, OutT>
     implements TransformTranslator<PTransform<PCollection<KV<K, InT>>, PCollection<KV<K, OutT>>>> {
+
+  private final String prefix;
+
+  ReshuffleTranslator(String prefix) {
+    this.prefix = prefix;
+  }
+
+  ReshuffleTranslator() {
+    this("rshfl-");
+  }
 
   @Override
   public void translate(
@@ -60,7 +71,7 @@ public class ReshuffleTranslator<K, InT, OutT>
             inputStream,
             inputCoder.getKeyCoder(),
             elementCoder,
-            "rshfl-" + ctx.getTransformId(),
+            prefix + ctx.getTransformId(),
             ctx.getPipelineOptions().getMaxSourceParallelism() > 1);
 
     ctx.registerMessageStream(output, outputStream);
@@ -74,7 +85,7 @@ public class ReshuffleTranslator<K, InT, OutT>
 
     final String inputId = ctx.getInputId(transform);
     final MessageStream<OpMessage<KV<K, InT>>> inputStream = ctx.getMessageStreamById(inputId);
-    final WindowedValue.WindowedValueCoder<KV<K, InT>> windowedInputCoder =
+    final WindowedValues.WindowedValueCoder<KV<K, InT>> windowedInputCoder =
         WindowUtils.instantiateWindowedCoder(inputId, pipeline.getComponents());
     final String outputId = ctx.getOutputId(transform);
 
@@ -83,8 +94,8 @@ public class ReshuffleTranslator<K, InT, OutT>
             inputStream,
             ((KvCoder<K, InT>) windowedInputCoder.getValueCoder()).getKeyCoder(),
             windowedInputCoder,
-            "rshfl-" + ctx.getTransformId(),
-            ctx.getSamzaPipelineOptions().getMaxSourceParallelism() > 1);
+            prefix + ctx.getTransformId(),
+            ctx.getPipelineOptions().getMaxSourceParallelism() > 1);
 
     ctx.registerMessageStream(outputId, outputStream);
   }

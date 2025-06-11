@@ -24,6 +24,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.beam.fn.harness.logging.BeamFnLoggingClient;
 import org.apache.beam.fn.harness.logging.BeamFnLoggingMDC;
+import org.apache.beam.fn.harness.logging.LoggingClient;
+import org.apache.beam.fn.harness.logging.LoggingClientFactory;
+import org.apache.beam.fn.harness.logging.QuotaEvent;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi;
 import org.apache.beam.model.fnexecution.v1.BeamFnLoggingGrpc;
 import org.apache.beam.model.pipeline.v1.Endpoints.ApiServiceDescriptor;
@@ -32,9 +35,9 @@ import org.apache.beam.runners.core.metrics.MonitoringInfoConstants;
 import org.apache.beam.runners.core.metrics.SimpleExecutionState;
 import org.apache.beam.sdk.fn.channel.ManagedChannelFactory;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.vendor.grpc.v1p43p2.io.grpc.Server;
-import org.apache.beam.vendor.grpc.v1p43p2.io.grpc.inprocess.InProcessServerBuilder;
-import org.apache.beam.vendor.grpc.v1p43p2.io.grpc.stub.StreamObserver;
+import org.apache.beam.vendor.grpc.v1p69p0.io.grpc.Server;
+import org.apache.beam.vendor.grpc.v1p69p0.io.grpc.inprocess.InProcessServerBuilder;
+import org.apache.beam.vendor.grpc.v1p69p0.io.grpc.stub.StreamObserver;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.Level;
 import org.openjdk.jmh.annotations.Scope;
@@ -43,6 +46,7 @@ import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Threads;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 /** Benchmarks for {@link BeamFnLoggingClient}. */
 public class BeamFnLoggingClientBenchmark {
@@ -78,7 +82,7 @@ public class BeamFnLoggingClientBenchmark {
   /** Setup a simple logging service and configure the {@link BeamFnLoggingClient}. */
   @State(Scope.Benchmark)
   public static class ManageLoggingClientAndService {
-    public final BeamFnLoggingClient loggingClient;
+    public final LoggingClient loggingClient;
     public final CallCountLoggingService loggingService;
     public final Server server;
 
@@ -96,7 +100,7 @@ public class BeamFnLoggingClientBenchmark {
                 .build();
         server.start();
         loggingClient =
-            new BeamFnLoggingClient(
+            LoggingClientFactory.createAndStart(
                 PipelineOptionsFactory.create(),
                 apiServiceDescriptor,
                 managedChannelFactory::forDescriptor);
@@ -190,6 +194,36 @@ public class BeamFnLoggingClientBenchmark {
       LOG.warn("log me");
     }
     BeamFnLoggingMDC.setInstructionId(null);
+  }
+
+  @Benchmark
+  @Threads(16) // Use several threads since we expect contention during logging
+  public void testLoggingWithCustomData(
+      ManyExpectedCallsLoggingClientAndService client, ManageExecutionState executionState)
+      throws Exception {
+    try (Closeable state =
+        executionState.executionStateTracker.enterState(executionState.simpleExecutionState)) {
+      try (Closeable mdc = MDC.putCloseable("key", "value")) {
+        LOG.warn("log me");
+      }
+    }
+  }
+
+  @Benchmark
+  @Threads(16) // Use several threads since we expect contention during logging
+  public void testLoggingWithQuotaEvent(
+      ManyExpectedCallsLoggingClientAndService client, ManageExecutionState executionState)
+      throws Exception {
+    try (Closeable state =
+        executionState.executionStateTracker.enterState(executionState.simpleExecutionState)) {
+      try (AutoCloseable ac =
+          new QuotaEvent.Builder()
+              .withOperation("test")
+              .withFullResourceName("//test.googleapis.com/abc/123")
+              .create()) {
+        LOG.warn("log me");
+      }
+    }
   }
 
   @Benchmark

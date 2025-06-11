@@ -26,16 +26,20 @@ import {
   extractName,
   withName,
 } from "./transforms/transform";
-import { parDo, DoFn } from "./transforms/pardo";
+import { parDo, extractContext } from "./transforms/pardo";
 import * as runnerApi from "./proto/beam_runner_api";
+import { requireForSerialization } from "./serialization";
+import { packageName } from "./utils/packageJson";
 
 /**
  * The base object on which one can start building a Beam DAG.
  * Generally followed by a source-like transform such as a read or impulse.
  */
 export class Root {
+  /** @internal */
   pipeline: Pipeline;
 
+  /** @internal */
   constructor(pipeline: Pipeline) {
     this.pipeline = pipeline;
   }
@@ -48,7 +52,7 @@ export class Root {
   }
 
   async applyAsync<OutputT extends PValue<any>>(
-    transform: AsyncPTransform<Root, OutputT>
+    transform: AsyncPTransform<Root, OutputT>,
   ) {
     if (!(transform instanceof AsyncPTransformClass)) {
       transform = new AsyncPTransformClassFromCallable(transform);
@@ -59,13 +63,15 @@ export class Root {
 
 /**
  * A deferred, possibly distributed collection of elements.
+ * See https://beam.apache.org/documentation/programming-guide/#pcollections
  */
 export class PCollection<T> {
-  type: string = "pcollection";
+  /** @internal */
   pipeline: Pipeline;
   private id: string;
   private computeId: () => string;
 
+  /** @internal */
   constructor(pipeline: Pipeline, id: string | (() => string)) {
     this.pipeline = pipeline;
     if (typeof id === "string") {
@@ -75,6 +81,7 @@ export class PCollection<T> {
     }
   }
 
+  /** @internal */
   getId(): string {
     if (this.id === null || this.id === undefined) {
       this.id = this.computeId();
@@ -83,7 +90,7 @@ export class PCollection<T> {
   }
 
   apply<OutputT extends PValue<any>>(
-    transform: PTransform<PCollection<T>, OutputT>
+    transform: PTransform<PCollection<T>, OutputT>,
   ) {
     if (!(transform instanceof PTransformClass)) {
       transform = new PTransformClassFromCallable(transform);
@@ -92,7 +99,7 @@ export class PCollection<T> {
   }
 
   applyAsync<OutputT extends PValue<any>>(
-    transform: AsyncPTransform<PCollection<T>, OutputT>
+    transform: AsyncPTransform<PCollection<T>, OutputT>,
   ) {
     if (!(transform instanceof AsyncPTransformClass)) {
       transform = new AsyncPTransformClassFromCallable(transform);
@@ -104,8 +111,11 @@ export class PCollection<T> {
     fn:
       | (ContextT extends undefined ? (element: T) => OutputT : never)
       | ((element: T, context: ContextT) => OutputT),
-    context: ContextT = undefined!
+    context: ContextT = undefined!,
   ): PCollection<OutputT> {
+    if (extractContext(fn)) {
+      context = { ...extractContext(fn), ...context };
+    }
     return this.apply(
       withName(
         "map(" + extractName(fn) + ")",
@@ -119,9 +129,9 @@ export class PCollection<T> {
                 : fn(element, context);
             },
           },
-          context
-        )
-      )
+          context,
+        ),
+      ),
     );
   }
 
@@ -129,8 +139,11 @@ export class PCollection<T> {
     fn:
       | (ContextT extends undefined ? (element: T) => Iterable<OutputT> : never)
       | ((element: T, context: ContextT) => Iterable<OutputT>),
-    context: ContextT = undefined!
+    context: ContextT = undefined!,
   ): PCollection<OutputT> {
+    if (extractContext(fn)) {
+      context = { ...extractContext(fn), ...context };
+    }
     return this.apply(
       withName(
         "flatMap(" + extractName(fn) + ")",
@@ -144,9 +157,9 @@ export class PCollection<T> {
                 : fn(element, context);
             },
           },
-          context
-        )
-      )
+          context,
+        ),
+      ),
     );
   }
 
@@ -156,7 +169,7 @@ export class PCollection<T> {
 }
 
 /**
- * The type of object that may be consumed or produced by a PTransformClass.
+ * The type of object that may be consumed or produced by a PTransform.
  */
 export type PValue<T> =
   | void
@@ -173,7 +186,7 @@ export type PValue<T> =
  */
 export function flattenPValue<T>(
   pValue: PValue<T>,
-  prefix: string = ""
+  prefix: string = "",
 ): { [key: string]: PCollection<T> } {
   const result: { [key: string]: PCollection<any> } = {};
   if (pValue === null || pValue === undefined) {
@@ -220,7 +233,7 @@ class PValueWrapper<T extends PValue<any>> {
 
   apply<O extends PValue<any>>(
     transform: PTransform<T, O>,
-    root: Root | null = null
+    root: Root | null = null,
   ) {
     if (!(transform instanceof PTransformClass)) {
       transform = new PTransformClassFromCallable(transform);
@@ -230,14 +243,14 @@ class PValueWrapper<T extends PValue<any>> {
 
   async applyAsync<O extends PValue<any>>(
     transform: AsyncPTransform<T, O>,
-    root: Root | null = null
+    root: Root | null = null,
   ) {
     if (!(transform instanceof AsyncPTransformClass)) {
       transform = new AsyncPTransformClassFromCallable(transform);
     }
     return await this.pipeline(root).applyAsyncTransform(
       transform,
-      this.pvalue
+      this.pvalue,
     );
   }
 
@@ -253,20 +266,20 @@ class PValueWrapper<T extends PValue<any>> {
 
 class PTransformClassFromCallable<
   InputT extends PValue<any>,
-  OutputT extends PValue<any>
+  OutputT extends PValue<any>,
 > extends PTransformClass<InputT, OutputT> {
   expander: (
     input: InputT,
     pipeline: Pipeline,
-    transformProto: runnerApi.PTransform
+    transformProto: runnerApi.PTransform,
   ) => OutputT;
 
   constructor(
     expander: (
       input: InputT,
       pipeline: Pipeline,
-      transformProto: runnerApi.PTransform
-    ) => OutputT
+      transformProto: runnerApi.PTransform,
+    ) => OutputT,
   ) {
     super(extractName(expander));
     this.expander = expander;
@@ -275,7 +288,7 @@ class PTransformClassFromCallable<
   expandInternal(
     input: InputT,
     pipeline: Pipeline,
-    transformProto: runnerApi.PTransform
+    transformProto: runnerApi.PTransform,
   ) {
     return this.expander(input, pipeline, transformProto);
   }
@@ -283,20 +296,20 @@ class PTransformClassFromCallable<
 
 class AsyncPTransformClassFromCallable<
   InputT extends PValue<any>,
-  OutputT extends PValue<any>
+  OutputT extends PValue<any>,
 > extends AsyncPTransformClass<InputT, OutputT> {
   expander: (
     input: InputT,
     pipeline: Pipeline,
-    transformProto: runnerApi.PTransform
+    transformProto: runnerApi.PTransform,
   ) => Promise<OutputT>;
 
   constructor(
     expander: (
       input: InputT,
       pipeline: Pipeline,
-      transformProto: runnerApi.PTransform
-    ) => Promise<OutputT>
+      transformProto: runnerApi.PTransform,
+    ) => Promise<OutputT>,
   ) {
     super(extractName(expander));
     this.expander = expander;
@@ -305,11 +318,10 @@ class AsyncPTransformClassFromCallable<
   async expandInternalAsync(
     input: InputT,
     pipeline: Pipeline,
-    transformProto: runnerApi.PTransform
+    transformProto: runnerApi.PTransform,
   ) {
     return this.expander(input, pipeline, transformProto);
   }
 }
 
-import { requireForSerialization } from "./serialization";
-requireForSerialization("apache-beam/pvalue", exports);
+requireForSerialization(`${packageName}/pvalue`, exports);

@@ -17,11 +17,9 @@
  */
 package org.apache.beam.runners.dataflow;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import java.util.Map;
-import org.apache.beam.runners.core.construction.PTransformReplacements;
-import org.apache.beam.runners.core.construction.ReplacementOutputs;
 import org.apache.beam.runners.dataflow.BatchViewOverrides.GroupByKeyAndSortValuesOnly;
 import org.apache.beam.runners.dataflow.options.DataflowPipelineOptions;
 import org.apache.beam.sdk.coders.Coder;
@@ -40,12 +38,15 @@ import org.apache.beam.sdk.transforms.reflect.DoFnInvokers;
 import org.apache.beam.sdk.transforms.reflect.DoFnSignature;
 import org.apache.beam.sdk.transforms.reflect.DoFnSignatures;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.PTransformReplacements;
+import org.apache.beam.sdk.util.construction.ReplacementOutputs;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionTuple;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TypeDescriptor;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
 import org.apache.beam.sdk.values.WindowingStrategy;
 import org.joda.time.Instant;
 
@@ -58,7 +59,7 @@ import org.joda.time.Instant;
  * grouping and expansion.
  *
  * <p>This implementation relies on implementation details of the Dataflow runner, specifically
- * standard fusion behavior of {@link ParDo} tranforms following a {@link GroupByKey}.
+ * standard fusion behavior of {@link ParDo} transforms following a {@link GroupByKey}.
  */
 public class BatchStatefulParDoOverrides {
 
@@ -239,7 +240,7 @@ public class BatchStatefulParDoOverrides {
           .setCoder(
               KvCoder.of(
                   keyCoder,
-                  KvCoder.of(InstantCoder.of(), WindowedValue.getFullCoder(kvCoder, windowCoder))))
+                  KvCoder.of(InstantCoder.of(), WindowedValues.getFullCoder(kvCoder, windowCoder))))
 
           // Group by key and sort by timestamp, dropping windows as they are reified
           .apply("PartitionKeys", new GroupByKeyAndSortValuesOnly<>())
@@ -258,7 +259,7 @@ public class BatchStatefulParDoOverrides {
           KV.of(
               c.element().getKey(),
               KV.of(
-                  c.timestamp(), WindowedValue.of(c.element(), c.timestamp(), window, c.pane()))));
+                  c.timestamp(), WindowedValues.of(c.element(), c.timestamp(), window, c.pane()))));
     }
   }
 

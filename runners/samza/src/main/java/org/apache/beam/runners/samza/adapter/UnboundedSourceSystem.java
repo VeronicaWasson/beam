@@ -46,9 +46,10 @@ import org.apache.beam.sdk.io.UnboundedSource;
 import org.apache.beam.sdk.io.UnboundedSource.CheckpointMark;
 import org.apache.beam.sdk.io.UnboundedSource.UnboundedReader;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
-import org.apache.beam.sdk.util.WindowedValue;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.apache.samza.Partition;
 import org.apache.samza.SamzaException;
 import org.apache.samza.config.Config;
@@ -400,7 +401,7 @@ public class UnboundedSourceSystem {
         final Instant time = reader.getCurrentTimestamp();
         final SystemStreamPartition ssp = readerToSsp.get(reader);
         final WindowedValue<T> windowedValue =
-            WindowedValue.timestampedValueInGlobalWindow(value, time);
+            WindowedValues.timestampedValueInGlobalWindow(value, time);
 
         final OpMessage<T> opMessage = OpMessage.ofElement(windowedValue);
         final IncomingMessageEnvelope envelope =

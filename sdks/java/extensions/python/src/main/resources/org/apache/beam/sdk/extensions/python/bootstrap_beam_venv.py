@@ -30,7 +30,6 @@ import os
 import shutil
 import subprocess
 import sys
-from pkg_resources import parse_version
 
 
 def main():
@@ -63,24 +62,17 @@ def main():
     if options.beam_version == 'latest':
         info = json.load(
             urllib.request.urlopen("https://pypi.org/pypi/apache_beam/json"))
-
-        def maybe_strict_version(s):
-            try:
-                return parse_version(s)
-            except:
-                return parse_version('0.0')
-
-        beam_version = max(info['releases'], key=maybe_strict_version)
-        beam_package = 'apache_beam[gcp,aws,asure,dataframe]==' + beam_version
+        beam_version = info['info']['version']
+        beam_package = 'apache_beam[gcp,aws,azure,dataframe]==' + beam_version
     elif (os.path.exists(options.beam_version)
           or options.beam_version.startswith('http://')
           or options.beam_version.startswith('https://')):
         # It's a path to a tarball.
         beam_version = os.path.basename(options.beam_version)
-        beam_package = options.beam_version + '[gcp,aws,asure,dataframe]'
+        beam_package = options.beam_version + '[gcp,aws,azure,dataframe]'
     else:
         beam_version = options.beam_version
-        beam_package = 'apache_beam[gcp,aws,asure,dataframe]==' + beam_version
+        beam_package = 'apache_beam[gcp,aws,azure,dataframe]==' + beam_version
 
     deps = options.extra_packages.split(';') if options.extra_packages else []
     venv_dir = os.path.join(

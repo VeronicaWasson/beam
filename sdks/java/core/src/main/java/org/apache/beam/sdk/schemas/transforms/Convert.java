@@ -17,8 +17,6 @@
  */
 package org.apache.beam.sdk.schemas.transforms;
 
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.schemas.SchemaCoder;
 import org.apache.beam.sdk.schemas.SchemaRegistry;
 import org.apache.beam.sdk.schemas.utils.ByteBuddyUtils.DefaultTypeConversionsFactory;
@@ -32,7 +30,6 @@ import org.apache.beam.sdk.values.Row;
 import org.apache.beam.sdk.values.TypeDescriptor;
 
 /** A set of utilities for converting between different objects supporting schemas. */
-@Experimental(Kind.SCHEMAS)
 @SuppressWarnings({
   "nullness" // TODO(https://github.com/apache/beam/issues/20497)
 })
@@ -59,7 +56,7 @@ public class Convert {
   }
 
   /**
-   * Convert a {@link PCollection}{@literal <Row>} into a {@link PCollection}{@literal <Row>}.
+   * Convert a {@link PCollection}{@literal <Row>} into a {@link PCollection}{@literal <OutputT>}.
    *
    * <p>The output schema will be inferred using the schema registry. A schema must be registered
    * for this type, or the conversion will fail.

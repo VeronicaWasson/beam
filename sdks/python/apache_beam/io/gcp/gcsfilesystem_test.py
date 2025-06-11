@@ -82,16 +82,17 @@ class GCSFileSystemTest(unittest.TestCase):
     # Prepare mocks.
     gcsio_mock = mock.MagicMock()
     gcsfilesystem.gcsio.GcsIO = lambda pipeline_options=None: gcsio_mock
-    gcsio_mock.list_prefix.return_value = {
-        'gs://bucket/file1': (1, 99999.0), 'gs://bucket/file2': (2, 88888.0)
-    }
+    gcsio_mock.list_files.return_value = iter([
+        ('gs://bucket/file1', (1, 99999.0)),
+        ('gs://bucket/file2', (2, 88888.0))
+    ])
     expected_results = set([
         FileMetadata('gs://bucket/file1', 1, 99999.0),
         FileMetadata('gs://bucket/file2', 2, 88888.0)
     ])
     match_result = self.fs.match(['gs://bucket/'])[0]
     self.assertEqual(set(match_result.metadata_list), expected_results)
-    gcsio_mock.list_prefix.assert_called_once_with(
+    gcsio_mock.list_files.assert_called_once_with(
         'gs://bucket/', with_metadata=True)
 
   @mock.patch('apache_beam.io.gcp.gcsfilesystem.gcsio')
@@ -100,12 +101,14 @@ class GCSFileSystemTest(unittest.TestCase):
     gcsio_mock = mock.MagicMock()
     limit = 1
     gcsfilesystem.gcsio.GcsIO = lambda pipeline_options=None: gcsio_mock
-    gcsio_mock.list_prefix.return_value = {'gs://bucket/file1': (1, 99999.0)}
+    gcsio_mock.list_files.return_value = iter([
+        ('gs://bucket/file1', (1, 99999.0))
+    ])
     expected_results = set([FileMetadata('gs://bucket/file1', 1, 99999.0)])
     match_result = self.fs.match(['gs://bucket/'], [limit])[0]
     self.assertEqual(set(match_result.metadata_list), expected_results)
     self.assertEqual(len(match_result.metadata_list), limit)
-    gcsio_mock.list_prefix.assert_called_once_with(
+    gcsio_mock.list_files.assert_called_once_with(
         'gs://bucket/', with_metadata=True)
 
   @mock.patch('apache_beam.io.gcp.gcsfilesystem.gcsio')
@@ -114,14 +117,14 @@ class GCSFileSystemTest(unittest.TestCase):
     gcsio_mock = mock.MagicMock()
     gcsfilesystem.gcsio.GcsIO = lambda pipeline_options=None: gcsio_mock
     exception = IOError('Failed')
-    gcsio_mock.list_prefix.side_effect = exception
+    gcsio_mock.list_files.side_effect = exception
 
     with self.assertRaisesRegex(BeamIOError,
                                 r'^Match operation failed') as error:
       self.fs.match(['gs://bucket/'])
     self.assertRegex(
         str(error.exception.exception_details), r'gs://bucket/.*%s' % exception)
-    gcsio_mock.list_prefix.assert_called_once_with(
+    gcsio_mock.list_files.assert_called_once_with(
         'gs://bucket/', with_metadata=True)
 
   @mock.patch('apache_beam.io.gcp.gcsfilesystem.gcsio')
@@ -129,13 +132,9 @@ class GCSFileSystemTest(unittest.TestCase):
     # Prepare mocks.
     gcsio_mock = mock.MagicMock()
     gcsfilesystem.gcsio.GcsIO = lambda pipeline_options=None: gcsio_mock
-    gcsio_mock.list_prefix.side_effect = [
-        {
-            'gs://bucket/file1': (1, 99999.0)
-        },
-        {
-            'gs://bucket/file2': (2, 88888.0)
-        },
+    gcsio_mock.list_files.side_effect = [
+        iter([('gs://bucket/file1', (1, 99999.0))]),
+        iter([('gs://bucket/file2', (2, 88888.0))]),
     ]
     expected_results = [[FileMetadata('gs://bucket/file1', 1, 99999.0)],
                         [FileMetadata('gs://bucket/file2', 2, 88888.0)]]
@@ -190,10 +189,8 @@ class GCSFileSystemTest(unittest.TestCase):
     gcsio_mock.copy.side_effect = exception
 
     # Issue batch rename.
-    expected_results = {
-        (s, d): exception
-        for s, d in zip(sources, destinations)
-    }
+    expected_results = {(s, d): exception
+                        for s, d in zip(sources, destinations)}
 
     # Issue batch copy.
     with self.assertRaisesRegex(BeamIOError,
@@ -259,7 +256,7 @@ class GCSFileSystemTest(unittest.TestCase):
     ])
 
   @mock.patch('apache_beam.io.gcp.gcsfilesystem.gcsio')
-  def test_rename_error(self, mock_gcsio):
+  def test_rename_delete_error(self, mock_gcsio):
     # Prepare mocks.
     gcsio_mock = mock.MagicMock()
     gcsfilesystem.gcsio.GcsIO = lambda pipeline_options=None: gcsio_mock
@@ -273,25 +270,20 @@ class GCSFileSystemTest(unittest.TestCase):
         'gs://bucket/to2',
         'gs://bucket/to3',
     ]
-    exception = IOError('Failed')
-    gcsio_mock.delete_batch.side_effect = [[(f, exception) for f in sources]]
     gcsio_mock.copy_batch.side_effect = [[
         ('gs://bucket/from1', 'gs://bucket/to1', None),
         ('gs://bucket/from2', 'gs://bucket/to2', None),
         ('gs://bucket/from3', 'gs://bucket/to3', None),
     ]]
+    gcsio_mock.delete_batch.side_effect = [[
+        ('gs://bucket/from1', None),
+        ('gs://bucket/from2', Exception("BadThings")),
+        ('gs://bucket/from3', None),
+    ]]
 
     # Issue batch rename.
-    expected_results = {
-        (s, d): exception
-        for s, d in zip(sources, destinations)
-    }
-
-    # Issue batch rename.
-    with self.assertRaisesRegex(BeamIOError,
-                                r'^Rename operation failed') as error:
+    with self.assertRaisesRegex(BeamIOError, r'^Rename operation failed'):
       self.fs.rename(sources, destinations)
-    self.assertEqual(error.exception.exception_details, expected_results)
 
     gcsio_mock.copy_batch.assert_called_once_with([
         ('gs://bucket/from1', 'gs://bucket/to1'),
@@ -305,11 +297,50 @@ class GCSFileSystemTest(unittest.TestCase):
     ])
 
   @mock.patch('apache_beam.io.gcp.gcsfilesystem.gcsio')
+  def test_rename_copy_error(self, mock_gcsio):
+    # Prepare mocks.
+    gcsio_mock = mock.MagicMock()
+    gcsfilesystem.gcsio.GcsIO = lambda pipeline_options=None: gcsio_mock
+    sources = [
+        'gs://bucket/from1',
+        'gs://bucket/from2',
+        'gs://bucket/from3',
+    ]
+    destinations = [
+        'gs://bucket/to1',
+        'gs://bucket/to2',
+        'gs://bucket/to3',
+    ]
+    gcsio_mock.copy_batch.side_effect = [[
+        ('gs://bucket/from1', 'gs://bucket/to1', None),
+        ('gs://bucket/from2', 'gs://bucket/to2', Exception("BadThings")),
+        ('gs://bucket/from3', 'gs://bucket/to3', None),
+    ]]
+    gcsio_mock.delete_batch.side_effect = [[
+        ('gs://bucket/from1', None),
+        ('gs://bucket/from3', None),
+    ]]
+
+    # Issue batch rename.
+    with self.assertRaisesRegex(BeamIOError, r'^Rename operation failed'):
+      self.fs.rename(sources, destinations)
+
+    gcsio_mock.copy_batch.assert_called_once_with([
+        ('gs://bucket/from1', 'gs://bucket/to1'),
+        ('gs://bucket/from2', 'gs://bucket/to2'),
+        ('gs://bucket/from3', 'gs://bucket/to3'),
+    ])
+    gcsio_mock.delete_batch.assert_called_once_with([
+        'gs://bucket/from1',
+        'gs://bucket/from3',
+    ])
+
+  @mock.patch('apache_beam.io.gcp.gcsfilesystem.gcsio')
   def test_delete(self, mock_gcsio):
     # Prepare mocks.
     gcsio_mock = mock.MagicMock()
     gcsfilesystem.gcsio.GcsIO = lambda pipeline_options=None: gcsio_mock
-    gcsio_mock._status.return_value = {'size': 0, 'last_updated': 99999.0}
+    gcsio_mock._status.return_value = {'size': 0, 'updated': 99999.0}
     files = [
         'gs://bucket/from1',
         'gs://bucket/from2',
@@ -325,22 +356,32 @@ class GCSFileSystemTest(unittest.TestCase):
     # Prepare mocks.
     gcsio_mock = mock.MagicMock()
     gcsfilesystem.gcsio.GcsIO = lambda pipeline_options=None: gcsio_mock
-    exception = IOError('Failed')
-    gcsio_mock.delete_batch.side_effect = exception
-    gcsio_mock._status.return_value = {'size': 0, 'last_updated': 99999.0}
+
+    gcsio_mock._status.return_value = {'size': 0, 'updated': 99999.0}
     files = [
         'gs://bucket/from1',
         'gs://bucket/from2',
         'gs://bucket/from3',
     ]
-    expected_results = {f: exception for f in files}
-
+    gcsio_mock.delete_batch.side_effect = [
+        [('gs://bucket/from1', None)],
+        [('gs://bucket/from2', Exception("BadThings"))],
+        [('gs://bucket/from3', None)],
+    ]
     # Issue batch delete.
-    with self.assertRaisesRegex(BeamIOError,
-                                r'^Delete operation failed') as error:
+    with self.assertRaisesRegex(BeamIOError, r'^Delete operation failed'):
       self.fs.delete(files)
-    self.assertEqual(error.exception.exception_details, expected_results)
     gcsio_mock.delete_batch.assert_called()
+
+  def test_lineage(self):
+    self._verify_lineage("gs://bucket/", ("bucket", ))
+    self._verify_lineage("gs://bucket/foo/bar.txt", ("bucket", "foo/bar.txt"))
+
+  def _verify_lineage(self, uri, expected_segments):
+    lineage_mock = mock.MagicMock()
+    self.fs.report_lineage(uri, lineage_mock)
+    lineage_mock.add.assert_called_once_with(
+        "gcs", *expected_segments, last_segment_sep='/')
 
 
 if __name__ == '__main__':

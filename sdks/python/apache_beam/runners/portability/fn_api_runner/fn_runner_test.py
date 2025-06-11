@@ -54,6 +54,7 @@ from apache_beam.metrics import monitoring_infos
 from apache_beam.metrics.execution import MetricKey
 from apache_beam.metrics.metricbase import MetricName
 from apache_beam.options.pipeline_options import DebugOptions
+from apache_beam.options.pipeline_options import DirectOptions
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import StandardOptions
 from apache_beam.options.value_provider import RuntimeValueProvider
@@ -72,6 +73,7 @@ from apache_beam.tools import utils
 from apache_beam.transforms import environments
 from apache_beam.transforms import userstate
 from apache_beam.transforms import window
+from apache_beam.transforms.periodicsequence import PeriodicImpulse
 from apache_beam.utils import timestamp
 from apache_beam.utils import windowed_value
 
@@ -165,6 +167,7 @@ class FnApiRunnerTest(unittest.TestCase):
 
       assert_that(res, equal_to([6, 12, 18]))
 
+  @unittest.skip('https://github.com/apache/beam/issues/23944')
   def test_batch_pardo_trigger_flush(self):
     try:
       utils.check_compiled('apache_beam.coders.coder_impl')
@@ -191,7 +194,8 @@ class FnApiRunnerTest(unittest.TestCase):
     # - The output batch type of the producer
     # - The input batch type of the consumer
     with self.assertWarnsRegex(InefficientExecutionWarning,
-                               r'ListPlusOneDoFn.*NumpyArray.*List\[int64\]'):
+                               (r'ListPlusOneDoFn.*NumpyArray.*List\[<class '
+                                r'\'numpy.int64\'>\]')):
       with self.create_pipeline() as p:
         res = (
             p
@@ -315,12 +319,27 @@ class FnApiRunnerTest(unittest.TestCase):
           | beam.WindowInto(window.SlidingWindows(size=5, period=3))
           | beam.ParDo(PerWindowDoFn()))
 
-      assert_that(res, equal_to([               0*-3, 1*-3, # [-3, 2)
-                                 0*0, 1*0, 2*0, 3* 0, 4* 0, # [ 0, 5)
-                                 3*3, 4*3, 5*3, 6* 3, 7* 3, # [ 3, 8)
-                                 6*6, 7*6, 8*6, 9* 6,       # [ 6, 11)
-                                 9*9                        # [ 9, 14)
-                                 ]))
+      assert_that(
+          res,
+          equal_to([
+              0 * -3,
+              1 * -3,  # [-3, 2)
+              0 * 0,
+              1 * 0,
+              2 * 0,
+              3 * 0,
+              4 * 0,  # [ 0, 5)
+              3 * 3,
+              4 * 3,
+              5 * 3,
+              6 * 3,
+              7 * 3,  # [ 3, 8)
+              6 * 6,
+              7 * 6,
+              8 * 6,
+              9 * 6,  # [ 6, 11)
+              9 * 9  # [ 9, 14)
+          ]))
 
   def test_batch_to_element_pardo(self):
     class ArraySumDoFn(beam.DoFn):
@@ -367,6 +386,7 @@ class FnApiRunnerTest(unittest.TestCase):
 
       assert_that(res, equal_to([6, 12, 12, 18, 18, 18]))
 
+  @unittest.skip('https://github.com/apache/beam/issues/23944')
   def test_pardo_large_input(self):
     try:
       utils.check_compiled('apache_beam.coders.coder_impl')
@@ -534,6 +554,22 @@ class FnApiRunnerTest(unittest.TestCase):
                   equal_to([('a', 1), ('b', 2)] + third_element),
                   label='CheckFlattenOfSideInput')
 
+  def test_flatten_and_gbk(self, with_transcoding=True):
+    with self.create_pipeline() as p:
+      side1 = p | 'side1' >> beam.Create([('a', 1)])
+      if with_transcoding:
+        # Also test non-matching coder types (transcoding required)
+        second_element = [('another_type')]
+      else:
+        second_element = [('b', 2)]
+      side2 = p | 'side2' >> beam.Create(second_element)
+
+      flatten_out = (side1, side2) | beam.Flatten()
+      gbk_out = side1 | beam.GroupByKey()
+
+      assert_that(flatten_out, equal_to([('a', 1)] + second_element))
+      assert_that(gbk_out, equal_to([('a', [1])]))
+
   def test_gbk_side_input(self):
     with self.create_pipeline() as p:
       main = p | 'main' >> beam.Create([None])
@@ -561,15 +597,12 @@ class FnApiRunnerTest(unittest.TestCase):
       side = p | 'side' >> beam.Create([('a', 1), ('b', 2), ('a', 3)])
       assert_that(
           main | 'first map' >> beam.Map(
-              lambda k,
-              d,
-              l: (k, sorted(d[k]), sorted([e[1] for e in l])),
+              lambda k, d, l: (k, sorted(d[k]), sorted([e[1] for e in l])),
               beam.pvalue.AsMultiMap(side),
               beam.pvalue.AsList(side))
           | 'second map' >> beam.Map(
-              lambda k,
-              d,
-              l: (k[0], sorted(d[k[0]]), sorted([e[1] for e in l])),
+              lambda k, d, l:
+              (k[0], sorted(d[k[0]]), sorted([e[1] for e in l])),
               beam.pvalue.AsMultiMap(side),
               beam.pvalue.AsList(side)),
           equal_to([('a', [1, 3], [1, 2, 3]), ('b', [2], [1, 2, 3])]))
@@ -736,6 +769,111 @@ class FnApiRunnerTest(unittest.TestCase):
       expected = [('fired', ts) for ts in (20, 200)]
       assert_that(actual, equal_to(expected))
 
+  def _run_pardo_et_timer_test(
+      self, n, timer_delay, reset_count=True, clear_timer=True, expected=None):
+    class EventTimeTimerDoFn(beam.DoFn):
+      COUNT = userstate.ReadModifyWriteStateSpec(
+          'count', coders.VarInt32Coder())
+      # event-time timer
+      TIMER = userstate.TimerSpec('timer', userstate.TimeDomain.WATERMARK)
+
+      def __init__(self):
+        self._n = n
+        self._timer_delay = timer_delay
+        self._reset_count = reset_count
+        self._clear_timer = clear_timer
+
+      def process(
+          self,
+          element_pair,
+          t=beam.DoFn.TimestampParam,
+          count=beam.DoFn.StateParam(COUNT),
+          timer=beam.DoFn.TimerParam(TIMER)):
+        local_count = count.read() or 0
+        local_count += 1
+
+        _LOGGER.info(
+            "get element %s, count=%d", str(element_pair[1]), local_count)
+        if local_count == 1:
+          _LOGGER.info("set timer to %s", str(t + self._timer_delay))
+          timer.set(t + self._timer_delay)
+
+        if local_count == self._n:
+          if self._reset_count:
+            _LOGGER.info("reset count")
+            local_count = 0
+
+          # don't need the timer now
+          if self._clear_timer:
+            _LOGGER.info("clear timer")
+            timer.clear()
+
+        count.write(local_count)
+
+      @userstate.on_timer(TIMER)
+      def timer_callback(self, t=beam.DoFn.TimestampParam):
+        _LOGGER.error("Timer should not fire here")
+        _LOGGER.info("timer callback start (timestamp=%s)", str(t))
+        yield "fired"
+
+    with self.create_pipeline() as p:
+      actual = (
+          p | PeriodicImpulse(
+              start_timestamp=timestamp.Timestamp.now(),
+              stop_timestamp=timestamp.Timestamp.now() + 14,
+              fire_interval=1)
+          | beam.WithKeys(0)
+          | beam.ParDo(EventTimeTimerDoFn()))
+      assert_that(actual, equal_to(expected))
+
+  def test_pardo_et_timer_with_no_firing(self):
+    if type(self).__name__ in {'FnApiRunnerTest',
+                               'FnApiRunnerTestWithGrpc',
+                               'FnApiRunnerTestWithGrpcAndMultiWorkers',
+                               'FnApiRunnerTestWithDisabledCaching',
+                               'FnApiRunnerTestWithMultiWorkers',
+                               'FnApiRunnerTestWithBundleRepeat',
+                               'FnApiRunnerTestWithBundleRepeatAndMultiWorkers',
+                               'SamzaRunnerTest',
+                               'SparkRunnerTest'}:
+      raise unittest.SkipTest("https://github.com/apache/beam/issues/35168")
+
+    # The timer will not fire. It is initially set to T + 10, but then it is
+    # cleared at T + 4 (count == 5), and reset to T + 5 + 10
+    # (count is reset every 5 seconds).
+    self._run_pardo_et_timer_test(5, 10, True, True, [])
+
+  def test_pardo_et_timer_with_no_reset(self):
+    if type(self).__name__ in {'FnApiRunnerTest',
+                               'FnApiRunnerTestWithGrpc',
+                               'FnApiRunnerTestWithGrpcAndMultiWorkers',
+                               'FnApiRunnerTestWithDisabledCaching',
+                               'FnApiRunnerTestWithMultiWorkers',
+                               'FnApiRunnerTestWithBundleRepeat',
+                               'FnApiRunnerTestWithBundleRepeatAndMultiWorkers',
+                               'SamzaRunnerTest',
+                               'SparkRunnerTest'}:
+      raise unittest.SkipTest("https://github.com/apache/beam/issues/35168")
+
+    # The timer will not fire. It is initially set to T + 10, and then it is
+    # cleared at T + 4 and never set again (count is not reset).
+    self._run_pardo_et_timer_test(5, 10, False, True, [])
+
+  def test_pardo_et_timer_with_no_reset_and_no_clear(self):
+    if type(self).__name__ in {'FnApiRunnerTest',
+                               'FnApiRunnerTestWithGrpc',
+                               'FnApiRunnerTestWithGrpcAndMultiWorkers',
+                               'FnApiRunnerTestWithDisabledCaching',
+                               'FnApiRunnerTestWithMultiWorkers',
+                               'FnApiRunnerTestWithBundleRepeat',
+                               'FnApiRunnerTestWithBundleRepeatAndMultiWorkers',
+                               'SamzaRunnerTest',
+                               'SparkRunnerTest'}:
+      raise unittest.SkipTest("https://github.com/apache/beam/issues/35168")
+    # The timer will fire at T + 10. After the timer is set, it is never
+    # cleared or set again.
+    self._run_pardo_et_timer_test(5, 10, False, False, ["fired"])
+
   def test_pardo_state_timers(self):
     self._run_pardo_state_timers(windowed=False)
 
@@ -772,7 +910,8 @@ class FnApiRunnerTest(unittest.TestCase):
           state.clear()
           yield buffer
         else:
-          timer.set(ts + 1)
+          # Set the timer to fire within it's window.
+          timer.set(ts + (1 - timestamp.Duration(micros=1000)))
 
       @userstate.on_timer(timer_spec)
       def process_timer(self, state=beam.DoFn.StateParam(state_spec)):
@@ -786,8 +925,10 @@ class FnApiRunnerTest(unittest.TestCase):
       # Acutal should be a grouping of the inputs into batches of size
       # at most buffer_size, but the actual batching is nondeterministic
       # based on ordering and trigger firing timing.
-      self.assertEqual(sorted(sum((list(b) for b in actual), [])), elements)
-      self.assertEqual(max(len(list(buffer)) for buffer in actual), buffer_size)
+      self.assertEqual(
+          sorted(sum((list(b) for b in actual), [])), elements, actual)
+      self.assertEqual(
+          max(len(list(buffer)) for buffer in actual), buffer_size, actual)
       if windowed:
         # Elements were assigned to windows based on their parity.
         # Assert that each grouping consists of elements belonging to the
@@ -983,7 +1124,7 @@ class FnApiRunnerTest(unittest.TestCase):
     self.run_sdf_initiated_checkpointing(is_drain=True)
 
   def test_sdf_default_truncate_when_bounded(self):
-    class SimleSDF(beam.DoFn):
+    class SimpleSDF(beam.DoFn):
       def process(
           self,
           element,
@@ -996,11 +1137,11 @@ class FnApiRunnerTest(unittest.TestCase):
           cur += 1
 
     with self.create_pipeline(is_drain=True) as p:
-      actual = (p | beam.Create([10]) | beam.ParDo(SimleSDF()))
+      actual = (p | beam.Create([10]) | beam.ParDo(SimpleSDF()))
       assert_that(actual, equal_to(range(10)))
 
   def test_sdf_default_truncate_when_unbounded(self):
-    class SimleSDF(beam.DoFn):
+    class SimpleSDF(beam.DoFn):
       def process(
           self,
           element,
@@ -1013,11 +1154,11 @@ class FnApiRunnerTest(unittest.TestCase):
           cur += 1
 
     with self.create_pipeline(is_drain=True) as p:
-      actual = (p | beam.Create([10]) | beam.ParDo(SimleSDF()))
+      actual = (p | beam.Create([10]) | beam.ParDo(SimpleSDF()))
       assert_that(actual, equal_to([]))
 
   def test_sdf_with_truncate(self):
-    class SimleSDF(beam.DoFn):
+    class SimpleSDF(beam.DoFn):
       def process(
           self,
           element,
@@ -1030,7 +1171,7 @@ class FnApiRunnerTest(unittest.TestCase):
           cur += 1
 
     with self.create_pipeline(is_drain=True) as p:
-      actual = (p | beam.Create([10]) | beam.ParDo(SimleSDF()))
+      actual = (p | beam.Create([10]) | beam.ParDo(SimpleSDF()))
       assert_that(actual, equal_to(range(5)))
 
   def test_group_by_key(self):
@@ -1047,6 +1188,15 @@ class FnApiRunnerTest(unittest.TestCase):
     with self.create_pipeline() as p:
       assert_that(
           p | beam.Create([1, 2, 3]) | beam.Reshuffle(), equal_to([1, 2, 3]))
+
+  def test_reshuffle_after_custom_window(self):
+    with self.create_pipeline() as p:
+      assert_that(
+          p | beam.Create([12, 2, 1])
+          | beam.Map(lambda t: window.TimestampedValue(t, t))
+          | beam.WindowInto(beam.transforms.window.FixedWindows(2))
+          | beam.Reshuffle(),
+          equal_to([12, 2, 1]))
 
   def test_flatten(self, with_transcoding=True):
     with self.create_pipeline() as p:
@@ -1073,6 +1223,27 @@ class FnApiRunnerTest(unittest.TestCase):
           | beam.Create([('a', 1), ('a', 2), ('b', 3)])
           | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
       assert_that(res, equal_to([('a', 1.5), ('b', 3.0)]))
+
+  def test_windowed_combine_per_key(self):
+    with self.create_pipeline() as p:
+      input = (
+          p | beam.Create([12, 2, 1])
+          | beam.Map(lambda t: window.TimestampedValue(('k', t), t)))
+
+      fixed = input | 'Fixed' >> (
+          beam.WindowInto(beam.transforms.window.FixedWindows(10))
+          | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
+      assert_that(fixed, equal_to([('k', 1.5), ('k', 12)]))
+
+      sliding = input | 'Sliding' >> (
+          beam.WindowInto(beam.transforms.window.SlidingWindows(20, 10))
+          | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
+      assert_that(sliding, equal_to([('k', 1.5), ('k', 5.0), ('k', 12)]))
+
+      sessions = input | 'Sessions' >> (
+          beam.WindowInto(beam.transforms.window.Sessions(5))
+          | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
+      assert_that(sessions, equal_to([('k', 1.5), ('k', 12)]))
 
   def test_read(self):
     # Can't use NamedTemporaryFile as a context
@@ -1113,6 +1284,19 @@ class FnApiRunnerTest(unittest.TestCase):
     from apache_beam.runners.portability.fn_api_runner.execution import GenericMergingWindowFn
     self.assertEqual(GenericMergingWindowFn._HANDLES, {})
 
+  def test_custom_window_type(self):
+    with self.create_pipeline() as p:
+      res = (
+          p
+          | beam.Create([1, 2, 100, 101, 102])
+          | beam.Map(lambda t: window.TimestampedValue(('k', t), t))
+          | beam.WindowInto(EvenOddWindows())
+          | beam.GroupByKey()
+          | beam.Map(lambda k_vs1: (k_vs1[0], sorted(k_vs1[1]))))
+      assert_that(
+          res,
+          equal_to([('k', [1]), ('k', [2]), ('k', [101]), ('k', [100, 102])]))
+
   @unittest.skip('BEAM-9119: test is flaky')
   def test_large_elements(self):
     with self.create_pipeline() as p:
@@ -1125,8 +1309,7 @@ class FnApiRunnerTest(unittest.TestCase):
       side_input_res = (
           big
           | beam.Map(
-              lambda x,
-              side: (x[0], side.count(x[0])),
+              lambda x, side: (x[0], side.count(x[0])),
               beam.pvalue.AsList(big | beam.Map(lambda x: x[0]))))
       assert_that(
           side_input_res,
@@ -1189,19 +1372,24 @@ class FnApiRunnerTest(unittest.TestCase):
       pcoll_b = p | 'b' >> beam.Create(['b'])
       assert_that((pcoll_a, pcoll_b) | First(), equal_to(['a']))
 
-  def test_metrics(self, check_gauge=True):
+  def test_metrics(self, check_gauge=True, check_bounded_trie=False):
     p = self.create_pipeline()
 
     counter = beam.metrics.Metrics.counter('ns', 'counter')
     distribution = beam.metrics.Metrics.distribution('ns', 'distribution')
     gauge = beam.metrics.Metrics.gauge('ns', 'gauge')
+    string_set = beam.metrics.Metrics.string_set('ns', 'string_set')
+    bounded_trie = beam.metrics.Metrics.bounded_trie('ns', 'bounded_trie')
 
-    pcoll = p | beam.Create(['a', 'zzz'])
+    elements = ['a', 'zzz']
+    pcoll = p | beam.Create(elements)
     # pylint: disable=expression-not-assigned
     pcoll | 'count1' >> beam.FlatMap(lambda x: counter.inc())
     pcoll | 'count2' >> beam.FlatMap(lambda x: counter.inc(len(x)))
     pcoll | 'dist' >> beam.FlatMap(lambda x: distribution.update(len(x)))
     pcoll | 'gauge' >> beam.FlatMap(lambda x: gauge.set(3))
+    pcoll | 'string_set' >> beam.FlatMap(lambda x: string_set.add(x))
+    pcoll | 'bounded_trie' >> beam.FlatMap(lambda x: bounded_trie.add(tuple(x)))
 
     res = p.run()
     res.wait_until_finish()
@@ -1220,6 +1408,18 @@ class FnApiRunnerTest(unittest.TestCase):
       gaug, = res.metrics().query(beam.metrics.MetricsFilter()
                                   .with_name('gauge'))['gauges']
       self.assertEqual(gaug.committed.value, 3)
+
+    str_set, = res.metrics().query(beam.metrics.MetricsFilter()
+                                  .with_name('string_set'))['string_sets']
+    self.assertEqual(str_set.committed, set(elements))
+
+    if check_bounded_trie:
+      bounded_trie, = res.metrics().query(beam.metrics.MetricsFilter()
+                                    .with_name('bounded_trie'))['bounded_tries']
+      self.assertEqual(bounded_trie.committed.size(), 2)
+      for element in elements:
+        self.assertTrue(
+            bounded_trie.committed.contains(tuple(element)), element)
 
   def test_callbacks_with_exception(self):
     elements_list = ['1', '2']
@@ -1350,8 +1550,7 @@ class FnApiRunnerTest(unittest.TestCase):
     with self.create_pipeline() as p:
       _ = p | beam.Create([10, 20, 30]) | PackableCombines()
 
-    res = p.run()
-    res.wait_until_finish()
+    res = p.result
 
     packed_step_name_regex = (
         r'.*Packed.*PackableMin.*CombinePerKey.*PackableMax.*CombinePerKey.*' +
@@ -1370,6 +1569,15 @@ class FnApiRunnerTest(unittest.TestCase):
 
   def test_pack_combiners(self):
     self._test_pack_combiners(assert_using_counter_names=True)
+
+  def test_group_by_key_with_empty_pcoll_elements(self):
+    with self.create_pipeline() as p:
+      res = (
+          p
+          | beam.Create([('test_key', 'test_value')])
+          | beam.Filter(lambda x: False)
+          | beam.GroupByKey())
+      assert_that(res, equal_to([]))
 
 
 # These tests are kept in a separate group so that they are
@@ -1692,14 +1900,8 @@ class FnApiRunnerMetricsTest(unittest.TestCase):
         | beam.GroupByKey()
         | 'm_out' >> beam.FlatMap(
             lambda x: [
-                1,
-                2,
-                3,
-                4,
-                5,
-                beam.pvalue.TaggedOutput('once', x),
-                beam.pvalue.TaggedOutput('twice', x),
-                beam.pvalue.TaggedOutput('twice', x)
+                1, 2, 3, 4, 5, beam.pvalue.TaggedOutput('once', x), beam.pvalue.
+                TaggedOutput('twice', x), beam.pvalue.TaggedOutput('twice', x)
             ]))
 
     res = p.run()
@@ -2107,6 +2309,33 @@ class FnApiRunnerSplitTest(unittest.TestCase):
         if expected_groups:
           assert_that(grouped, equal_to(expected_groups), label='CheckGrouped')
 
+  def test_time_based_split_manager(self):
+
+    elements = [str(x) for x in range(100)]
+
+    class BundleCountingDoFn(beam.DoFn):
+      def process(self, element):
+        time.sleep(0.005)
+        yield element
+
+      def finish_bundle(self):
+        yield window.GlobalWindows.windowed_value('endOfBundle')
+
+    with self.create_pipeline() as p:
+      p._options.view_as(DirectOptions).direct_test_splits = {
+          'SplitMarker': {
+              'timings': [0, .05], 'fractions': [0.5, 0.5]
+          }
+      }
+      assert_that(
+          p
+          | beam.Create(elements)
+          | 'SplitMarker' >> beam.ParDo(BundleCountingDoFn()),
+          # We split the first bundle twice (once at 50%, and again at 50% of
+          # what was left). All returned split remainders get processed
+          # (together) in a (single) subsequent bundle.
+          equal_to(elements + ['endOfBundle'] * 2))
+
   def verify_channel_split(self, split_result, last_primary, first_residual):
     self.assertEqual(1, len(split_result.channel_splits), split_result)
     channel_split, = split_result.channel_splits
@@ -2172,7 +2401,7 @@ class ElementCounter(object):
     return _unpickle_element_counter, (name, )
 
 
-_pickled_element_counters = {}  # type: Dict[str, ElementCounter]
+_pickled_element_counters: Dict[str, ElementCounter] = {}
 
 
 def _unpickle_element_counter(name):
@@ -2338,6 +2567,47 @@ class CustomMergingWindowFn(window.WindowFn):
 
   def get_window_coder(self):
     return coders.IntervalWindowCoder()
+
+
+class ColoredFixedWindow(window.BoundedWindow):
+  def __init__(self, end, color):
+    super().__init__(end)
+    self.color = color
+
+  def __hash__(self):
+    return hash((self.end, self.color))
+
+  def __eq__(self, other):
+    return (
+        type(self) == type(other) and self.end == other.end and
+        self.color == other.color)
+
+
+class ColoredFixedWindowCoder(beam.coders.Coder):
+  kv_coder = beam.coders.TupleCoder(
+      [beam.coders.TimestampCoder(), beam.coders.StrUtf8Coder()])
+
+  def encode(self, colored_window):
+    return self.kv_coder.encode((colored_window.end, colored_window.color))
+
+  def decode(self, encoded_window):
+    return ColoredFixedWindow(*self.kv_coder.decode(encoded_window))
+
+  def is_deterministic(self):
+    return True
+
+
+class EvenOddWindows(window.NonMergingWindowFn):
+  def assign(self, context):
+    timestamp = context.timestamp
+    return [
+        ColoredFixedWindow(
+            timestamp - timestamp % 10 + 10,
+            'red' if timestamp.micros // 1000000 % 2 else 'black')
+    ]
+
+  def get_window_coder(self):
+    return ColoredFixedWindowCoder()
 
 
 class ExpectingSideInputsFn(beam.DoFn):

@@ -17,7 +17,7 @@
  */
 package org.apache.beam.sdk.extensions.sql.meta.provider.kafka;
 
-import static org.apache.beam.vendor.calcite.v1_28_0.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import java.util.Collection;
 import java.util.HashMap;
@@ -110,7 +110,7 @@ public abstract class BeamKafkaTable extends SchemaBaseBeamTable {
         .setRowSchema(getSchema());
   }
 
-  KafkaIO.Read<byte[], byte[]> createKafkaRead() {
+  protected KafkaIO.Read<byte[], byte[]> createKafkaRead() {
     KafkaIO.Read<byte[], byte[]> kafkaRead;
     if (topics != null) {
       kafkaRead =
@@ -159,6 +159,10 @@ public abstract class BeamKafkaTable extends SchemaBaseBeamTable {
 
   public List<String> getTopics() {
     return topics;
+  }
+
+  public Map<String, Object> getConfigUpdates() {
+    return configUpdates;
   }
 
   @Override

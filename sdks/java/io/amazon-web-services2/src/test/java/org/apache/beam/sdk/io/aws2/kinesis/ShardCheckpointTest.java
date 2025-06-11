@@ -18,9 +18,11 @@
 package org.apache.beam.sdk.io.aws2.kinesis;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Matchers.eq;
-import static org.mockito.Matchers.isNull;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static software.amazon.awssdk.services.kinesis.model.ShardIteratorType.AFTER_SEQUENCE_NUMBER;
@@ -136,6 +138,30 @@ public class ShardCheckpointTest {
             checkpoint(AT_TIMESTAMP, referenceTimestamp.toInstant())
                 .isBeforeOrAt(recordWith(referenceTimestamp.plusMillis(10).toInstant())))
         .isTrue();
+  }
+
+  @Test
+  public void testEquals() {
+    assertEquals(
+        new ShardCheckpoint("stream-01", "shard-000", new StartingPoint(Instant.ofEpochMilli(112))),
+        new ShardCheckpoint(
+            "stream-01", "shard-000", new StartingPoint(Instant.ofEpochMilli(112))));
+
+    assertEquals(
+        new ShardCheckpoint(
+            "stream-01", "shard-000", ShardIteratorType.AFTER_SEQUENCE_NUMBER, "9", 0L),
+        new ShardCheckpoint(
+            "stream-01", "shard-000", ShardIteratorType.AFTER_SEQUENCE_NUMBER, "9", 0L));
+    assertNotEquals(
+        new ShardCheckpoint(
+            "stream-01", "shard-000", ShardIteratorType.AFTER_SEQUENCE_NUMBER, "10", 0L),
+        new ShardCheckpoint(
+            "stream-01", "shard-000", ShardIteratorType.AFTER_SEQUENCE_NUMBER, "9", 0L));
+
+    assertNotEquals(
+        new ShardCheckpoint("stream-01", "shard-000", new StartingPoint(Instant.ofEpochMilli(112))),
+        new ShardCheckpoint(
+            "stream-01", "shard-000", new StartingPoint(Instant.ofEpochMilli(113))));
   }
 
   private KinesisRecord recordWith(ExtendedSequenceNumber extendedSequenceNumber) {

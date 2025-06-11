@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-import { Pipeline } from "../internal/pipeline";
+import { Pipeline } from "../proto/beam_runner_api";
 import { PipelineResult, Runner } from "./runner";
 import { PortableRunner } from "./portable_runner/runner";
 import { PythonService } from "../utils/service";
@@ -30,15 +30,26 @@ export function dataflowRunner(runnerOptions: {
   return new (class extends Runner {
     async runPipeline(
       pipeline: Pipeline,
-      options: Object = {}
+      options: Object = {},
     ): Promise<PipelineResult> {
-      return new PortableRunner(
+      var augmentedOptions = { experiments: [] as string[], ...options };
+      augmentedOptions.experiments.push("use_runner_v2");
+      augmentedOptions.experiments.push("use_portable_job_submission");
+      augmentedOptions.experiments.push("use_sibling_sdk_workers");
+      const service = PythonService.forModule(
+        "apache_beam.runners.dataflow.dataflow_job_service",
+        ["--port", "{{PORT}}"],
+      );
+      const result = new PortableRunner(
         runnerOptions as any,
-        PythonService.forModule(
-          "apache_beam.runners.dataflow.dataflow_job_service",
-          ["--port", "{{PORT}}"]
-        )
-      ).runPipeline(pipeline, options);
+        service,
+      ).runPipeline(pipeline, augmentedOptions);
+      result.then((res) => {
+        res.waitUntilFinish().then((_state) => {
+          service.stop();
+        });
+      });
+      return result;
     }
   })();
 }

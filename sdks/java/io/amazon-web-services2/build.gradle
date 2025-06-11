@@ -33,7 +33,8 @@ def excludeNetty = {
 }
 
 dependencies {
-  implementation library.java.vendored_guava_26_0_jre
+  implementation library.java.vendored_guava_32_1_2_jre
+  implementation library.java.vendored_grpc_1_69_0
   implementation library.java.error_prone_annotations
   implementation project(path: ":sdks:java:core", configuration: "shadow")
   implementation library.java.aws_java_sdk2_cloudwatch, excludeNetty
@@ -48,12 +49,24 @@ dependencies {
   implementation library.java.aws_java_sdk2_auth, excludeNetty
   implementation library.java.aws_java_sdk2_regions, excludeNetty
   implementation library.java.aws_java_sdk2_utils, excludeNetty
+  implementation library.java.aws_java_sdk2_profiles, excludeNetty
   implementation library.java.aws_java_sdk2_http_client_spi, excludeNetty
   implementation library.java.aws_java_sdk2_apache_client, excludeNetty
   implementation library.java.aws_java_sdk2_netty_client, excludeNetty
-  implementation "software.amazon.kinesis:amazon-kinesis-client:2.3.4", excludeNetty
+  implementation("software.amazon.kinesis:amazon-kinesis-client:3.0.1") {
+    // Note: The KCL client isn't used. However, unfortunately, some model classes of KCL leak into the
+    // KinesisIO API (KinesisClientRecord, InitialPositionInStream). Additionally, KinesisIO
+    // internally uses KCL utils to generate aggregated messages and de-aggregate them.
+
+    // Exclude unnecessary runtime dependencies of the client as these cause conflicts.
+    exclude group: "software.amazon.glue", module: "*"
+    exclude group: "software.amazon.awssdk", module: "*"
+    exclude group: "io.reactivex.rxjava3", module: "rxjava"
+  }
   implementation library.java.netty_all // force version of netty used by Beam
+  implementation library.java.netty_transport
   permitUnusedDeclared library.java.netty_all
+  implementation library.java.byte_buddy
   implementation library.java.jackson_core
   implementation library.java.jackson_annotations
   implementation library.java.jackson_databind
@@ -61,10 +74,12 @@ dependencies {
   implementation library.java.slf4j_api
   implementation library.java.protobuf_java
   implementation "commons-lang:commons-lang:2.6"
+  implementation "org.reactivestreams:reactive-streams:1.0.3"
   implementation library.java.commons_lang3
   implementation library.java.commons_codec
   testImplementation project(path: ":sdks:java:core", configuration: "shadowTest")
-  testImplementation project(path: ":sdks:java:io:common", configuration: "testRuntimeMigration")
+  testImplementation project(path: ":sdks:java:extensions:avro", configuration: "testRuntimeMigration")
+  testImplementation project(path: ":sdks:java:io:common")
   testImplementation "io.findify:s3mock_2.12:0.2.6"
   testImplementation 'org.elasticmq:elasticmq-rest-sqs_2.12:1.3.5'
   testImplementation library.java.mockito_core

@@ -20,6 +20,7 @@ package org.apache.beam.sdk.io.gcp.bigquery;
 import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryResourceNaming.createTempTableReference;
 import static org.apache.beam.sdk.transforms.display.DisplayDataMatchers.hasDisplayItem;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
@@ -36,13 +37,22 @@ import com.google.bigtable.v2.Mutation;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.io.Serializable;
+import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import org.apache.avro.specific.SpecificDatumReader;
+import org.apache.avro.specific.SpecificRecordBase;
+import org.apache.beam.sdk.PipelineResult;
 import org.apache.beam.sdk.coders.CoderRegistry;
 import org.apache.beam.sdk.coders.KvCoder;
+import org.apache.beam.sdk.coders.SerializableCoder;
 import org.apache.beam.sdk.coders.VarIntCoder;
+import org.apache.beam.sdk.extensions.avro.io.AvroSource;
 import org.apache.beam.sdk.extensions.protobuf.ByteStringCoder;
 import org.apache.beam.sdk.extensions.protobuf.ProtoCoder;
 import org.apache.beam.sdk.io.BoundedSource;
@@ -51,6 +61,7 @@ import org.apache.beam.sdk.io.gcp.bigquery.BigQueryResourceNaming.JobType;
 import org.apache.beam.sdk.io.gcp.testing.FakeBigQueryServices;
 import org.apache.beam.sdk.io.gcp.testing.FakeDatasetService;
 import org.apache.beam.sdk.io.gcp.testing.FakeJobService;
+import org.apache.beam.sdk.metrics.Lineage;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.ValueProvider;
@@ -70,15 +81,17 @@ import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.Row;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.MoreCollectors;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
 import org.junit.rules.TemporaryFolder;
 import org.junit.rules.TestRule;
+import org.junit.rules.Timeout;
 import org.junit.runner.Description;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -90,6 +103,8 @@ public class BigQueryIOReadTest implements Serializable {
   private transient PipelineOptions options;
   private transient TemporaryFolder testFolder = new TemporaryFolder();
   private transient TestPipeline p;
+
+  @Rule public transient Timeout globalTimeout = Timeout.seconds(60);
 
   @Rule
   public final transient TestRule folderThenPipeline =
@@ -130,6 +145,55 @@ public class BigQueryIOReadTest implements Serializable {
           .withDatasetService(fakeDatasetService)
           .withJobService(fakeJobService);
 
+  private SerializableFunction<TableSchema, AvroSource.DatumReaderFactory<TableRow>>
+      datumReaderFactoryFn =
+          (SerializableFunction<TableSchema, AvroSource.DatumReaderFactory<TableRow>>)
+              input -> {
+                try {
+                  String jsonSchema = BigQueryIO.JSON_FACTORY.toString(input);
+                  return (AvroSource.DatumReaderFactory<TableRow>)
+                      (writer, reader) ->
+                          new BigQueryIO.GenericDatumTransformer<>(
+                              BigQueryIO.TableRowParser.INSTANCE, jsonSchema, writer);
+                } catch (IOException e) {
+                  return null;
+                }
+              };
+
+  private static class MyData implements Serializable {
+    private String name;
+    private Long number;
+    private BigDecimal numeric;
+    private BigDecimal numeric2;
+
+    public MyData(String name, Long number, BigDecimal numeric, BigDecimal numeric2) {
+      this.name = name;
+      this.number = number;
+      this.numeric = numeric;
+      this.numeric2 = numeric2;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      MyData myData = (MyData) o;
+      return number.equals(myData.number)
+          && name.equals(myData.name)
+          && numeric.equals(myData.numeric)
+          && numeric2.equals(myData.numeric2);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(name, number, numeric, numeric2);
+    }
+  }
+
   private void checkSetsProject(String projectId) throws Exception {
     fakeDatasetService.createDataset(projectId, "dataset-id", "", "", null);
     String tableId = "sometable";
@@ -144,47 +208,89 @@ public class BigQueryIOReadTest implements Serializable {
                     .setFields(
                         ImmutableList.of(
                             new TableFieldSchema().setName("name").setType("STRING"),
-                            new TableFieldSchema().setName("number").setType("INTEGER")))));
+                            new TableFieldSchema().setName("number").setType("INTEGER"),
+                            new TableFieldSchema().setName("numeric_num").setType("NUMERIC"),
+                            new TableFieldSchema()
+                                .setName("numeric_num2")
+                                .setType("NUMERIC")
+                                .setScale(2L)
+                                .setPrecision(3L)))));
 
     FakeBigQueryServices fakeBqServices =
         new FakeBigQueryServices()
             .withJobService(new FakeJobService())
             .withDatasetService(fakeDatasetService);
 
+    BigDecimal bd1 = new BigDecimal("123456789.123456789");
+    bd1 = bd1.setScale(9, BigDecimal.ROUND_DOWN);
+    BigDecimal bd2 = new BigDecimal("-98789.54767119977");
+    bd2 = bd2.setScale(9, BigDecimal.ROUND_DOWN);
+    BigDecimal bd3 = new BigDecimal("10.99");
+    bd3 = bd3.setScale(9, BigDecimal.ROUND_DOWN);
+    BigDecimal bd4 = new BigDecimal("2.98123232");
+    bd4 = bd4.setScale(2, BigDecimal.ROUND_DOWN);
+
     List<TableRow> expected =
         ImmutableList.of(
-            new TableRow().set("name", "a").set("number", 1L),
-            new TableRow().set("name", "b").set("number", 2L),
-            new TableRow().set("name", "c").set("number", 3L),
-            new TableRow().set("name", "d").set("number", 4L),
-            new TableRow().set("name", "e").set("number", 5L),
-            new TableRow().set("name", "f").set("number", 6L));
+            new TableRow()
+                .set("name", "a")
+                .set("number", 1L)
+                .set("numeric_num", ByteBuffer.wrap(bd1.unscaledValue().toByteArray()))
+                .set("numeric_num2", ByteBuffer.wrap(bd4.unscaledValue().toByteArray())),
+            new TableRow()
+                .set("name", "b")
+                .set("number", 2L)
+                .set("numeric_num", ByteBuffer.wrap(bd2.unscaledValue().toByteArray()))
+                .set("numeric_num2", ByteBuffer.wrap(bd4.unscaledValue().toByteArray())),
+            new TableRow()
+                .set("name", "c")
+                .set("number", 3L)
+                .set("numeric_num", ByteBuffer.wrap(bd3.unscaledValue().toByteArray()))
+                .set("numeric_num2", ByteBuffer.wrap(bd4.unscaledValue().toByteArray())),
+            new TableRow()
+                .set("name", "d")
+                .set("number", 4L)
+                .set("numeric_num", ByteBuffer.wrap(bd3.unscaledValue().toByteArray()))
+                .set("numeric_num2", ByteBuffer.wrap(bd4.unscaledValue().toByteArray())),
+            new TableRow()
+                .set("name", "e")
+                .set("number", 5L)
+                .set("numeric_num", ByteBuffer.wrap(bd3.unscaledValue().toByteArray()))
+                .set("numeric_num2", ByteBuffer.wrap(bd4.unscaledValue().toByteArray())),
+            new TableRow()
+                .set("name", "f")
+                .set("number", 6L)
+                .set("numeric_num", ByteBuffer.wrap(bd3.unscaledValue().toByteArray()))
+                .set("numeric_num2", ByteBuffer.wrap(bd4.unscaledValue().toByteArray())));
     fakeDatasetService.insertAll(tableReference, expected, null);
 
     TableReference tableRef = new TableReference().setDatasetId("dataset-id").setTableId(tableId);
 
-    PCollection<KV<String, Long>> output =
+    PCollection<MyData> output =
         p.apply(BigQueryIO.read().from(tableRef).withTestServices(fakeBqServices))
             .apply(
                 ParDo.of(
-                    new DoFn<TableRow, KV<String, Long>>() {
+                    new DoFn<TableRow, MyData>() {
                       @ProcessElement
                       public void processElement(ProcessContext c) throws Exception {
                         c.output(
-                            KV.of(
+                            new MyData(
                                 (String) c.element().get("name"),
-                                Long.valueOf((String) c.element().get("number"))));
+                                Long.valueOf((String) c.element().get("number")),
+                                new BigDecimal((String) c.element().get("numeric_num")),
+                                new BigDecimal((String) c.element().get("numeric_num2"))));
                       }
-                    }));
+                    }))
+            .setCoder(SerializableCoder.of(MyData.class));
     PAssert.that(output)
         .containsInAnyOrder(
             ImmutableList.of(
-                KV.of("a", 1L),
-                KV.of("b", 2L),
-                KV.of("c", 3L),
-                KV.of("d", 4L),
-                KV.of("e", 5L),
-                KV.of("f", 6L)));
+                new MyData("a", 1L, bd1, bd4),
+                new MyData("b", 2L, bd2, bd4),
+                new MyData("c", 3L, bd3, bd4),
+                new MyData("d", 4L, bd3, bd4),
+                new MyData("e", 5L, bd3, bd4),
+                new MyData("f", 6L, bd3, bd4)));
     p.run();
   }
 
@@ -199,7 +305,16 @@ public class BigQueryIOReadTest implements Serializable {
 
   private void checkTypedReadQueryObject(
       BigQueryIO.TypedRead<?> read, String query, String kmsKey, String tempDataset) {
-    checkTypedReadQueryObjectWithValidate(read, query, kmsKey, tempDataset, true);
+    checkTypedReadQueryObjectWithValidate(read, query, kmsKey, tempDataset, null, true);
+  }
+
+  private void checkTypedReadQueryObject(
+      BigQueryIO.TypedRead<?> read,
+      String query,
+      String kmsKey,
+      String tempDataset,
+      String tempProject) {
+    checkTypedReadQueryObjectWithValidate(read, query, kmsKey, tempDataset, tempProject, true);
   }
 
   private void checkReadTableObjectWithValidate(
@@ -223,12 +338,19 @@ public class BigQueryIOReadTest implements Serializable {
       String query,
       String kmsKey,
       String tempDataset,
+      String tempProject,
       boolean validate) {
     assertNull(read.getTable());
     assertEquals(query, read.getQuery().get());
     assertEquals(kmsKey, read.getKmsKey());
     assertEquals(tempDataset, read.getQueryTempDataset());
+    assertEquals(tempProject, read.getQueryTempProject());
     assertEquals(validate, read.getValidate());
+  }
+
+  private void checkLineageSourceMetric(PipelineResult pipelineResult, String tableName) {
+    Set<String> result = Lineage.query(pipelineResult.metrics(), Lineage.Type.SOURCE);
+    assertThat(result, contains("bigquery:" + tableName.replace(':', '.')));
   }
 
   @Before
@@ -292,6 +414,16 @@ public class BigQueryIOReadTest implements Serializable {
             .withKmsKey("kms_key")
             .withQueryTempDataset("temp_dataset");
     checkTypedReadQueryObject(read, "foo_query", "kms_key", "temp_dataset");
+  }
+
+  @Test
+  public void testBuildQueryBasedTypedReadSourceWithTempProject() {
+    BigQueryIO.TypedRead<?> read =
+        BigQueryIO.readTableRows()
+            .fromQuery("foo_query")
+            .withKmsKey("kms_key")
+            .withQueryTempProjectAndDataset("temp_project", "temp_dataset");
+    checkTypedReadQueryObject(read, "foo_query", "kms_key", "temp_dataset", "temp_project");
   }
 
   @Test
@@ -373,7 +505,9 @@ public class BigQueryIOReadTest implements Serializable {
             .setFields(
                 ImmutableList.of(
                     new TableFieldSchema().setName("name").setType("STRING"),
-                    new TableFieldSchema().setName("number").setType("INTEGER"))));
+                    new TableFieldSchema().setName("number").setType("INTEGER"),
+                    new TableFieldSchema().setName("numeric_num").setType("NUMERIC"),
+                    new TableFieldSchema().setName("numeric_num2").setType("NUMERIC"))));
     sometable.setTableReference(
         new TableReference()
             .setProjectId("non-executing-project")
@@ -384,11 +518,29 @@ public class BigQueryIOReadTest implements Serializable {
     fakeDatasetService.createDataset("non-executing-project", "somedataset", "", "", null);
     fakeDatasetService.createTable(sometable);
 
+    BigDecimal bd1 = new BigDecimal("10.223");
+    bd1 = bd1.setScale(9, BigDecimal.ROUND_DOWN);
+    byte[] bytes = bd1.unscaledValue().toByteArray();
+    BigDecimal bd2 = new BigDecimal("-99.9999");
+    bd2 = bd2.setScale(9, BigDecimal.ROUND_DOWN);
+    byte[] bytes2 = bd2.unscaledValue().toByteArray();
     List<TableRow> records =
         Lists.newArrayList(
-            new TableRow().set("name", "a").set("number", 1L),
-            new TableRow().set("name", "b").set("number", 2L),
-            new TableRow().set("name", "c").set("number", 3L));
+            new TableRow()
+                .set("name", "a")
+                .set("number", 1L)
+                .set("numeric_num", ByteBuffer.wrap(bytes))
+                .set("numeric_num2", ByteBuffer.wrap(bytes2)),
+            new TableRow()
+                .set("name", "b")
+                .set("number", 2L)
+                .set("numeric_num", ByteBuffer.wrap(bytes))
+                .set("numeric_num2", ByteBuffer.wrap(bytes2)),
+            new TableRow()
+                .set("name", "c")
+                .set("number", 3L)
+                .set("numeric_num", ByteBuffer.wrap(bytes))
+                .set("numeric_num2", ByteBuffer.wrap(bytes2)));
     fakeDatasetService.insertAll(sometable.getTableReference(), records, null);
 
     FakeBigQueryServices fakeBqServices =
@@ -412,23 +564,31 @@ public class BigQueryIOReadTest implements Serializable {
               .withoutValidation();
       readTransform = useTemplateCompatibility ? read.withTemplateCompatibility() : read;
     }
-    PCollection<KV<String, Long>> output =
+    PCollection<MyData> output =
         p.apply(readTransform)
             .apply(
                 ParDo.of(
-                    new DoFn<TableRow, KV<String, Long>>() {
+                    new DoFn<TableRow, MyData>() {
                       @ProcessElement
                       public void processElement(ProcessContext c) throws Exception {
                         c.output(
-                            KV.of(
+                            new MyData(
                                 (String) c.element().get("name"),
-                                Long.valueOf((String) c.element().get("number"))));
+                                Long.valueOf((String) c.element().get("number")),
+                                new BigDecimal((String) c.element().get("numeric_num")),
+                                new BigDecimal((String) c.element().get("numeric_num2"))));
                       }
-                    }));
+                    }))
+            .setCoder(SerializableCoder.of(MyData.class));
 
     PAssert.that(output)
-        .containsInAnyOrder(ImmutableList.of(KV.of("a", 1L), KV.of("b", 2L), KV.of("c", 3L)));
-    p.run();
+        .containsInAnyOrder(
+            ImmutableList.of(
+                new MyData("a", 1L, bd1, bd2),
+                new MyData("b", 2L, bd1, bd2),
+                new MyData("c", 3L, bd1, bd2)));
+    PipelineResult result = p.run();
+    checkLineageSourceMetric(result, "non-executing-project:somedataset.sometable");
   }
 
   @Test
@@ -486,6 +646,107 @@ public class BigQueryIOReadTest implements Serializable {
                 Row.withSchema(expectedSchema).addValues("a", 1L).build(),
                 Row.withSchema(expectedSchema).addValues("b", 2L).build(),
                 Row.withSchema(expectedSchema).addValues("c", 3L).build()));
+
+    p.run();
+  }
+
+  static class User extends SpecificRecordBase {
+    private static final org.apache.avro.Schema schema =
+        org.apache.avro.SchemaBuilder.record("User")
+            .namespace("org.apache.beam.sdk.io.gcp.bigquery.BigQueryIOReadTest$")
+            .fields()
+            .optionalString("name")
+            .endRecord();
+
+    private String name;
+
+    public String getName() {
+      return this.name;
+    }
+
+    public void setName(String name) {
+      this.name = name;
+    }
+
+    public User() {}
+
+    @Override
+    public void put(int i, Object v) {
+      if (i == 0) {
+        setName(((org.apache.avro.util.Utf8) v).toString());
+      }
+    }
+
+    @Override
+    public Object get(int i) {
+      if (i == 0) {
+        return getName();
+      }
+      return null;
+    }
+
+    @Override
+    public org.apache.avro.Schema getSchema() {
+      return schema;
+    }
+
+    public static org.apache.avro.Schema getAvroSchema() {
+      return schema;
+    }
+  }
+
+  @Test
+  public void testReadTableWithReaderDatumFactory() throws IOException, InterruptedException {
+    // setup
+    Table someTable = new Table();
+    someTable.setSchema(
+        new TableSchema()
+            .setFields(ImmutableList.of(new TableFieldSchema().setName("name").setType("STRING"))));
+    someTable.setTableReference(
+        new TableReference()
+            .setProjectId("non-executing-project")
+            .setDatasetId("schema_dataset")
+            .setTableId("schema_table"));
+    someTable.setNumBytes(1024L * 1024L);
+    FakeDatasetService fakeDatasetService = new FakeDatasetService();
+    fakeDatasetService.createDataset("non-executing-project", "schema_dataset", "", "", null);
+    fakeDatasetService.createTable(someTable);
+
+    List<TableRow> records =
+        Lists.newArrayList(
+            new TableRow().set("name", "a"),
+            new TableRow().set("name", "b"),
+            new TableRow().set("name", "c"),
+            new TableRow().set("name", "d"));
+
+    fakeDatasetService.insertAll(someTable.getTableReference(), records, null);
+
+    FakeBigQueryServices fakeBqServices =
+        new FakeBigQueryServices()
+            .withJobService(new FakeJobService())
+            .withDatasetService(fakeDatasetService);
+
+    BigQueryIO.TypedRead<User> read =
+        BigQueryIO.readWithDatumReader(
+                (AvroSource.DatumReaderFactory<User>)
+                    (writer, reader) -> new SpecificDatumReader<>(User.getAvroSchema()))
+            .from("non-executing-project:schema_dataset.schema_table")
+            .withTestServices(fakeBqServices)
+            .withoutValidation()
+            .withCoder(SerializableCoder.of(User.class));
+
+    PCollection<User> bqRows = p.apply(read);
+
+    User a = new User();
+    a.setName("a");
+    User b = new User();
+    b.setName("b");
+    User c = new User();
+    c.setName("c");
+    User d = new User();
+    d.setName("d");
+
+    PAssert.that(bqRows).containsInAnyOrder(ImmutableList.of(a, b, c, d));
 
     p.run();
   }
@@ -558,7 +819,7 @@ public class BigQueryIOReadTest implements Serializable {
     String stepUuid = "testStepUuid";
     BoundedSource<TableRow> bqSource =
         BigQueryTableSourceDef.create(fakeBqServices, ValueProvider.StaticValueProvider.of(table))
-            .toSource(stepUuid, TableRowJsonCoder.of(), BigQueryIO.TableRowParser.INSTANCE, false);
+            .toSource(stepUuid, TableRowJsonCoder.of(), datumReaderFactoryFn, false);
 
     PipelineOptions options = PipelineOptionsFactory.create();
     options.setTempLocation(testFolder.getRoot().getAbsolutePath());
@@ -575,6 +836,12 @@ public class BigQueryIOReadTest implements Serializable {
     // Simulate a repeated call to split(), like a Dataflow worker will sometimes do.
     sources = bqSource.split(200, options);
     assertEquals(2, sources.size());
+    assertEquals(
+        TableRowJsonCoder.of(),
+        sources.stream()
+            .map(BoundedSource<TableRow>::getOutputCoder)
+            .distinct()
+            .collect(MoreCollectors.onlyElement()));
 
     // A repeated call to split() should not have caused a duplicate extract job.
     assertEquals(1, fakeJobService.getNumExtractJobCalls());
@@ -607,7 +874,7 @@ public class BigQueryIOReadTest implements Serializable {
     String stepUuid = "testStepUuid";
     BoundedSource<TableRow> bqSource =
         BigQueryTableSourceDef.create(fakeBqServices, ValueProvider.StaticValueProvider.of(table))
-            .toSource(stepUuid, TableRowJsonCoder.of(), BigQueryIO.TableRowParser.INSTANCE, false);
+            .toSource(stepUuid, TableRowJsonCoder.of(), datumReaderFactoryFn, false);
 
     PipelineOptions options = PipelineOptionsFactory.create();
 
@@ -645,7 +912,7 @@ public class BigQueryIOReadTest implements Serializable {
     String stepUuid = "testStepUuid";
     BoundedSource<TableRow> bqSource =
         BigQueryTableSourceDef.create(fakeBqServices, ValueProvider.StaticValueProvider.of(table))
-            .toSource(stepUuid, TableRowJsonCoder.of(), BigQueryIO.TableRowParser.INSTANCE, false);
+            .toSource(stepUuid, TableRowJsonCoder.of(), datumReaderFactoryFn, false);
 
     PipelineOptions options = PipelineOptionsFactory.create();
 
@@ -675,8 +942,9 @@ public class BigQueryIOReadTest implements Serializable {
                 QueryPriority.BATCH,
                 null,
                 null,
+                null,
                 null)
-            .toSource(stepUuid, TableRowJsonCoder.of(), BigQueryIO.TableRowParser.INSTANCE, false);
+            .toSource(stepUuid, TableRowJsonCoder.of(), datumReaderFactoryFn, false);
 
     fakeJobService.expectDryRunQuery(
         bqOptions.getProject(),
@@ -751,8 +1019,9 @@ public class BigQueryIOReadTest implements Serializable {
                 QueryPriority.BATCH,
                 null,
                 null,
+                null,
                 null)
-            .toSource(stepUuid, TableRowJsonCoder.of(), BigQueryIO.TableRowParser.INSTANCE, false);
+            .toSource(stepUuid, TableRowJsonCoder.of(), datumReaderFactoryFn, false);
 
     options.setTempLocation(testFolder.getRoot().getAbsolutePath());
 
@@ -763,6 +1032,12 @@ public class BigQueryIOReadTest implements Serializable {
 
     List<? extends BoundedSource<TableRow>> sources = bqSource.split(100, options);
     assertEquals(2, sources.size());
+    assertEquals(
+        TableRowJsonCoder.of(),
+        sources.stream()
+            .map(BoundedSource<TableRow>::getOutputCoder)
+            .distinct()
+            .collect(MoreCollectors.onlyElement()));
   }
 
   /**
@@ -817,8 +1092,9 @@ public class BigQueryIOReadTest implements Serializable {
                 QueryPriority.BATCH,
                 null,
                 null,
+                null,
                 null)
-            .toSource(stepUuid, TableRowJsonCoder.of(), BigQueryIO.TableRowParser.INSTANCE, false);
+            .toSource(stepUuid, TableRowJsonCoder.of(), datumReaderFactoryFn, false);
 
     options.setTempLocation(testFolder.getRoot().getAbsolutePath());
 
@@ -829,6 +1105,12 @@ public class BigQueryIOReadTest implements Serializable {
 
     List<? extends BoundedSource<TableRow>> sources = bqSource.split(100, options);
     assertEquals(2, sources.size());
+    assertEquals(
+        TableRowJsonCoder.of(),
+        sources.stream()
+            .map(BoundedSource<TableRow>::getOutputCoder)
+            .distinct()
+            .collect(MoreCollectors.onlyElement()));
   }
 
   @Test

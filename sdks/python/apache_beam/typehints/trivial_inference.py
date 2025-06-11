@@ -35,6 +35,7 @@ from apache_beam import pvalue
 from apache_beam.typehints import Any
 from apache_beam.typehints import row_type
 from apache_beam.typehints import typehints
+from apache_beam.utils import python_callable
 
 
 class TypeInferenceError(ValueError):
@@ -125,11 +126,12 @@ class Const(object):
 class FrameState(object):
   """Stores the state of the frame at a particular point of execution.
   """
-  def __init__(self, f, local_vars=None, stack=()):
+  def __init__(self, f, local_vars=None, stack=(), kw_names=None):
     self.f = f
     self.co = f.__code__
     self.vars = list(local_vars)
     self.stack = list(stack)
+    self.kw_names = kw_names
 
   def __eq__(self, other):
     return isinstance(other, FrameState) and self.__dict__ == other.__dict__
@@ -138,7 +140,7 @@ class FrameState(object):
     return hash(tuple(sorted(self.__dict__.items())))
 
   def copy(self):
-    return FrameState(self.f, self.vars, self.stack)
+    return FrameState(self.f, self.vars, self.stack, self.kw_names)
 
   def const_type(self, i):
     return Const(self.co.co_consts[i])
@@ -314,6 +316,10 @@ def infer_return_type(c, input_types, debug=False, depth=5):
           isinstance(input_types[1], Const)):
       from apache_beam.typehints import opcodes
       return opcodes._getattr(input_types[0], input_types[1].value)
+    elif isinstance(c, python_callable.PythonCallableWithSource):
+      # TODO(https://github.com/apache/beam/issues/24755): This can be removed
+      # once support for inference across *args and **kwargs is implemented.
+      return infer_return_type(c._callable, input_types, debug, depth)
     else:
       return Any
   except TypeInferenceError:
@@ -347,9 +353,16 @@ def infer_return_type_func(f, input_types, debug=False, depth=0):
   if debug:
     print()
     print(f, id(f), input_types)
-    dis.dis(f)
+    ver = (sys.version_info.major, sys.version_info.minor)
+    if ver >= (3, 13):
+      dis.dis(f, show_caches=True, show_offsets=True)
+    elif ver >= (3, 11):
+      dis.dis(f, show_caches=True)
+    else:
+      dis.dis(f)
   from . import opcodes
   simple_ops = dict((k.upper(), v) for k, v in opcodes.__dict__.items())
+  from . import intrinsic_one_ops
 
   co = f.__code__
   code = co.co_code
@@ -369,15 +382,31 @@ def infer_return_type_func(f, input_types, debug=False, depth=0):
   # In Python 3, use dis library functions to disassemble bytecode and handle
   # EXTENDED_ARGs.
   ofs_table = {}  # offset -> instruction
-  for instruction in dis.get_instructions(f):
+  if (sys.version_info.major, sys.version_info.minor) >= (3, 11):
+    dis_ints = dis.get_instructions(f, show_caches=True)
+  else:
+    dis_ints = dis.get_instructions(f)
+
+  for instruction in dis_ints:
     ofs_table[instruction.offset] = instruction
 
   # Python 3.6+: 1 byte opcode + 1 byte arg (2 bytes, arg may be ignored).
   inst_size = 2
   opt_arg_size = 0
 
+  # Python 3.10: bpo-27129 changes jump offsets to use instruction offsets,
+  # not byte offsets. The offsets were halved (16 bits fro instructions vs 8
+  # bits for bytes), so we have to double the value of arg.
+  if (sys.version_info.major, sys.version_info.minor) >= (3, 10):
+    jump_multiplier = 2
+  else:
+    jump_multiplier = 1
+
   last_pc = -1
+  last_real_opname = opname = None
   while pc < end:  # pylint: disable=too-many-nested-blocks
+    if opname not in ('PRECALL', 'CACHE'):
+      last_real_opname = opname
     start = pc
     instruction = ofs_table[pc]
     op = instruction.opcode
@@ -387,6 +416,18 @@ def infer_return_type_func(f, input_types, debug=False, depth=0):
       print(dis.opname[op].ljust(20), end=' ')
 
     pc += inst_size
+    # Python 3.13 deprecated show_caches and removed cache instruction
+    # outputs, instead putting the cache instructions nested within the
+    # Instruction object.
+    if (sys.version_info.major, sys.version_info.minor) >= (3, 13):
+      cache = instruction.cache_info
+      if cache is not None:
+        # Each entry in cache_info is a tuple with the name of the cached
+        # object, the number of cache calls it produces, and the byte
+        # representation of the cached item.
+        for cache_entry in cache:
+          pc += cache_entry[1] * inst_size
+    arg = None
     if op >= dis.HAVE_ARGUMENT:
       arg = instruction.arg
       pc += opt_arg_size
@@ -395,17 +436,43 @@ def infer_return_type_func(f, input_types, debug=False, depth=0):
         if op in dis.hasconst:
           print('(' + repr(co.co_consts[arg]) + ')', end=' ')
         elif op in dis.hasname:
-          print('(' + co.co_names[arg] + ')', end=' ')
+          if (sys.version_info.major, sys.version_info.minor) >= (3, 11):
+            # Pre-emptively bit-shift so the print doesn't go out of index
+            print_arg = arg >> 1
+          else:
+            print_arg = arg
+          print('(' + co.co_names[print_arg] + ')', end=' ')
         elif op in dis.hasjrel:
-          print('(to ' + repr(pc + arg) + ')', end=' ')
+          print('(to ' + repr(pc + (arg * jump_multiplier)) + ')', end=' ')
         elif op in dis.haslocal:
-          print('(' + co.co_varnames[arg] + ')', end=' ')
+          # Args to double-fast opcodes are bit manipulated, correct the arg
+          # for printing + avoid the out-of-index
+          if dis.opname[op] == 'LOAD_FAST_LOAD_FAST':
+            print(
+                '(' + co.co_varnames[arg >> 4] + ', ' +
+                co.co_varnames[arg & 15] + ')',
+                end=' ')
+          elif dis.opname[op] == 'STORE_FAST_LOAD_FAST':
+            print('(' + co.co_varnames[arg & 15] + ')', end=' ')
+          elif dis.opname[op] == 'STORE_FAST_STORE_FAST':
+            pass
+          else:
+            print('(' + co.co_varnames[arg] + ')', end=' ')
         elif op in dis.hascompare:
+          if (sys.version_info.major, sys.version_info.minor) >= (3, 12):
+            # In 3.12 this arg was bit-shifted. Shifting it back avoids an
+            # out-of-index.
+            arg = arg >> 4
           print('(' + dis.cmp_op[arg] + ')', end=' ')
         elif op in dis.hasfree:
           if free is None:
             free = co.co_cellvars + co.co_freevars
-          print('(' + free[arg] + ')', end=' ')
+          # From 3.11 on the arg is no longer offset by len(co_varnames)
+          # so we adjust it back
+          print_arg = arg
+          if (sys.version_info.major, sys.version_info.minor) >= (3, 11):
+            print_arg = arg - len(co.co_varnames)
+          print('(' + free[print_arg] + ')', end=' ')
 
     # Actually emulate the op.
     if state is None and states[start] is None:
@@ -431,8 +498,8 @@ def infer_return_type_func(f, input_types, debug=False, depth=0):
         else:
           return_type = Any
       elif opname == 'CALL_FUNCTION_KW':
-        # TODO(udim): Handle keyword arguments. Requires passing them by name
-        #   to infer_return_type.
+        # TODO(BEAM-24755): Handle keyword arguments. Requires passing them by
+        #   name to infer_return_type.
         pop_count = arg + 2
         if isinstance(state.stack[-pop_count], Const):
           from apache_beam.pvalue import Row
@@ -451,10 +518,10 @@ def infer_return_type_func(f, input_types, debug=False, depth=0):
         # stack[-has_kwargs]: Map of keyword args.
         # stack[-1 - has_kwargs]: Iterable of positional args.
         # stack[-2 - has_kwargs]: Function to call.
-        has_kwargs = arg & 1  # type: int
+        has_kwargs: int = arg & 1
         pop_count = has_kwargs + 2
         if has_kwargs:
-          # TODO(udim): Unimplemented. Requires same functionality as a
+          # TODO(BEAM-24755): Unimplemented. Requires same functionality as a
           #   CALL_FUNCTION_KW implementation.
           return_type = Any
         else:
@@ -485,6 +552,74 @@ def infer_return_type_func(f, input_types, debug=False, depth=0):
       else:
         return_type = typehints.Any
       state.stack[-pop_count:] = [return_type]
+    elif opname == 'CALL':
+      pop_count = 1 + arg
+      # Keyword Args case
+      if state.kw_names is not None:
+        if isinstance(state.stack[-pop_count], Const):
+          from apache_beam.pvalue import Row
+          if state.stack[-pop_count].value == Row:
+            fields = state.kw_names
+            return_type = row_type.RowTypeConstraint.from_fields(
+                list(
+                    zip(fields,
+                        Const.unwrap_all(state.stack[-pop_count + 1:]))))
+          else:
+            return_type = Any
+        state.kw_names = None
+      else:
+        # Handle comprehensions always having an arg of 0 for CALL
+        # See https://github.com/python/cpython/issues/102403 for context.
+        if (pop_count == 1 and last_real_opname == 'GET_ITER' and
+            len(state.stack) > 1 and isinstance(state.stack[-2], Const) and
+            getattr(state.stack[-2].value, '__name__', None)
+            in ('<listcomp>', '<dictcomp>', '<setcomp>', '<genexpr>')):
+          pop_count += 1
+        if depth <= 0 or pop_count > len(state.stack):
+          return_type = Any
+        elif isinstance(state.stack[-pop_count], Const):
+          return_type = infer_return_type(
+              state.stack[-pop_count].value,
+              state.stack[1 - pop_count:],
+              debug=debug,
+              depth=depth - 1)
+        else:
+          return_type = Any
+      state.stack[-pop_count:] = [return_type]
+    # CALL_KW handles all calls with kwargs post-3.13, have to maintain
+    # both paths for now. This call replaces state.kw_names with a tuple
+    # of keyword names at state.stack[-1]
+    elif opname == 'CALL_KW':
+      pop_count = 2 + arg
+      if isinstance(state.stack[-pop_count], Const):
+        from apache_beam.pvalue import Row
+        if state.stack[-pop_count].value == Row:
+          fields = state.stack[-1].value
+          return_type = row_type.RowTypeConstraint.from_fields(
+              list(
+                  zip(fields,
+                      Const.unwrap_all(state.stack[-pop_count + 1:-1]))))
+        else:
+          return_type = Any
+      else:
+        # Handle comprehensions always having an arg of 0 for CALL
+        # See https://github.com/python/cpython/issues/102403 for context.
+        if (pop_count == 1 and last_real_opname == 'GET_ITER' and
+            len(state.stack) > 1 and isinstance(state.stack[-2], Const) and
+            getattr(state.stack[-2].value, '__name__', None)
+            in ('<listcomp>', '<dictcomp>', '<setcomp>', '<genexpr>')):
+          pop_count += 1
+        if depth <= 0 or pop_count > len(state.stack):
+          return_type = Any
+        elif isinstance(state.stack[-pop_count], Const):
+          return_type = infer_return_type(
+              state.stack[-pop_count].value,
+              state.stack[1 - pop_count:],
+              debug=debug,
+              depth=depth - 1)
+        else:
+          return_type = Any
+      state.stack[-pop_count:] = [return_type]
     elif opname in simple_ops:
       if debug:
         print("Executing simple op " + opname)
@@ -495,26 +630,106 @@ def infer_return_type_func(f, input_types, debug=False, depth=0):
     elif opname == 'YIELD_VALUE':
       yields.add(state.stack[-1])
     elif opname == 'JUMP_FORWARD':
-      jmp = pc + arg
+      jmp = pc + arg * jump_multiplier
+      jmp_state = state
+      state = None
+    elif opname in ('JUMP_BACKWARD', 'JUMP_BACKWARD_NO_INTERRUPT'):
+      jmp = pc - (arg * jump_multiplier)
       jmp_state = state
       state = None
     elif opname == 'JUMP_ABSOLUTE':
-      jmp = arg
+      jmp = arg * jump_multiplier
       jmp_state = state
       state = None
     elif opname in ('POP_JUMP_IF_TRUE', 'POP_JUMP_IF_FALSE'):
       state.stack.pop()
-      jmp = arg
+      # The arg was changed to be a relative delta instead of an absolute
+      # in 3.11, and became a full instruction instead of a
+      # pseudo-instruction in 3.12
+      if (sys.version_info.major, sys.version_info.minor) >= (3, 12):
+        jmp = pc + arg * jump_multiplier
+      else:
+        jmp = arg * jump_multiplier
+      jmp_state = state.copy()
+    elif opname in ('POP_JUMP_FORWARD_IF_TRUE', 'POP_JUMP_FORWARD_IF_FALSE'):
+      state.stack.pop()
+      jmp = pc + arg * jump_multiplier
+      jmp_state = state.copy()
+    elif opname in ('POP_JUMP_BACKWARD_IF_TRUE', 'POP_JUMP_BACKWARD_IF_FALSE'):
+      state.stack.pop()
+      jmp = pc - (arg * jump_multiplier)
+      jmp_state = state.copy()
+    elif opname in ('POP_JUMP_FORWARD_IF_NONE', 'POP_JUMP_FORWARD_IF_NOT_NONE'):
+      state.stack.pop()
+      jmp = pc + arg * jump_multiplier
+      jmp_state = state.copy()
+    elif opname in ('POP_JUMP_BACKWARD_IF_NONE',
+                    'POP_JUMP_BACKWARD_IF_NOT_NONE'):
+      state.stack.pop()
+      jmp = pc - (arg * jump_multiplier)
       jmp_state = state.copy()
     elif opname in ('JUMP_IF_TRUE_OR_POP', 'JUMP_IF_FALSE_OR_POP'):
-      jmp = arg
+      # The arg was changed to be a relative delta instead of an absolute
+      # in 3.11
+      if (sys.version_info.major, sys.version_info.minor) >= (3, 11):
+        jmp = pc + arg * jump_multiplier
+      else:
+        jmp = arg * jump_multiplier
       jmp_state = state.copy()
       state.stack.pop()
     elif opname == 'FOR_ITER':
-      jmp = pc + arg
+      jmp = pc + arg * jump_multiplier
+      if sys.version_info >= (3, 12):
+        # The jump is relative to the next instruction after a cache call,
+        # so jump 4 more bytes.
+        jmp += 4
       jmp_state = state.copy()
       jmp_state.stack.pop()
       state.stack.append(element_type(state.stack[-1]))
+    elif opname == 'COPY_FREE_VARS':
+      # Helps with calling closures, but since we aren't executing
+      # them we can treat this as a no-op
+      pass
+    elif opname == 'KW_NAMES':
+      tup = co.co_consts[arg]
+      state.kw_names = tup
+    elif opname == 'RESUME':
+      # RESUME is a no-op
+      pass
+    elif opname == 'PUSH_NULL':
+      # We're treating this as a no-op to avoid having to check
+      # for extra None values on the stack when we extract return
+      # values
+      pass
+    elif opname == 'PRECALL':
+      # PRECALL is a no-op.
+      pass
+    elif opname == 'MAKE_CELL':
+      # TODO: see if we need to implement cells like this
+      pass
+    elif opname == 'RETURN_GENERATOR':
+      # TODO: see what this behavior is supposed to be beyond
+      # putting something on the stack to be popped off
+      state.stack.append(None)
+      pass
+    elif opname == 'CACHE':
+      # No-op introduced in 3.11. Without handling this some
+      # instructions have functionally > 2 byte size.
+      pass
+    elif opname == 'RETURN_CONST':
+      # Introduced in 3.12. Handles returning constants directly
+      # instead of having a LOAD_CONST before a RETURN_VALUE.
+      returns.add(state.const_type(arg))
+      state = None
+    elif opname == 'CALL_INTRINSIC_1':
+      # Introduced in 3.12. The arg is an index into a table of
+      # operations reproduced in INT_ONE_OPS. Not all ops are
+      # relevant for our type checking infrastructure.
+      int_op = intrinsic_one_ops.INT_ONE_OPS[arg]
+      if debug:
+        print("Executing intrinsic one op", int_op.__name__.upper())
+      int_op(state, arg)
+
     else:
       raise TypeInferenceError('unable to handle %s' % opname)
 

@@ -21,6 +21,7 @@
 
 import io
 import logging
+import os
 import unittest
 
 from hamcrest import all_of
@@ -117,7 +118,7 @@ class SdkWorkerMainTest(unittest.TestCase):
           'LOGGING_API_SERVICE_DESCRIPTOR': '',
           'CONTROL_API_SERVICE_DESCRIPTOR': '',
           'PIPELINE_OPTIONS': '{"default_sdk_harness_log_level":"INVALID",'
-          '"sdk_harness_log_level_overrides":"{INVALID_JSON}"}',
+          '"sdk_harness_log_level_overrides":[]}',
       },
                                      dry_run=True)
     logstream.seek(0)
@@ -127,6 +128,17 @@ class SdkWorkerMainTest(unittest.TestCase):
 
   def test_import_beam_plugins(self):
     sdk_worker_main._import_beam_plugins(BeamPlugin.get_all_plugin_paths())
+
+  @staticmethod
+  def _overrides_case_to_option_dict(case):
+    """
+    Return logging level overrides from command line strings via PipelineOption.
+    """
+    options_list = []
+    for c in case:
+      options_list += ['--sdk_harness_log_level_overrides', c]
+    options = PipelineOptions(options_list)
+    return options.get_all_options()
 
   def test__get_log_level_from_options_dict(self):
     test_cases = [
@@ -148,7 +160,7 @@ class SdkWorkerMainTest(unittest.TestCase):
 
   def test__set_log_level_overrides(self):
     test_cases = [
-        ([], {}), # not provided, as a smoke test
+        ([], {}),  # not provided, as a smoke test
         (
             # single overrides
             ['{"fake_module_1a.b":"DEBUG","fake_module_1c.d":"INFO"}'],
@@ -156,13 +168,13 @@ class SdkWorkerMainTest(unittest.TestCase):
                 "fake_module_1a.b": logging.DEBUG,
                 "fake_module_1a.b.f": logging.DEBUG,
                 "fake_module_1c.d": logging.INFO
-            }
-        ),
+            }),
         (
-            # multiple overrides
+            # multiple overrides, the last takes precedence
             [
                 '{"fake_module_2a.b":"DEBUG"}',
-                '{"fake_module_2c.d":"ERROR","fake_module_2c.d.e":15}'
+                '{"fake_module_2c.d":"WARNING","fake_module_2c.d.e":15}',
+                '{"fake_module_2c.d":"ERROR"}'
             ],
             {
                 "fake_module_2a.b": logging.DEBUG,
@@ -170,31 +182,68 @@ class SdkWorkerMainTest(unittest.TestCase):
                 "fake_module_2c.d": logging.ERROR,
                 "fake_module_2c.d.e": 15,
                 "fake_module_2c.d.f": logging.ERROR
-            }
-        )
+            })
     ]
     for case, expected in test_cases:
-      options_dict = {'sdk_harness_log_level_overrides': case}
-      sdk_worker_main._set_log_level_overrides(options_dict)
+      overrides = self._overrides_case_to_option_dict(case)
+      sdk_worker_main._set_log_level_overrides(overrides)
       for name, level in expected.items():
         self.assertEqual(logging.getLogger(name).getEffectiveLevel(), level)
 
   def test__set_log_level_overrides_error(self):
     test_cases = [
-        ({
-            'sdk_harness_log_level_overrides': ['{"missed.quote":WARNING}']
-        },
-         "Unable to parse sdk_harness_log_level_overrides"),
-        ({
-            'sdk_harness_log_level_overrides': ['{"invalid.level":"INVALID"}']
-        },
+        (['{"json.value.is.not.level": ["ERROR"]}'],
+         "Error occurred when setting log level"),
+        (['{"invalid.level":"INVALID"}'],
          "Error occurred when setting log level"),
     ]
     for case, expected in test_cases:
+      overrides = self._overrides_case_to_option_dict(case)
       with self.assertLogs('apache_beam.runners.worker.sdk_worker_main',
                            level='ERROR') as cm:
-        sdk_worker_main._set_log_level_overrides(case)
+        sdk_worker_main._set_log_level_overrides(overrides)
         self.assertIn(expected, cm.output[0])
+
+  def test_gcp_profiler_uses_provided_service_name_when_specified(self):
+    options = PipelineOptions(
+        ['--dataflow_service_options=enable_google_cloud_profiler=sample'])
+    gcp_profiler_name = sdk_worker_main._get_gcp_profiler_name_if_enabled(
+        options)
+    sdk_worker_main._start_profiler = unittest.mock.MagicMock()
+    sdk_worker_main._start_profiler(gcp_profiler_name, "version")
+    sdk_worker_main._start_profiler.assert_called_with("sample", "version")
+
+  @unittest.mock.patch.dict(os.environ, {"JOB_NAME": "sample_job"}, clear=True)
+  def test_gcp_profiler_uses_job_name_when_service_name_not_specified(self):
+    options = PipelineOptions(
+        ['--dataflow_service_options=enable_google_cloud_profiler'])
+    gcp_profiler_name = sdk_worker_main._get_gcp_profiler_name_if_enabled(
+        options)
+    sdk_worker_main._start_profiler = unittest.mock.MagicMock()
+    sdk_worker_main._start_profiler(gcp_profiler_name, "version")
+    sdk_worker_main._start_profiler.assert_called_with("sample_job", "version")
+
+  @unittest.mock.patch.dict(os.environ, {"JOB_NAME": "sample_job"}, clear=True)
+  def test_gcp_profiler_uses_job_name_when_enabled_as_experiment(self):
+    options = PipelineOptions(['--experiment=enable_google_cloud_profiler'])
+    gcp_profiler_name = sdk_worker_main._get_gcp_profiler_name_if_enabled(
+        options)
+    sdk_worker_main._start_profiler = unittest.mock.MagicMock()
+    sdk_worker_main._start_profiler(gcp_profiler_name, "version")
+    sdk_worker_main._start_profiler.assert_called_with("sample_job", "version")
+
+  @unittest.mock.patch.dict(os.environ, {"JOB_NAME": "sample_job"}, clear=True)
+  def test_pipeline_option_max_cache_memory_usage_mb(self):
+    options = PipelineOptions(flags=['--max_cache_memory_usage_mb=50'])
+
+    cache_size = sdk_worker_main._get_state_cache_size_bytes(options)
+    self.assertEqual(cache_size, 50 << 20)
+
+  @unittest.mock.patch.dict(os.environ, {"JOB_NAME": "sample_job"}, clear=True)
+  def test_pipeline_option_max_cache_memory_usage_mb_with_experiments(self):
+    options = PipelineOptions(flags=['--experiments=state_cache_size=50'])
+    cache_size = sdk_worker_main._get_state_cache_size_bytes(options)
+    self.assertEqual(cache_size, 50 << 20)
 
 
 if __name__ == '__main__':

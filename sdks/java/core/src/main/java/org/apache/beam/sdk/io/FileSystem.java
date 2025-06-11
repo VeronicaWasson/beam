@@ -23,12 +23,11 @@ import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.WritableByteChannel;
 import java.util.Collection;
 import java.util.List;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.io.fs.CreateOptions;
 import org.apache.beam.sdk.io.fs.MatchResult;
 import org.apache.beam.sdk.io.fs.MoveOptions;
 import org.apache.beam.sdk.io.fs.ResourceId;
+import org.apache.beam.sdk.metrics.Lineage;
 
 /**
  * File system interface in Beam.
@@ -38,7 +37,6 @@ import org.apache.beam.sdk.io.fs.ResourceId;
  * <p>All methods are protected, and they are for file system providers to implement. Clients should
  * use the {@link FileSystems} utility.
  */
-@Experimental(Kind.FILESYSTEM)
 public abstract class FileSystem<ResourceIdT extends ResourceId> {
   /**
    * This is the entry point to convert user-provided specs to {@link ResourceIdT ResourceIds}.
@@ -158,4 +156,21 @@ public abstract class FileSystem<ResourceIdT extends ResourceId> {
    * @see <a href="https://www.ietf.org/rfc/rfc2396.txt">RFC 2396</a>
    */
   protected abstract String getScheme();
+
+  public enum LineageLevel {
+    FILE,
+    TOP_LEVEL
+  }
+
+  /** Report {@link Lineage} metrics for resource id at file level. */
+  protected void reportLineage(ResourceIdT resourceId, Lineage lineage) {
+    reportLineage(resourceId, lineage, LineageLevel.FILE);
+  }
+
+  /**
+   * Report {@link Lineage} metrics for resource id to a given level.
+   *
+   * <p>Unless override by FileSystem implementations, default to no-op.
+   */
+  protected void reportLineage(ResourceIdT unusedId, Lineage unusedLineage, LineageLevel level) {}
 }

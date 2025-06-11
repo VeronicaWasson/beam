@@ -23,9 +23,14 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph/mtime"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph/window"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/metrics"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/register"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/transforms/filter"
 	"github.com/google/go-cmp/cmp"
 )
 
@@ -41,6 +46,7 @@ func init() {
 	beam.RegisterFunction(dofn2x1)
 	beam.RegisterFunction(dofn3x1)
 	beam.RegisterFunction(dofn2x2KV)
+	beam.RegisterFunction(dofnMultiMap)
 	beam.RegisterFunction(dofn2)
 	beam.RegisterFunction(dofnKV)
 	beam.RegisterFunction(dofnKV2)
@@ -55,6 +61,10 @@ func init() {
 
 	beam.RegisterFunction(dofn1Counter)
 	beam.RegisterFunction(dofnSink)
+
+	beam.RegisterFunction(dofnEtKV1)
+	beam.RegisterFunction(dofnEtKV2)
+	beam.RegisterFunction(formatCoGBK2)
 }
 
 func dofn1(imp []byte, emit func(int64)) {
@@ -111,6 +121,16 @@ func dofn2x2KV(imp []byte, iter func(*string, *int64) bool, emitK func(string), 
 		sum += v
 		emitK(k)
 	}
+	emitV(sum)
+}
+
+func dofnMultiMap(key string, lookup func(string) func(*int64) bool, emitK func(string), emitV func(int64)) {
+	var v, sum int64
+	iter := lookup(key)
+	for iter(&v) {
+		sum += v
+	}
+	emitK(key)
 	emitV(sum)
 }
 
@@ -219,6 +239,36 @@ func dofnSink(ctx context.Context, _ []byte) {
 
 func dofn1Counter(ctx context.Context, _ []byte, emit func(int64)) {
 	beam.NewCounter(ns, "count").Inc(ctx, 1)
+}
+
+const baseTs = mtime.Time(1663663026000)
+
+func dofnEtKV1(imp []byte, emit func(beam.EventTime, string, int64)) {
+	emit(baseTs, "a", 1)
+	emit(baseTs.Add(time.Millisecond*1200), "a", 3)
+
+	emit(baseTs.Add(time.Millisecond*2500), "b", 3)
+}
+
+func dofnEtKV2(imp []byte, emit func(beam.EventTime, string, int64)) {
+	emit(baseTs.Add(time.Millisecond*500), "a", 2)
+
+	emit(baseTs.Add(time.Millisecond), "b", 1)
+	emit(baseTs.Add(time.Millisecond*500), "b", 2)
+}
+
+func formatCoGBK2(s string, u func(*int64) bool, v func(*int64) bool) string {
+	var ls0, ls1 []int64
+	val := int64(0)
+	for u(&val) {
+		ls0 = append(ls0, val)
+	}
+	sort.Slice(ls0, func(i, j int) bool { return ls0[i] < ls0[j] })
+	for v(&val) {
+		ls1 = append(ls1, val)
+	}
+	sort.Slice(ls1, func(i, j int) bool { return ls1[i] < ls1[j] })
+	return fmt.Sprintf("%s,%v,%v", s, ls0, ls1)
 }
 
 func TestRunner_Pipelines(t *testing.T) {
@@ -409,6 +459,24 @@ func TestRunner_Pipelines(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	t.Run("sideinput_multimap", func(t *testing.T) {
+		p, s := beam.NewPipelineWithRoot()
+		imp := beam.Impulse(s)
+		col1 := beam.ParDo(s, dofnKV, imp)
+		keys := filter.Distinct(s, beam.DropValue(s, col1))
+		ks, sum := beam.ParDo2(s, dofnMultiMap, keys, beam.SideInput{Input: col1})
+		beam.ParDo(s, &stringCheck{
+			Name: "iterKV sideinput check K",
+			Want: []string{"a", "b"},
+		}, ks)
+		beam.ParDo(s, &int64Check{
+			Name: "iterKV sideinput check V",
+			Want: []int{9, 12},
+		}, sum)
+		if _, err := executeWithT(context.Background(), t, p); err != nil {
+			t.Fatal(err)
+		}
+	})
 	// Validates the waiting on side input readiness in buffer.
 	t.Run("sideinput_2iterable", func(t *testing.T) {
 		p, s := beam.NewPipelineWithRoot()
@@ -421,6 +489,28 @@ func TestRunner_Pipelines(t *testing.T) {
 			Name: "iter sideinput check",
 			Want: []int{16, 17, 18},
 		}, sum)
+		if _, err := executeWithT(context.Background(), t, p); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("window", func(t *testing.T) {
+		p, s := beam.NewPipelineWithRoot()
+		imp := beam.Impulse(s)
+		col1 := beam.ParDo(s, dofnEtKV1, imp)
+		wcol1 := beam.WindowInto(s, window.NewSessions(time.Second), col1)
+		col2 := beam.ParDo(s, dofnEtKV2, imp)
+		wcol2 := beam.WindowInto(s, window.NewSessions(time.Second), col2)
+		coGBK := beam.CoGroupByKey(s, wcol1, wcol2)
+		format := beam.ParDo(s, formatCoGBK2, coGBK)
+		beam.ParDo(s, &stringCheck{
+			Name: "window",
+			Want: []string{
+				"a,[1 3],[2]",
+				"b,[3],[]",
+				"b,[],[1 2]",
+			},
+		}, format)
+
 		if _, err := executeWithT(context.Background(), t, p); err != nil {
 			t.Fatal(err)
 		}
@@ -452,4 +542,101 @@ func TestMain(m *testing.M) {
 	}
 	beam.Init()
 	os.Exit(m.Run())
+}
+
+func init() {
+	// Basic Registration
+	// 	beam.RegisterFunction(identity)
+	// 	beam.RegisterType(reflect.TypeOf((*source)(nil)))
+	// 	beam.RegisterType(reflect.TypeOf((*discard)(nil)))
+
+	// Generic registration
+	register.Function2x0(identity)
+	register.DoFn2x0[[]byte, func(int)]((*source)(nil))
+	register.DoFn1x0[int]((*discard)(nil))
+	register.Emitter1[int]()
+}
+
+type source struct {
+	Count int
+}
+
+func (fn *source) ProcessElement(_ []byte, emit func(int)) {
+	for i := 0; i < fn.Count; i++ {
+		emit(i)
+	}
+}
+
+func identity(v int, emit func(int)) {
+	emit(v)
+}
+
+type discard struct {
+	processed int
+}
+
+func (fn *discard) ProcessElement(int) {
+	fn.processed++
+}
+
+// BenchmarkPipe checks basic throughput and exec overhead with everything registered.
+//
+// Just registered: ~700-900ns per call, 330B per DoFn, across 5 allocs per DoFn
+//
+// goos: linux
+// goarch: amd64
+// pkg: github.com/apache/beam/sdks/v2/go/pkg/beam/runners/direct
+// cpu: 12th Gen Intel(R) Core(TM) i7-1260P
+// BenchmarkPipe/dofns=0-16         	 1657698	       763.0 ns/op	  10.49 MB/s	       763.0 ns/elm	     320 B/op	       6 allocs/op
+// BenchmarkPipe/dofns=1-16         	  832784	      1294 ns/op	  12.37 MB/s	      1294 ns/elm	     656 B/op	      11 allocs/op
+// BenchmarkPipe/dofns=2-16         	  633345	      1798 ns/op	  13.35 MB/s	       899.0 ns/elm	     992 B/op	      16 allocs/op
+// BenchmarkPipe/dofns=3-16         	  471106	      2446 ns/op	  13.08 MB/s	       815.4 ns/elm	    1329 B/op	      21 allocs/op
+// BenchmarkPipe/dofns=5-16         	  340099	      3634 ns/op	  13.21 MB/s	       726.8 ns/elm	    2001 B/op	      31 allocs/op
+// BenchmarkPipe/dofns=10-16        	  183429	      6957 ns/op	  12.65 MB/s	       695.7 ns/elm	    3683 B/op	      56 allocs/op
+// BenchmarkPipe/dofns=100-16       	   17956	     65986 ns/op	  12.25 MB/s	       659.9 ns/elm	   33975 B/op	     506 allocs/op
+//
+// Optimized w/ Generic reg: ~200-300ns per call, 150B per DoFn, across 2 allocs per DoFn
+//
+// goos: linux
+// goarch: amd64
+// pkg: github.com/apache/beam/sdks/v2/go/pkg/beam/runners/direct
+// cpu: 12th Gen Intel(R) Core(TM) i7-1260P
+// BenchmarkPipe/dofns=0-16         	 9319206	       131.5 ns/op	  60.85 MB/s	       131.5 ns/elm	     152 B/op	       2 allocs/op
+// BenchmarkPipe/dofns=1-16         	 4465477	       268.3 ns/op	  59.63 MB/s	       268.3 ns/elm	     304 B/op	       3 allocs/op
+// BenchmarkPipe/dofns=2-16         	 2876710	       431.9 ns/op	  55.56 MB/s	       216.0 ns/elm	     456 B/op	       5 allocs/op
+// BenchmarkPipe/dofns=3-16         	 2096349	       562.1 ns/op	  56.93 MB/s	       187.4 ns/elm	     608 B/op	       7 allocs/op
+// BenchmarkPipe/dofns=5-16         	 1347927	       823.8 ns/op	  58.27 MB/s	       164.8 ns/elm	     912 B/op	      11 allocs/op
+// BenchmarkPipe/dofns=10-16        	  737594	      1590 ns/op	  55.36 MB/s	       159.0 ns/elm	    1672 B/op	      21 allocs/op
+// BenchmarkPipe/dofns=100-16       	   60728	     19696 ns/op	  41.02 MB/s	       197.0 ns/elm	   15357 B/op	     201 allocs/op
+func BenchmarkPipe(b *testing.B) {
+	makeBench := func(numDoFns int) func(b *testing.B) {
+		return func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(8 * int64(numDoFns+1))
+
+			disc := &discard{}
+			p, s := beam.NewPipelineWithRoot()
+			imp := beam.Impulse(s)
+			src := beam.ParDo(s, &source{Count: b.N}, imp)
+			iden := src
+			for i := 0; i < numDoFns; i++ {
+				iden = beam.ParDo(s, identity, iden)
+			}
+			beam.ParDo0(s, disc, iden)
+			Execute(context.TODO(), p)
+			if disc.processed != b.N {
+				b.Fatalf("processed dodn't match bench number: got %v want %v", disc.processed, b.N)
+			}
+			d := b.Elapsed()
+			div := numDoFns
+			if div == 0 {
+				div = 1
+			}
+			div = div * b.N
+			b.ReportMetric(float64(d)/float64(div), "ns/elm")
+		}
+	}
+	for _, numDoFns := range []int{0, 1, 2, 3, 5, 10, 100} {
+		b.Run(fmt.Sprintf("dofns=%d", numDoFns), makeBench(numDoFns))
+	}
 }

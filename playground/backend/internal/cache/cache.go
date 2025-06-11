@@ -16,10 +16,13 @@
 package cache
 
 import (
-	pb "beam.apache.org/playground/backend/internal/api/v1"
 	"context"
-	"github.com/google/uuid"
 	"time"
+
+	"github.com/google/uuid"
+
+	pb "beam.apache.org/playground/backend/internal/api/v1"
+	"beam.apache.org/playground/backend/internal/db/entity"
 )
 
 // SubKey is used to keep value with Cache using nested structure like pipelineId:subKey:value
@@ -63,6 +66,9 @@ const (
 	// ExamplesCatalog is catalog of examples available in Playground
 	ExamplesCatalog string = "EXAMPLES_CATALOG"
 
+	// SdksCatalog is the catalog of SDKs in Playground
+	SdksCatalog string = "SDKS_CATALOG"
+
 	// DefaultPrecompiledExamples is used to keep default examples
 	DefaultPrecompiledExamples string = "DEFAULT_PRECOMPILED_OBJECTS"
 )
@@ -70,11 +76,15 @@ const (
 // Cache is used to store states and outputs for Apache Beam pipelines that running in Playground
 // Cache allows keep and read any value by pipelineId and subKey:
 // pipelineId_1:
-//				subKey_1: value_1
-//				subKey_2: value_2
+//
+//	subKey_1: value_1
+//	subKey_2: value_2
+//
 // pipelineId_2:
-//				subKey_1: value_3
-//				subKey_3: value_4
+//
+//	subKey_1: value_3
+//	subKey_3: value_4
+//
 // pipelineId is uuid that calculates in the controller when the server takes new request to run code
 type Cache interface {
 	// GetValue returns value from cache by pipelineId and subKey.
@@ -97,4 +107,10 @@ type Cache interface {
 
 	// GetDefaultPrecompiledObject returns default precompiled object for SDK from cache.
 	GetDefaultPrecompiledObject(ctx context.Context, sdk pb.Sdk) (*pb.PrecompiledObject, error)
+
+	// SetSdkCatalog adds the given sdk catalog to the cache.
+	SetSdkCatalog(ctx context.Context, sdks []*entity.SDKEntity) error
+
+	// GetSdkCatalog returns sdk catalog from the cache.
+	GetSdkCatalog(ctx context.Context) ([]*entity.SDKEntity, error)
 }

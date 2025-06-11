@@ -17,7 +17,7 @@
  */
 package org.apache.beam.sdk.io.gcp.pubsub;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.auto.value.AutoValue;
 import java.util.Map;
@@ -25,7 +25,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
  * Class representing a Pub/Sub message. Each message contains a single message payload, a map of
- * attached attributes, and a message id.
+ * attached attributes, a message id and an ordering key.
  */
 @SuppressWarnings({
   "nullness" // TODO(https://github.com/apache/beam/issues/20497)
@@ -33,6 +33,8 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 public class PubsubMessage {
   @AutoValue
   abstract static class Impl {
+    abstract @Nullable String getTopic();
+
     @SuppressWarnings("mutable")
     abstract byte[] getPayload();
 
@@ -40,21 +42,53 @@ public class PubsubMessage {
 
     abstract @Nullable String getMessageId();
 
+    abstract @Nullable String getOrderingKey();
+
     static Impl create(
-        byte[] payload, @Nullable Map<String, String> attributes, @Nullable String messageId) {
-      return new AutoValue_PubsubMessage_Impl(payload, attributes, messageId);
+        @Nullable String topic,
+        byte[] payload,
+        @Nullable Map<String, String> attributes,
+        @Nullable String messageId,
+        @Nullable String orderingKey) {
+      return new AutoValue_PubsubMessage_Impl(topic, payload, attributes, messageId, orderingKey);
     }
   }
 
   private Impl impl;
 
   public PubsubMessage(byte[] payload, @Nullable Map<String, String> attributes) {
-    this(payload, attributes, null);
+    this(payload, attributes, null, null);
   }
 
   public PubsubMessage(
       byte[] payload, @Nullable Map<String, String> attributes, @Nullable String messageId) {
-    impl = Impl.create(payload, attributes, messageId);
+    impl = Impl.create(null, payload, attributes, messageId, null);
+  }
+
+  public PubsubMessage(
+      byte[] payload,
+      @Nullable Map<String, String> attributes,
+      @Nullable String messageId,
+      @Nullable String orderingKey) {
+    impl = Impl.create(null, payload, attributes, messageId, orderingKey);
+  }
+
+  private PubsubMessage(Impl impl) {
+    this.impl = impl;
+  }
+
+  public PubsubMessage withTopic(String topic) {
+    return new PubsubMessage(
+        Impl.create(
+            topic,
+            impl.getPayload(),
+            impl.getAttributeMap(),
+            impl.getMessageId(),
+            impl.getOrderingKey()));
+  }
+
+  public @Nullable String getTopic() {
+    return impl.getTopic();
   }
 
   /** Returns the main PubSub message. */
@@ -76,6 +110,21 @@ public class PubsubMessage {
   /** Returns the messageId of the message populated by Cloud Pub/Sub. */
   public @Nullable String getMessageId() {
     return impl.getMessageId();
+  }
+
+  public PubsubMessage withOrderingKey(@Nullable String orderingKey) {
+    return new PubsubMessage(
+        Impl.create(
+            impl.getTopic(),
+            impl.getPayload(),
+            impl.getAttributeMap(),
+            impl.getMessageId(),
+            orderingKey));
+  }
+
+  /** Returns the ordering key of the message. */
+  public @Nullable String getOrderingKey() {
+    return impl.getOrderingKey();
   }
 
   @Override

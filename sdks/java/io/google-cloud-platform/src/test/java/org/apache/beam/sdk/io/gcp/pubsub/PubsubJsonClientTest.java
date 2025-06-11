@@ -19,8 +19,14 @@ package org.apache.beam.sdk.io.gcp.pubsub;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
 import static org.mockito.Mockito.when;
 
+import com.google.api.client.googleapis.json.GoogleJsonError;
+import com.google.api.client.googleapis.json.GoogleJsonResponseException;
+import com.google.api.client.http.HttpHeaders;
+import com.google.api.client.http.HttpResponseException;
 import com.google.api.services.pubsub.Pubsub;
 import com.google.api.services.pubsub.Pubsub.Projects.Subscriptions;
 import com.google.api.services.pubsub.Pubsub.Projects.Topics;
@@ -32,6 +38,8 @@ import com.google.api.services.pubsub.model.PubsubMessage;
 import com.google.api.services.pubsub.model.PullRequest;
 import com.google.api.services.pubsub.model.PullResponse;
 import com.google.api.services.pubsub.model.ReceivedMessage;
+import com.google.api.services.pubsub.model.Schema;
+import com.google.api.services.pubsub.model.SchemaSettings;
 import com.google.api.services.pubsub.model.Subscription;
 import com.google.api.services.pubsub.model.Topic;
 import com.google.protobuf.ByteString;
@@ -46,8 +54,8 @@ import org.apache.beam.sdk.io.gcp.pubsub.PubsubClient.OutgoingMessage;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubClient.ProjectPath;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubClient.SubscriptionPath;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubClient.TopicPath;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -65,6 +73,9 @@ public class PubsubJsonClientTest {
   private static final TopicPath TOPIC = PubsubClient.topicPathFromName("testProject", "testTopic");
   private static final SubscriptionPath SUBSCRIPTION =
       PubsubClient.subscriptionPathFromName("testProject", "testSubscription");
+
+  private static final PubsubClient.SchemaPath SCHEMA =
+      PubsubClient.schemaPathFromId("testProject", "testSchemaId");
   private static final long REQ_TIME = 1234L;
   private static final long PUB_TIME = 3456L;
   private static final long MESSAGE_TIME = 6789L;
@@ -212,7 +223,8 @@ public class PubsubJsonClientTest {
                 .setOrderingKey(ORDERING_KEY)
                 .build(),
             MESSAGE_TIME,
-            RECORD_ID);
+            RECORD_ID,
+            null);
     int n = client.publish(TOPIC, ImmutableList.of(actualMessage));
     assertEquals(1, n);
   }
@@ -240,7 +252,8 @@ public class PubsubJsonClientTest {
                 .setData(ByteString.copyFromUtf8(DATA))
                 .build(),
             MESSAGE_TIME,
-            RECORD_ID);
+            RECORD_ID,
+            null);
     int n = client.publish(TOPIC, ImmutableList.of(actualMessage));
     assertEquals(1, n);
   }
@@ -271,7 +284,8 @@ public class PubsubJsonClientTest {
                 .putAllAttributes(attrs)
                 .build(),
             MESSAGE_TIME,
-            RECORD_ID);
+            RECORD_ID,
+            null);
     int n = client.publish(TOPIC, ImmutableList.of(actualMessage));
     assertEquals(1, n);
   }
@@ -321,5 +335,118 @@ public class PubsubJsonClientTest {
         PubsubClient.subscriptionPathFromName(PROJECT.getId(), "Subscription" + i).getPath());
     subscription.setTopic(PubsubClient.topicPathFromName(PROJECT.getId(), "Topic" + i).getPath());
     return subscription;
+  }
+
+  @Test
+  public void testGetSchemaPath() throws IOException {
+    TopicPath topicDoesNotExist =
+        PubsubClient.topicPathFromPath("projects/testProject/topics/idontexist");
+    TopicPath topicExistsDeletedSchema =
+        PubsubClient.topicPathFromPath("projects/testProject/topics/deletedSchema");
+    TopicPath topicExistsNoSchema =
+        PubsubClient.topicPathFromPath("projects/testProject/topics/noSchema");
+    TopicPath topicExistsSchema =
+        PubsubClient.topicPathFromPath("projects/testProject/topics/topicWithSchema");
+    when(mockPubsub.projects().topics().get(topicDoesNotExist.getPath()).execute())
+        .thenThrow(
+            new IOException(
+                String.format("topic does not exist: %s", topicDoesNotExist.getPath())));
+    when(mockPubsub.projects().topics().get(topicExistsDeletedSchema.getPath()).execute())
+        .thenReturn(
+            new Topic()
+                .setName(topicExistsDeletedSchema.getName())
+                .setSchemaSettings(
+                    new SchemaSettings().setSchema(PubsubClient.SchemaPath.DELETED_SCHEMA_PATH)));
+    when(mockPubsub.projects().topics().get(topicExistsNoSchema.getPath()).execute())
+        .thenReturn(new Topic().setName(topicExistsNoSchema.getName()));
+    when(mockPubsub.projects().topics().get(topicExistsSchema.getPath()).execute())
+        .thenReturn(
+            new Topic()
+                .setName(topicExistsSchema.getName())
+                .setSchemaSettings(new SchemaSettings().setSchema(SCHEMA.getPath())));
+
+    client = new PubsubJsonClient(null, null, mockPubsub);
+
+    assertThrows(
+        "topic does not exist", IOException.class, () -> client.getSchemaPath(topicDoesNotExist));
+
+    assertNull("schema for topic is deleted", client.getSchemaPath(topicExistsDeletedSchema));
+
+    assertNull("topic has no schema", client.getSchemaPath(topicExistsNoSchema));
+
+    assertEquals(SCHEMA.getPath(), client.getSchemaPath(topicExistsSchema).getPath());
+  }
+
+  @Test
+  public void testAvroSchema() throws IOException {
+    String schemaDefinition =
+        "{"
+            + " \"type\" : \"record\","
+            + " \"name\" : \"Avro\","
+            + " \"fields\" : ["
+            + "   {"
+            + "     \"name\" : \"StringField\","
+            + "     \"type\" : \"string\""
+            + "   },"
+            + "   {"
+            + "     \"name\" : \"FloatField\","
+            + "     \"type\" : \"float\""
+            + "   },"
+            + "   {"
+            + "     \"name\" : \"BooleanField\","
+            + "     \"type\" : \"boolean\""
+            + "   }"
+            + " ]"
+            + "}";
+    Schema schema =
+        new Schema().setName(SCHEMA.getPath()).setType("AVRO").setDefinition(schemaDefinition);
+    when(mockPubsub.projects().schemas().get(SCHEMA.getPath()).execute()).thenReturn(schema);
+    client = new PubsubJsonClient(null, null, mockPubsub);
+    assertEquals(
+        org.apache.beam.sdk.schemas.Schema.of(
+            org.apache.beam.sdk.schemas.Schema.Field.of(
+                "StringField", org.apache.beam.sdk.schemas.Schema.FieldType.STRING),
+            org.apache.beam.sdk.schemas.Schema.Field.of(
+                "FloatField", org.apache.beam.sdk.schemas.Schema.FieldType.FLOAT),
+            org.apache.beam.sdk.schemas.Schema.Field.of(
+                "BooleanField", org.apache.beam.sdk.schemas.Schema.FieldType.BOOLEAN)),
+        client.getSchema(SCHEMA));
+  }
+
+  @Test
+  public void getProtoSchema() throws IOException {
+    String schemaDefinition =
+        "syntax = \"proto3\"; message ProtocolBuffer { string string_field = 1; int32 int_field = 2; }";
+    Schema schema =
+        new Schema()
+            .setName(SCHEMA.getPath())
+            .setType("PROTOCOL_BUFFER")
+            .setDefinition(schemaDefinition);
+    when(mockPubsub.projects().schemas().get(SCHEMA.getPath()).execute()).thenReturn(schema);
+    client = new PubsubJsonClient(null, null, mockPubsub);
+    assertThrows(
+        "Pub/Sub Schema type PROTOCOL_BUFFER is not supported at this time",
+        IllegalArgumentException.class,
+        () -> client.getSchema(SCHEMA));
+  }
+
+  @Test
+  public void isTopicExists() throws Exception {
+    TopicPath topicExists =
+        PubsubClient.topicPathFromPath("projects/testProject/topics/topicExists");
+    TopicPath topicDoesNotExist =
+        PubsubClient.topicPathFromPath("projects/testProject/topics/topicDoesNotExist");
+    HttpResponseException.Builder builder =
+        new HttpResponseException.Builder(404, "topic is not found", new HttpHeaders());
+    GoogleJsonError error = new GoogleJsonError();
+    when(mockPubsub.projects().topics().get(topicExists.getPath()).execute())
+        .thenReturn(new Topic().setName(topicExists.getName()));
+    when(mockPubsub.projects().topics().get(topicDoesNotExist.getPath()).execute())
+        .thenThrow(new GoogleJsonResponseException(builder, error));
+
+    client = new PubsubJsonClient(null, null, mockPubsub);
+
+    assertEquals(true, client.isTopicExists(topicExists));
+    assertEquals(false, client.isTopicExists(topicDoesNotExist));
   }
 }

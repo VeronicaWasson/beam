@@ -31,28 +31,36 @@ Parquet file.
 # pytype: skip-file
 
 from functools import partial
+from typing import Iterator
 
-from pkg_resources import parse_version
+from packaging import version
 
 from apache_beam.io import filebasedsink
 from apache_beam.io import filebasedsource
 from apache_beam.io.filesystem import CompressionTypes
+from apache_beam.io.filesystems import FileSystems
 from apache_beam.io.iobase import RangeTracker
 from apache_beam.io.iobase import Read
 from apache_beam.io.iobase import Write
+from apache_beam.portability.api import schema_pb2
 from apache_beam.transforms import DoFn
 from apache_beam.transforms import ParDo
 from apache_beam.transforms import PTransform
+from apache_beam.transforms import window
+from apache_beam.typehints import schemas
 
 try:
   import pyarrow as pa
   import pyarrow.parquet as pq
+  # pylint: disable=ungrouped-imports
+  from apache_beam.typehints import arrow_type_compatibility
 except ImportError:
   pa = None
   pq = None
   ARROW_MAJOR_VERSION = None
+  arrow_type_compatibility = None
 else:
-  base_pa_version = parse_version(pa.__version__).base_version
+  base_pa_version = version.parse(pa.__version__).base_version
   ARROW_MAJOR_VERSION, _, _ = map(int, base_pa_version.split('.'))
 
 __all__ = [
@@ -60,7 +68,8 @@ __all__ = [
     'ReadAllFromParquet',
     'ReadFromParquetBatched',
     'ReadAllFromParquetBatched',
-    'WriteToParquet'
+    'WriteToParquet',
+    'WriteToParquetBatched'
 ]
 
 
@@ -81,6 +90,85 @@ class _ArrowTableToRowDictionaries(DoFn):
         yield (file_name, row)
       else:
         yield row
+
+
+class _RowDictionariesToArrowTable(DoFn):
+  """ A DoFn that consumes python dictionarys and yields a pyarrow table."""
+  def __init__(
+      self,
+      schema,
+      row_group_buffer_size=64 * 1024 * 1024,
+      record_batch_size=1000):
+    self._schema = schema
+    self._row_group_buffer_size = row_group_buffer_size
+    self._buffer = [[] for _ in range(len(schema.names))]
+    self._buffer_size = record_batch_size
+    self._record_batches = []
+    self._record_batches_byte_size = 0
+
+  def process(self, row):
+    if len(self._buffer[0]) >= self._buffer_size:
+      self._flush_buffer()
+
+    if self._record_batches_byte_size >= self._row_group_buffer_size:
+      table = self._create_table()
+      yield table
+
+    # reorder the data in columnar format.
+    for i, n in enumerate(self._schema.names):
+      self._buffer[i].append(row[n])
+
+  def finish_bundle(self):
+    if len(self._buffer[0]) > 0:
+      self._flush_buffer()
+    if self._record_batches_byte_size > 0:
+      table = self._create_table()
+      yield window.GlobalWindows.windowed_value_at_end_of_window(table)
+
+  def display_data(self):
+    res = super().display_data()
+    res['row_group_buffer_size'] = str(self._row_group_buffer_size)
+    res['buffer_size'] = str(self._buffer_size)
+
+    return res
+
+  def _create_table(self):
+    table = pa.Table.from_batches(self._record_batches, schema=self._schema)
+    self._record_batches = []
+    self._record_batches_byte_size = 0
+    return table
+
+  def _flush_buffer(self):
+    arrays = [[] for _ in range(len(self._schema.names))]
+    for x, y in enumerate(self._buffer):
+      arrays[x] = pa.array(y, type=self._schema.types[x])
+      self._buffer[x] = []
+    rb = pa.RecordBatch.from_arrays(arrays, schema=self._schema)
+    self._record_batches.append(rb)
+    size = 0
+    for x in arrays:
+      for b in x.buffers():
+        if b is not None:
+          size = size + b.size
+    self._record_batches_byte_size = self._record_batches_byte_size + size
+
+
+class _ArrowTableToBeamRows(DoFn):
+  def __init__(self, beam_type):
+    self._beam_type = beam_type
+
+  @DoFn.yields_batches
+  def process(self, element) -> Iterator[pa.Table]:
+    yield element
+
+  def infer_output_type(self, input_type):
+    return self._beam_type
+
+
+class _BeamRowsToArrowTable(DoFn):
+  @DoFn.yields_elements
+  def process_batch(self, element: pa.Table) -> Iterator[pa.Table]:
+    yield element
 
 
 class ReadFromParquetBatched(PTransform):
@@ -128,7 +216,7 @@ class ReadFromParquetBatched(PTransform):
     """
 
     super().__init__()
-    self._source = _create_parquet_source(
+    self._source = _ParquetSource(
         file_pattern,
         min_bundle_size,
         validate=validate,
@@ -143,11 +231,14 @@ class ReadFromParquetBatched(PTransform):
 
 
 class ReadFromParquet(PTransform):
-  """A :class:`~apache_beam.transforms.ptransform.PTransform` for reading
-     Parquet files as a `PCollection` of dictionaries. This `PTransform` is
-     currently experimental. No backward-compatibility guarantees."""
+  """A `PTransform` for reading Parquet files."""
   def __init__(
-      self, file_pattern=None, min_bundle_size=0, validate=True, columns=None):
+      self,
+      file_pattern=None,
+      min_bundle_size=0,
+      validate=True,
+      columns=None,
+      as_rows=False):
     """Initializes :class:`ReadFromParquet`.
 
     Uses source ``_ParquetSource`` to read a set of Parquet files defined by
@@ -192,17 +283,38 @@ class ReadFromParquet(PTransform):
       columns (List[str]): list of columns that will be read from files.
         A column name may be a prefix of a nested field, e.g. 'a' will select
         'a.b', 'a.c', and 'a.d.e'
+      as_rows (bool): whether to output a schema'd PCollection of Beam rows
+        rather than Python dictionaries.
     """
     super().__init__()
-    self._source = _create_parquet_source(
+    self._source = _ParquetSource(
         file_pattern,
         min_bundle_size,
         validate=validate,
         columns=columns,
     )
+    if as_rows:
+      if columns is None:
+        filter_schema = lambda schema: schema
+      else:
+        top_level_columns = set(c.split('.')[0] for c in columns)
+        filter_schema = lambda schema: schema_pb2.Schema(
+            fields=[f for f in schema.fields if f.name in top_level_columns])
+      path = FileSystems.match([file_pattern], [1])[0].metadata_list[0].path
+      with FileSystems.open(path) as fin:
+        self._schema = filter_schema(
+            arrow_type_compatibility.beam_schema_from_arrow_schema(
+                pq.read_schema(fin)))
+    else:
+      self._schema = None
 
   def expand(self, pvalue):
-    return pvalue | Read(self._source) | ParDo(_ArrowTableToRowDictionaries())
+    arrow_batches = pvalue | Read(self._source)
+    if self._schema is None:
+      return arrow_batches | ParDo(_ArrowTableToRowDictionaries())
+    else:
+      return arrow_batches | ParDo(
+          _ArrowTableToBeamRows(schemas.named_tuple_from_schema(self._schema)))
 
   def display_data(self):
     return {'source_dd': self._source}
@@ -242,9 +354,7 @@ class ReadAllFromParquetBatched(PTransform):
     """
     super().__init__()
     source_from_file = partial(
-        _create_parquet_source,
-        min_bundle_size=min_bundle_size,
-        columns=columns)
+        _ParquetSource, min_bundle_size=min_bundle_size, columns=columns)
     self._read_all_files = filebasedsource.ReadAllFiles(
         True,
         CompressionTypes.UNCOMPRESSED,
@@ -268,17 +378,6 @@ class ReadAllFromParquet(PTransform):
   def expand(self, pvalue):
     return pvalue | self._read_batches | ParDo(
         _ArrowTableToRowDictionaries(), with_filename=self._with_filename)
-
-
-def _create_parquet_source(
-    file_pattern=None, min_bundle_size=0, validate=False, columns=None):
-  return \
-    _ParquetSource(
-        file_pattern=file_pattern,
-        min_bundle_size=min_bundle_size,
-        validate=validate,
-        columns=columns,
-    )
 
 
 class _ParquetUtils(object):
@@ -307,7 +406,8 @@ class _ParquetUtils(object):
 class _ParquetSource(filebasedsource.FileBasedSource):
   """A source for reading Parquet files.
   """
-  def __init__(self, file_pattern, min_bundle_size, validate, columns):
+  def __init__(
+      self, file_pattern, min_bundle_size=0, validate=False, columns=None):
     super().__init__(
         file_pattern=file_pattern,
         min_bundle_size=min_bundle_size,
@@ -358,16 +458,16 @@ class _ParquetSource(filebasedsource.FileBasedSource):
         yield table
 
 
+_create_parquet_source = _ParquetSource
+
+
 class WriteToParquet(PTransform):
   """A ``PTransform`` for writing parquet files.
-
-    This ``PTransform`` is currently experimental. No backward-compatibility
-    guarantees.
   """
   def __init__(
       self,
       file_path_prefix,
-      schema,
+      schema=None,
       row_group_buffer_size=64 * 1024 * 1024,
       record_batch_size=1000,
       codec='none',
@@ -453,13 +553,136 @@ class WriteToParquet(PTransform):
       A WriteToParquet transform usable for writing.
     """
     super().__init__()
+    self._schema = schema
+    self._row_group_buffer_size = row_group_buffer_size
+    self._record_batch_size = record_batch_size
+
     self._sink = \
       _create_parquet_sink(
           file_path_prefix,
           schema,
           codec,
-          row_group_buffer_size,
-          record_batch_size,
+          use_deprecated_int96_timestamps,
+          use_compliant_nested_type,
+          file_name_suffix,
+          num_shards,
+          shard_name_template,
+          mime_type
+      )
+
+  def expand(self, pcoll):
+    if self._schema is None:
+      try:
+        beam_schema = schemas.schema_from_element_type(pcoll.element_type)
+      except TypeError as exn:
+        raise ValueError(
+            "A schema is required to write non-schema'd data.") from exn
+      self._sink._schema = (
+          arrow_type_compatibility.arrow_schema_from_beam_schema(beam_schema))
+      convert_fn = _BeamRowsToArrowTable()
+    else:
+      convert_fn = _RowDictionariesToArrowTable(
+          self._schema, self._row_group_buffer_size, self._record_batch_size)
+    return pcoll | ParDo(convert_fn) | Write(self._sink)
+
+  def display_data(self):
+    return {
+        'sink_dd': self._sink,
+        'row_group_buffer_size': str(self._row_group_buffer_size)
+    }
+
+
+class WriteToParquetBatched(PTransform):
+  """A ``PTransform`` for writing parquet files from a `PCollection` of
+    `pyarrow.Table`.
+
+    This ``PTransform`` is currently experimental. No backward-compatibility
+    guarantees.
+  """
+  def __init__(
+      self,
+      file_path_prefix,
+      schema=None,
+      codec='none',
+      use_deprecated_int96_timestamps=False,
+      use_compliant_nested_type=False,
+      file_name_suffix='',
+      num_shards=0,
+      shard_name_template=None,
+      mime_type='application/x-parquet',
+  ):
+    """Initialize a WriteToParquetBatched transform.
+
+    Writes parquet files from a :class:`~apache_beam.pvalue.PCollection` of
+    records. Each record is a pa.Table Schema must be specified like the
+    example below.
+
+    .. testsetup:: batched
+
+      from tempfile import NamedTemporaryFile
+      import glob
+      import os
+      import pyarrow
+
+      filename = NamedTemporaryFile(delete=False).name
+
+    .. testcode:: batched
+
+      table = pyarrow.Table.from_pylist([{'name': 'foo', 'age': 10},
+                                         {'name': 'bar', 'age': 20}])
+      with beam.Pipeline() as p:
+        records = p | 'Read' >> beam.Create([table])
+        _ = records | 'Write' >> beam.io.WriteToParquetBatched(filename,
+            pyarrow.schema(
+                [('name', pyarrow.string()), ('age', pyarrow.int64())]
+            )
+        )
+
+    .. testcleanup:: batched
+
+      for output in glob.glob('{}*'.format(filename)):
+        os.remove(output)
+
+    For more information on supported types and schema, please see the pyarrow
+    document.
+
+    Args:
+      file_path_prefix: The file path to write to. The files written will begin
+        with this prefix, followed by a shard identifier (see num_shards), and
+        end in a common extension, if given by file_name_suffix. In most cases,
+        only this argument is specified and num_shards, shard_name_template, and
+        file_name_suffix use default values.
+      schema: The schema to use, as type of ``pyarrow.Schema``.
+      codec: The codec to use for block-level compression. Any string supported
+        by the pyarrow specification is accepted.
+      use_deprecated_int96_timestamps: Write nanosecond resolution timestamps to
+        INT96 Parquet format. Defaults to False.
+      use_compliant_nested_type: Write compliant Parquet nested type (lists).
+      file_name_suffix: Suffix for the files written.
+      num_shards: The number of files (shards) used for output. If not set, the
+        service will decide on the optimal number of shards.
+        Constraining the number of shards is likely to reduce
+        the performance of a pipeline.  Setting this value is not recommended
+        unless you require a specific number of output files.
+      shard_name_template: A template string containing placeholders for
+        the shard number and shard count. When constructing a filename for a
+        particular shard number, the upper-case letters 'S' and 'N' are
+        replaced with the 0-padded shard number and shard count respectively.
+        This argument can be '' in which case it behaves as if num_shards was
+        set to 1 and only one file will be generated. The default pattern used
+        is '-SSSSS-of-NNNNN' if None is passed as the shard_name_template.
+      mime_type: The MIME type to use for the produced files, if the filesystem
+        supports specifying MIME types.
+
+    Returns:
+      A WriteToParquetBatched transform usable for writing.
+    """
+    super().__init__()
+    self._sink = \
+      _create_parquet_sink(
+          file_path_prefix,
+          schema,
+          codec,
           use_deprecated_int96_timestamps,
           use_compliant_nested_type,
           file_name_suffix,
@@ -479,8 +702,6 @@ def _create_parquet_sink(
     file_path_prefix,
     schema,
     codec,
-    row_group_buffer_size,
-    record_batch_size,
     use_deprecated_int96_timestamps,
     use_compliant_nested_type,
     file_name_suffix,
@@ -492,8 +713,6 @@ def _create_parquet_sink(
         file_path_prefix,
         schema,
         codec,
-        row_group_buffer_size,
-        record_batch_size,
         use_deprecated_int96_timestamps,
         use_compliant_nested_type,
         file_name_suffix,
@@ -504,14 +723,12 @@ def _create_parquet_sink(
 
 
 class _ParquetSink(filebasedsink.FileBasedSink):
-  """A sink for parquet files."""
+  """A sink for parquet files from batches."""
   def __init__(
       self,
       file_path_prefix,
       schema,
       codec,
-      row_group_buffer_size,
-      record_batch_size,
       use_deprecated_int96_timestamps,
       use_compliant_nested_type,
       file_name_suffix,
@@ -535,7 +752,6 @@ class _ParquetSink(filebasedsink.FileBasedSink):
           "Due to ARROW-9424, writing with LZ4 compression is not supported in "
           "pyarrow 1.x, please use a different pyarrow version or a different "
           f"codec. Your pyarrow version: {pa.__version__}")
-    self._row_group_buffer_size = row_group_buffer_size
     self._use_deprecated_int96_timestamps = use_deprecated_int96_timestamps
     if use_compliant_nested_type and ARROW_MAJOR_VERSION < 4:
       raise ValueError(
@@ -543,10 +759,6 @@ class _ParquetSink(filebasedsink.FileBasedSink):
           "pyarrow version >= 4.x, please use a different pyarrow version. "
           f"Your pyarrow version: {pa.__version__}")
     self._use_compliant_nested_type = use_compliant_nested_type
-    self._buffer = [[] for _ in range(len(schema.names))]
-    self._buffer_size = record_batch_size
-    self._record_batches = []
-    self._record_batches_byte_size = 0
     self._file_handle = None
 
   def open(self, temp_path):
@@ -564,23 +776,10 @@ class _ParquetSink(filebasedsink.FileBasedSink):
         use_deprecated_int96_timestamps=self._use_deprecated_int96_timestamps,
         use_compliant_nested_type=self._use_compliant_nested_type)
 
-  def write_record(self, writer, value):
-    if len(self._buffer[0]) >= self._buffer_size:
-      self._flush_buffer()
-
-    if self._record_batches_byte_size >= self._row_group_buffer_size:
-      self._write_batches(writer)
-
-    # reorder the data in columnar format.
-    for i, n in enumerate(self._schema.names):
-      self._buffer[i].append(value[n])
+  def write_record(self, writer, table: pa.Table):
+    writer.write_table(table)
 
   def close(self, writer):
-    if len(self._buffer[0]) > 0:
-      self._flush_buffer()
-    if self._record_batches_byte_size > 0:
-      self._write_batches(writer)
-
     writer.close()
     if self._file_handle:
       self._file_handle.close()
@@ -590,25 +789,4 @@ class _ParquetSink(filebasedsink.FileBasedSink):
     res = super().display_data()
     res['codec'] = str(self._codec)
     res['schema'] = str(self._schema)
-    res['row_group_buffer_size'] = str(self._row_group_buffer_size)
     return res
-
-  def _write_batches(self, writer):
-    table = pa.Table.from_batches(self._record_batches, schema=self._schema)
-    self._record_batches = []
-    self._record_batches_byte_size = 0
-    writer.write_table(table)
-
-  def _flush_buffer(self):
-    arrays = [[] for _ in range(len(self._schema.names))]
-    for x, y in enumerate(self._buffer):
-      arrays[x] = pa.array(y, type=self._schema.types[x])
-      self._buffer[x] = []
-    rb = pa.RecordBatch.from_arrays(arrays, schema=self._schema)
-    self._record_batches.append(rb)
-    size = 0
-    for x in arrays:
-      for b in x.buffers():
-        if b is not None:
-          size = size + b.size
-    self._record_batches_byte_size = self._record_batches_byte_size + size

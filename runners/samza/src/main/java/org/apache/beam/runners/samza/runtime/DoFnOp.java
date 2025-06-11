@@ -17,36 +17,31 @@
  */
 package org.apache.beam.runners.samza.runtime;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
 import java.util.concurrent.CompletionStage;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.runners.core.DoFnRunner;
-import org.apache.beam.runners.core.DoFnRunners;
 import org.apache.beam.runners.core.PushbackSideInputDoFnRunner;
 import org.apache.beam.runners.core.SideInputHandler;
 import org.apache.beam.runners.core.SimplePushbackSideInputDoFnRunner;
 import org.apache.beam.runners.core.StateNamespace;
 import org.apache.beam.runners.core.StateNamespaces;
 import org.apache.beam.runners.core.TimerInternals;
-import org.apache.beam.runners.core.construction.graph.ExecutableStage;
 import org.apache.beam.runners.fnexecution.control.ExecutableStageContext;
 import org.apache.beam.runners.fnexecution.control.StageBundleFactory;
 import org.apache.beam.runners.fnexecution.provisioning.JobInfo;
 import org.apache.beam.runners.samza.SamzaExecutionContext;
 import org.apache.beam.runners.samza.SamzaPipelineOptions;
 import org.apache.beam.runners.samza.util.DoFnUtils;
-import org.apache.beam.runners.samza.util.FutureUtils;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.DoFnSchemaInformation;
@@ -56,12 +51,15 @@ import org.apache.beam.sdk.transforms.reflect.DoFnInvokers;
 import org.apache.beam.sdk.transforms.reflect.DoFnSignature;
 import org.apache.beam.sdk.transforms.reflect.DoFnSignatures;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.WindowedValueMultiReceiver;
+import org.apache.beam.sdk.util.construction.graph.ExecutableStage;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TupleTag;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
 import org.apache.beam.sdk.values.WindowingStrategy;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterators;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterators;
 import org.apache.samza.config.Config;
 import org.apache.samza.context.Context;
 import org.apache.samza.operators.Scheduler;
@@ -127,6 +125,7 @@ public class DoFnOp<InT, FnOutT, OutT> implements Op<InT, OutT, Void> {
 
   private final DoFnSchemaInformation doFnSchemaInformation;
   private final Map<?, PCollectionView<?>> sideInputMapping;
+  private final Map<String, String> stateIdToStoreMapping;
 
   public DoFnOp(
       TupleTag<FnOutT> mainOutputTag,
@@ -148,7 +147,8 @@ public class DoFnOp<InT, FnOutT, OutT> implements Op<InT, OutT, Void> {
       JobInfo jobInfo,
       Map<String, TupleTag<?>> idToTupleTagMap,
       DoFnSchemaInformation doFnSchemaInformation,
-      Map<?, PCollectionView<?>> sideInputMapping) {
+      Map<?, PCollectionView<?>> sideInputMapping,
+      Map<String, String> stateIdToStoreMapping) {
     this.mainOutputTag = mainOutputTag;
     this.doFn = doFn;
     this.sideInputs = sideInputs;
@@ -171,6 +171,7 @@ public class DoFnOp<InT, FnOutT, OutT> implements Op<InT, OutT, Void> {
     this.bundleStateId = "_samza_bundle_" + transformId;
     this.doFnSchemaInformation = doFnSchemaInformation;
     this.sideInputMapping = sideInputMapping;
+    this.stateIdToStoreMapping = stateIdToStoreMapping;
   }
 
   @Override
@@ -197,13 +198,20 @@ public class DoFnOp<InT, FnOutT, OutT> implements Op<InT, OutT, Void> {
     final FutureCollector<OutT> outputFutureCollector = createFutureCollector();
 
     this.bundleManager =
-        new BundleManager<>(
-            createBundleProgressListener(),
-            outputFutureCollector,
-            samzaPipelineOptions.getMaxBundleSize(),
-            samzaPipelineOptions.getMaxBundleTimeMs(),
-            timerRegistry,
-            bundleCheckTimerId);
+        isPortable
+            ? new PortableBundleManager<>(
+                createBundleProgressListener(),
+                samzaPipelineOptions.getMaxBundleSize(),
+                samzaPipelineOptions.getMaxBundleTimeMs(),
+                timerRegistry,
+                bundleCheckTimerId)
+            : new ClassicBundleManager<>(
+                createBundleProgressListener(),
+                outputFutureCollector,
+                samzaPipelineOptions.getMaxBundleSize(),
+                samzaPipelineOptions.getMaxBundleTimeMs(),
+                timerRegistry,
+                bundleCheckTimerId);
 
     this.timerInternalsFactory =
         SamzaTimerInternalsFactory.createTimerInternalFactory(
@@ -259,7 +267,10 @@ public class DoFnOp<InT, FnOutT, OutT> implements Op<InT, OutT, Void> {
               sideOutputTags,
               outputCoders,
               doFnSchemaInformation,
-              (Map<String, PCollectionView<?>>) sideInputMapping);
+              (Map<String, PCollectionView<?>>) sideInputMapping,
+              stateIdToStoreMapping,
+              emitter,
+              outputFutureCollector);
     }
 
     this.pushbackFnRunner =
@@ -471,65 +482,15 @@ public class DoFnOp<InT, FnOutT, OutT> implements Op<InT, OutT, Void> {
       Function<T, OutT> valueMapper) {
     return valueFuture.thenApply(
         res ->
-            WindowedValue.of(
+            WindowedValues.of(
                 valueMapper.apply(res),
                 windowedValue.getTimestamp(),
                 windowedValue.getWindows(),
-                windowedValue.getPane()));
-  }
-
-  static class FutureCollectorImpl<OutT> implements FutureCollector<OutT> {
-    private final List<CompletionStage<WindowedValue<OutT>>> outputFutures;
-    private final AtomicBoolean collectorSealed;
-
-    FutureCollectorImpl() {
-      /*
-       * Choosing synchronized list here since the concurrency is low as the message dispatch thread is single threaded.
-       * We need this guard against scenarios when watermark/finish bundle trigger outputs.
-       */
-      outputFutures = Collections.synchronizedList(new ArrayList<>());
-      collectorSealed = new AtomicBoolean(true);
-    }
-
-    @Override
-    public void add(CompletionStage<WindowedValue<OutT>> element) {
-      checkState(
-          !collectorSealed.get(),
-          "Cannot add elements to an unprepared collector. Make sure prepare() is invoked before adding elements.");
-      outputFutures.add(element);
-    }
-
-    @Override
-    public void discard() {
-      collectorSealed.compareAndSet(false, true);
-      outputFutures.clear();
-    }
-
-    @Override
-    public CompletionStage<Collection<WindowedValue<OutT>>> finish() {
-      /*
-       * We can ignore the results here because its okay to call finish without invoking prepare. It will be a no-op
-       * and an empty collection will be returned.
-       */
-      collectorSealed.compareAndSet(false, true);
-
-      CompletionStage<Collection<WindowedValue<OutT>>> sealedOutputFuture =
-          FutureUtils.flattenFutures(outputFutures);
-      outputFutures.clear();
-      return sealedOutputFuture;
-    }
-
-    @Override
-    public void prepare() {
-      boolean isCollectorSealed = collectorSealed.compareAndSet(true, false);
-      checkState(
-          isCollectorSealed,
-          "Failed to prepare the collector. Collector needs to be sealed before prepare() is invoked.");
-    }
+                windowedValue.getPaneInfo()));
   }
 
   /**
-   * Factory class to create an {@link org.apache.beam.runners.core.DoFnRunners.OutputManager} that
+   * Factory class to create an {@link org.apache.beam.sdk.util.WindowedValueMultiReceiver} that
    * emits values to the main output only, which is a single {@link
    * org.apache.beam.sdk.values.PCollection}.
    *
@@ -537,19 +498,19 @@ public class DoFnOp<InT, FnOutT, OutT> implements Op<InT, OutT, Void> {
    */
   public static class SingleOutputManagerFactory<OutT> implements OutputManagerFactory<OutT> {
     @Override
-    public DoFnRunners.OutputManager create(OpEmitter<OutT> emitter) {
+    public WindowedValueMultiReceiver create(OpEmitter<OutT> emitter) {
       return createOutputManager(emitter, null);
     }
 
     @Override
-    public DoFnRunners.OutputManager create(
+    public WindowedValueMultiReceiver create(
         OpEmitter<OutT> emitter, FutureCollector<OutT> collector) {
       return createOutputManager(emitter, collector);
     }
 
-    private DoFnRunners.OutputManager createOutputManager(
+    private WindowedValueMultiReceiver createOutputManager(
         OpEmitter<OutT> emitter, FutureCollector<OutT> collector) {
-      return new DoFnRunners.OutputManager() {
+      return new WindowedValueMultiReceiver() {
         @Override
         @SuppressWarnings("unchecked")
         public <T> void output(TupleTag<T> tupleTag, WindowedValue<T> windowedValue) {
@@ -569,7 +530,7 @@ public class DoFnOp<InT, FnOutT, OutT> implements Op<InT, OutT, Void> {
   }
 
   /**
-   * Factory class to create an {@link org.apache.beam.runners.core.DoFnRunners.OutputManager} that
+   * Factory class to create an {@link org.apache.beam.runners.core.WindowedValueMultiReceiver} that
    * emits values to the main output as well as the side outputs via union type {@link
    * RawUnionValue}.
    */
@@ -581,19 +542,19 @@ public class DoFnOp<InT, FnOutT, OutT> implements Op<InT, OutT, Void> {
     }
 
     @Override
-    public DoFnRunners.OutputManager create(OpEmitter<RawUnionValue> emitter) {
+    public WindowedValueMultiReceiver create(OpEmitter<RawUnionValue> emitter) {
       return createOutputManager(emitter, null);
     }
 
     @Override
-    public DoFnRunners.OutputManager create(
+    public WindowedValueMultiReceiver create(
         OpEmitter<RawUnionValue> emitter, FutureCollector<RawUnionValue> collector) {
       return createOutputManager(emitter, collector);
     }
 
-    private DoFnRunners.OutputManager createOutputManager(
+    private WindowedValueMultiReceiver createOutputManager(
         OpEmitter<RawUnionValue> emitter, FutureCollector<RawUnionValue> collector) {
-      return new DoFnRunners.OutputManager() {
+      return new WindowedValueMultiReceiver() {
         @Override
         @SuppressWarnings("unchecked")
         public <T> void output(TupleTag<T> tupleTag, WindowedValue<T> windowedValue) {

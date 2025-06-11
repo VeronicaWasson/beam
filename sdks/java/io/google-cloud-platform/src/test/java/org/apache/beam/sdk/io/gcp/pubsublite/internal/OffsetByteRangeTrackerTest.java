@@ -35,7 +35,7 @@ import com.google.cloud.pubsublite.proto.ComputeMessageStatsResponse;
 import org.apache.beam.sdk.io.range.OffsetRange;
 import org.apache.beam.sdk.transforms.splittabledofn.RestrictionTracker.Progress;
 import org.apache.beam.sdk.transforms.splittabledofn.SplitResult;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Ticker;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Ticker;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -79,7 +79,7 @@ public class OffsetByteRangeTrackerTest {
   }
 
   @Test
-  @SuppressWarnings({"dereference.of.nullable", "argument.type.incompatible"})
+  @SuppressWarnings({"dereference.of.nullable", "argument"})
   public void claimSplitSuccess() {
     assertTrue(tracker.tryClaim(OffsetByteProgress.of(Offset.of(1_000), MIN_BYTES)));
     assertTrue(tracker.tryClaim(OffsetByteProgress.of(Offset.of(10_000), MIN_BYTES)));
@@ -98,7 +98,7 @@ public class OffsetByteRangeTrackerTest {
   }
 
   @Test
-  @SuppressWarnings({"dereference.of.nullable", "argument.type.incompatible"})
+  @SuppressWarnings({"dereference.of.nullable", "argument"})
   public void splitWithoutClaimEmpty() {
     when(ticker.read()).thenReturn(100000000000000L);
     SplitResult<OffsetByteRange> splits = tracker.trySplit(IGNORED_FRACTION);

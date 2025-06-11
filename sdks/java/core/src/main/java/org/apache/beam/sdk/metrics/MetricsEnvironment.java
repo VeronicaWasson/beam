@@ -21,9 +21,8 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.annotations.Internal;
+import org.apache.beam.sdk.util.StringUtils;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
@@ -44,7 +43,6 @@ import org.slf4j.LoggerFactory;
  * container for the current thread and get a {@link Closeable} that will restore the previous
  * container when closed.
  */
-@Experimental(Kind.METRICS)
 @Internal
 public class MetricsEnvironment {
 
@@ -53,11 +51,17 @@ public class MetricsEnvironment {
   private static final AtomicBoolean METRICS_SUPPORTED = new AtomicBoolean(false);
   private static final AtomicBoolean REPORTED_MISSING_CONTAINER = new AtomicBoolean(false);
 
-  private static final ThreadLocal<@Nullable MetricsContainerHolder> CONTAINER_FOR_THREAD =
+  @SuppressWarnings("type.argument") // object guaranteed to be non-null
+  private static final ThreadLocal<@NonNull MetricsContainerHolder> CONTAINER_FOR_THREAD =
       ThreadLocal.withInitial(MetricsContainerHolder::new);
 
   private static final AtomicReference<@Nullable MetricsContainer> PROCESS_WIDE_METRICS_CONTAINER =
       new AtomicReference<>();
+
+  /** Returns the container holder for the current thread. */
+  public static MetricsEnvironmentState getMetricsEnvironmentStateForCurrentThread() {
+    return CONTAINER_FOR_THREAD.get();
+  }
 
   /**
    * Set the {@link MetricsContainer} for the current thread.
@@ -66,8 +70,6 @@ public class MetricsEnvironment {
    */
   public static @Nullable MetricsContainer setCurrentContainer(
       @Nullable MetricsContainer container) {
-    @SuppressWarnings("nullness") // Non-null due to withInitialValue
-    @NonNull
     MetricsContainerHolder holder = CONTAINER_FOR_THREAD.get();
     @Nullable MetricsContainer previous = holder.container;
     holder.container = container;
@@ -108,7 +110,6 @@ public class MetricsEnvironment {
     private final MetricsContainerHolder holder;
     private final @Nullable MetricsContainer oldContainer;
 
-    @SuppressWarnings("nullness") // Non-null due to withInitialValue
     private ScopedContainer(MetricsContainer newContainer) {
       // It is safe to cache the thread-local holder because it never changes for the thread.
       holder = CONTAINER_FOR_THREAD.get();
@@ -130,15 +131,18 @@ public class MetricsEnvironment {
    * diagnostic message.
    */
   public static @Nullable MetricsContainer getCurrentContainer() {
-    @SuppressWarnings("nullness") // Non-null due to withInitialValue
     MetricsContainer container = CONTAINER_FOR_THREAD.get().container;
     if (container == null && REPORTED_MISSING_CONTAINER.compareAndSet(false, true)) {
       if (isMetricsSupported()) {
         LOG.error(
-            "Unable to update metrics on the current thread. "
-                + "Most likely caused by using metrics outside the managed work-execution thread.");
+            "Unable to update metrics on the current thread. Most likely caused by using metrics "
+                + "outside the managed work-execution thread:\n  {}",
+            StringUtils.arrayToNewlines(Thread.currentThread().getStackTrace(), 10));
       } else {
-        LOG.warn("Reporting metrics are not supported in the current execution environment.");
+        // rate limiting this log as it can be emitted each time metrics incremented
+        LOG.warn(
+            "Reporting metrics are not supported in the current execution environment:\n  {}",
+            StringUtils.arrayToNewlines(Thread.currentThread().getStackTrace(), 10));
       }
     }
     return container;
@@ -149,7 +153,24 @@ public class MetricsEnvironment {
     return PROCESS_WIDE_METRICS_CONTAINER.get();
   }
 
-  private static class MetricsContainerHolder {
-    public @Nullable MetricsContainer container = null;
+  public static class MetricsContainerHolder implements MetricsEnvironmentState {
+    private @Nullable MetricsContainer container = null;
+
+    @Override
+    public @Nullable MetricsContainer activate(@Nullable MetricsContainer metricsContainer) {
+      MetricsContainer old = container;
+      container = metricsContainer;
+      return old;
+    }
+  }
+
+  /**
+   * Set the {@link MetricsContainer} for the associated {@link MetricsEnvironment}.
+   *
+   * @return The previous container for the associated {@link MetricsEnvironment}.
+   */
+  public interface MetricsEnvironmentState {
+    @Nullable
+    MetricsContainer activate(@Nullable MetricsContainer metricsContainer);
   }
 }

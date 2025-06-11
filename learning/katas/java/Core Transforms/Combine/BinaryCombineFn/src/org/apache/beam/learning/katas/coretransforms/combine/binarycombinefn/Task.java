@@ -22,10 +22,14 @@ package org.apache.beam.learning.katas.coretransforms.combine.binarycombinefn;
 //   name: BinaryCombineFn
 //   description: Task from katas to implement the summation of BigIntegers.
 //   multifile: false
-//   context_line: 40
+//   context_line: 46
 //   categories:
 //     - Combiners
 //     - Core Transforms
+//   complexity: BASIC
+//   tags:
+//     - transforms
+//     - numbers
 
 import java.math.BigInteger;
 import org.apache.beam.learning.katas.util.Log;

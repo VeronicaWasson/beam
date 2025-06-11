@@ -18,22 +18,19 @@
 """
 Generates Python proto modules and grpc stubs for Beam protos.
 """
-
+import argparse
 import contextlib
 import glob
+import importlib.resources
 import inspect
 import logging
 import os
 import platform
 import re
 import shutil
-import subprocess
 import sys
-import time
 from collections import defaultdict
 from importlib import import_module
-
-import pkg_resources
 
 LOG = logging.getLogger()
 LOG.setLevel(logging.INFO)
@@ -60,7 +57,7 @@ LICENSE_HEADER = """
 NO_PROMISES_NOTICE = """
 \"\"\"
 For internal use only; no backwards-compatibility guarantees.
-Automatically generated when running setup.py sdist or build[_py].
+Automatically generated when running python -m build.
 \"\"\"
 """
 
@@ -123,8 +120,29 @@ def generate_urn_files(out_dir, api_path):
   This is executed at build time rather than dynamically on import to ensure
   that it is compatible with static type checkers like mypy.
   """
-  import google.protobuf.pyext._message as pyext_message
   from google.protobuf import message
+  from google.protobuf.internal import api_implementation
+  if api_implementation.Type() == 'python':
+    from google.protobuf.internal import containers
+    repeated_types = (
+        list,
+        containers.RepeatedScalarFieldContainer,
+        containers.RepeatedCompositeFieldContainer)
+  elif api_implementation.Type() == 'upb':
+    from google._upb import _message
+    repeated_types = (
+        list,
+        _message.RepeatedScalarContainer,
+        _message.RepeatedCompositeContainer)
+  elif api_implementation.Type() == 'cpp':
+    from google.protobuf.pyext import _message
+    repeated_types = (
+        list,
+        _message.RepeatedScalarContainer,
+        _message.RepeatedCompositeContainer)
+  else:
+    raise TypeError(
+        "Unknown proto implementation: " + api_implementation.Type())
 
   class Context(object):
     INDENT = '  '
@@ -175,12 +193,7 @@ def generate_urn_files(out_dir, api_path):
     def python_repr(self, obj):
       if isinstance(obj, message.Message):
         return self.message_repr(obj)
-      elif isinstance(
-          obj,
-          (
-              list,
-              pyext_message.RepeatedCompositeContainer,  # pylint: disable=c-extension-no-member
-              pyext_message.RepeatedScalarContainer)):  # pylint: disable=c-extension-no-member
+      elif isinstance(obj, repeated_types):
         return '[%s]' % ', '.join(self.python_repr(x) for x in obj)
       else:
         return repr(obj)
@@ -203,11 +216,10 @@ def generate_urn_files(out_dir, api_path):
 
     def write_enum(self, enum_name, enum, indent):
       ctx = Context(indent=indent)
-
       with ctx.indent():
-        for v in enum.DESCRIPTOR.values:
-          extensions = v.GetOptions().Extensions
-
+        for enum_value_name in enum.values_by_name:
+          enum_value_descriptor = enum.values_by_name[enum_value_name]
+          extensions = enum_value_descriptor.GetOptions().Extensions
           prop = (
               extensions[beam_runner_api_pb2.beam_urn],
               extensions[beam_runner_api_pb2.beam_constant],
@@ -219,7 +231,7 @@ def generate_urn_files(out_dir, api_path):
             continue
           ctx.line(
               '%s = PropertiesFromEnumValue(%s)' %
-              (v.name, ', '.join(self.python_repr(x) for x in prop)))
+              (enum_value_name, ', '.join(self.python_repr(x) for x in prop)))
 
       if ctx.lines:
         ctx.prepend('class %s(object):' % enum_name)
@@ -232,10 +244,10 @@ def generate_urn_files(out_dir, api_path):
 
       with ctx.indent():
         for obj_name, obj in inspect.getmembers(message):
-          if self.is_message_type(obj):
-            ctx.lines += self.write_message(obj_name, obj, ctx._indent)
-          elif self.is_enum_type(obj):
-            ctx.lines += self.write_enum(obj_name, obj, ctx._indent)
+          if obj_name == 'DESCRIPTOR':
+            for enum_name in obj.enum_types_by_name:
+              enum = obj.enum_types_by_name[enum_name]
+              ctx.lines += self.write_enum(enum_name, enum, ctx._indent)
 
       if ctx.lines:
         ctx.prepend('class %s(object):' % message_name)
@@ -305,49 +317,6 @@ def find_by_ext(root_dir, ext):
     for file in files:
       if file.endswith(ext):
         yield clean_path(os.path.join(root, file))
-
-
-def ensure_grpcio_exists():
-  try:
-    from grpc_tools import protoc  # pylint: disable=unused-import
-  except ImportError:
-    if platform.system() == 'Windows':
-      # For Windows, grpcio-tools has to be installed manually.
-      raise RuntimeError(
-          'Cannot generate protos for Windows since grpcio-tools package is '
-          'not installed. Please install this package manually '
-          'using \'pip install grpcio-tools\'.')
-    return _install_grpcio_tools()
-
-
-def _install_grpcio_tools():
-  """
-  Though wheels are available for grpcio-tools, setup_requires uses
-  easy_install which doesn't understand them.  This means that it is
-  compiled from scratch (which is expensive as it compiles the full
-  protoc compiler).  Instead, we attempt to install a wheel in a temporary
-  directory and add it to the path as needed.
-  See https://github.com/pypa/setuptools/issues/377
-  """
-  install_path = os.path.join(PYTHON_SDK_ROOT, '.eggs', 'grpcio-wheels')
-  logging.warning('Installing grpcio-tools into %s', install_path)
-  start = time.time()
-  subprocess.check_call([
-      sys.executable,
-      '-m',
-      'pip',
-      'install',
-      '--target',
-      install_path,
-      '--upgrade',
-      '-r',
-      os.path.join(PYTHON_SDK_ROOT, 'build-requirements.txt')
-  ])
-  logging.warning(
-      'Installing grpcio-tools took %0.2f seconds.', time.time() - start)
-
-  return install_path
-
 
 def build_relative_import(root_path, import_path, start_file_path):
   tail_path = import_path.replace('.', os.path.sep)
@@ -467,8 +436,8 @@ def generate_proto_files(force=False):
     return
 
   elif not out_files and not proto_files:
-    common = os.path.join(PYTHON_SDK_ROOT, '..', 'common')
-    if os.path.exists(common):
+    model = os.path.join(PROJECT_ROOT, 'model')
+    if os.path.exists(model):
       error_msg = 'No proto files found in %s.' % proto_dirs
     else:
       error_msg = 'Not in apache git tree, unable to find proto definitions.'
@@ -502,27 +471,31 @@ def generate_proto_files(force=False):
   if not os.path.exists(PYTHON_OUTPUT_PATH):
     os.mkdir(PYTHON_OUTPUT_PATH)
 
-  grpcio_install_loc = ensure_grpcio_exists()
   protoc_gen_mypy = _find_protoc_gen_mypy()
-  with PythonPath(grpcio_install_loc):
-    from grpc_tools import protoc
-    builtin_protos = pkg_resources.resource_filename('grpc_tools', '_proto')
-    args = ([sys.executable] +  # expecting to be called from command line
-            ['--proto_path=%s' % builtin_protos] +
-            ['--proto_path=%s' % d
-             for d in proto_dirs] + ['--python_out=%s' % PYTHON_OUTPUT_PATH] +
-            ['--plugin=protoc-gen-mypy=%s' % protoc_gen_mypy] +
-            ['--mypy_out=%s' % PYTHON_OUTPUT_PATH] +
-            # TODO(robertwb): Remove the prefix once it's the default.
-            ['--grpc_python_out=grpc_2_0:%s' % PYTHON_OUTPUT_PATH] +
-            proto_files)
+  from grpc_tools import protoc
+  builtin_protos = importlib.resources.files('grpc_tools') / '_proto'
+  args = (
+      [sys.executable] +  # expecting to be called from command line
+      ['--proto_path=%s' % builtin_protos] +
+      ['--proto_path=%s' % d
+      for d in proto_dirs] + ['--python_out=%s' % PYTHON_OUTPUT_PATH] +
+      ['--plugin=protoc-gen-mypy=%s' % protoc_gen_mypy] +
+      # new version of mypy-protobuf converts None to zero default value
+      # and remove Optional from the param type annotation. This causes
+      # some mypy errors. So to mitigate and fall back to old behavior,
+      # use `relax_strict_optional_primitives` flag. more at
+      # https://github.com/nipunn1313/mypy-protobuf/tree/main#relax_strict_optional_primitives # pylint:disable=line-too-long
+      ['--mypy_out=relax_strict_optional_primitives:%s' % PYTHON_OUTPUT_PATH
+      ] +
+      # TODO(robertwb): Remove the prefix once it's the default.
+      ['--grpc_python_out=grpc_2_0:%s' % PYTHON_OUTPUT_PATH] + proto_files)
 
-    LOG.info('Regenerating Python proto definitions (%s).' % regenerate_reason)
-    ret_code = protoc.main(args)
-    if ret_code:
-      raise RuntimeError(
-          'Protoc returned non-zero status (see logs for details): '
-          '%s' % ret_code)
+  LOG.info('Regenerating Python proto definitions (%s).' % regenerate_reason)
+  ret_code = protoc.main(args)
+  if ret_code:
+    raise RuntimeError(
+        'Protoc returned non-zero status (see logs for details): '
+        '%s' % ret_code)
 
   # copy resource files
   for path in MODEL_RESOURCES:
@@ -533,10 +506,10 @@ def generate_proto_files(force=False):
   # force relative import paths for proto files
   compiled_import_re = re.compile('^from (.*) import (.*)$')
   for file_path in find_by_ext(PYTHON_OUTPUT_PATH,
-                               ('_pb2.py', '_pb2_grpc.py', '_pb2.pyi')):
+                              ('_pb2.py', '_pb2_grpc.py', '_pb2.pyi')):
     proto_packages.add(os.path.dirname(file_path))
     lines = []
-    with open(file_path) as f:
+    with open(file_path, encoding='utf-8') as f:
       for line in f:
         match_obj = compiled_import_re.match(line)
         if match_obj and \
@@ -553,9 +526,11 @@ def generate_proto_files(force=False):
   generate_init_files_lite(PYTHON_OUTPUT_PATH)
   for proto_package in proto_packages:
     generate_urn_files(proto_package, PYTHON_OUTPUT_PATH)
-
-  generate_init_files_full(PYTHON_OUTPUT_PATH)
+    generate_init_files_full(PYTHON_OUTPUT_PATH)
 
 
 if __name__ == '__main__':
-  generate_proto_files(force=True)
+  parser = argparse.ArgumentParser()
+  parser.add_argument('--no-force', dest='force', action='store_false')
+  args = parser.parse_args()
+  generate_proto_files(force=args.force)

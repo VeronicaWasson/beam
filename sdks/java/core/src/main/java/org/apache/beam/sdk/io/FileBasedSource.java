@@ -17,26 +17,30 @@
  */
 package org.apache.beam.sdk.io;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Verify.verify;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Verify.verify;
 
 import java.io.IOException;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.SeekableByteChannel;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.NoSuchElementException;
+import java.util.concurrent.atomic.AtomicReference;
+import org.apache.beam.sdk.io.FileSystem.LineageLevel;
 import org.apache.beam.sdk.io.fs.EmptyMatchTreatment;
 import org.apache.beam.sdk.io.fs.MatchResult;
 import org.apache.beam.sdk.io.fs.MatchResult.Metadata;
+import org.apache.beam.sdk.io.fs.ResourceId;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.options.ValueProvider.StaticValueProvider;
 import org.apache.beam.sdk.transforms.display.DisplayData;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Instant;
 import org.slf4j.Logger;
@@ -73,6 +77,8 @@ public abstract class FileBasedSource<T> extends OffsetBasedSource<T> {
   private MatchResult.@Nullable Metadata singleFileMetadata;
   private final Mode mode;
 
+  private final AtomicReference<@Nullable Long> filesSizeBytes;
+
   /** A given {@code FileBasedSource} represents a file resource of one of these types. */
   public enum Mode {
     FILEPATTERN,
@@ -91,6 +97,7 @@ public abstract class FileBasedSource<T> extends OffsetBasedSource<T> {
     this.mode = Mode.FILEPATTERN;
     this.emptyMatchTreatment = emptyMatchTreatment;
     this.fileOrPatternSpec = fileOrPatternSpec;
+    this.filesSizeBytes = new AtomicReference<>();
   }
 
   /**
@@ -123,6 +130,7 @@ public abstract class FileBasedSource<T> extends OffsetBasedSource<T> {
     mode = Mode.SINGLE_FILE_OR_SUBRANGE;
     this.singleFileMetadata = checkNotNull(fileMetadata, "fileMetadata");
     this.fileOrPatternSpec = StaticValueProvider.of(fileMetadata.resourceId().toString());
+    this.filesSizeBytes = new AtomicReference<>();
 
     // This field will be unused in this mode.
     this.emptyMatchTreatment = EmptyMatchTreatment.DISALLOW;
@@ -222,6 +230,11 @@ public abstract class FileBasedSource<T> extends OffsetBasedSource<T> {
     String fileOrPattern = fileOrPatternSpec.get();
 
     if (mode == Mode.FILEPATTERN) {
+      Long maybeNumBytes = filesSizeBytes.get();
+      if (maybeNumBytes != null) {
+        return maybeNumBytes;
+      }
+
       long totalSize = 0;
       List<Metadata> allMatches = FileSystems.match(fileOrPattern, emptyMatchTreatment).metadata();
       for (Metadata metadata : allMatches) {
@@ -232,6 +245,8 @@ public abstract class FileBasedSource<T> extends OffsetBasedSource<T> {
           fileOrPattern,
           allMatches.size(),
           totalSize);
+
+      filesSizeBytes.compareAndSet(null, totalSize);
       return totalSize;
     } else {
       long start = getStartOffset();
@@ -284,6 +299,8 @@ public abstract class FileBasedSource<T> extends OffsetBasedSource<T> {
           System.currentTimeMillis() - startTime,
           expandedFiles.size(),
           splitResults.size());
+
+      reportSourceLineage(expandedFiles);
       return splitResults;
     } else {
       if (isSplittable()) {
@@ -297,6 +314,37 @@ public abstract class FileBasedSource<T> extends OffsetBasedSource<T> {
                 + "the file is not seekable",
             fileOrPattern);
         return ImmutableList.of(this);
+      }
+    }
+  }
+
+  /**
+   * Report source Lineage. Due to the size limit of Beam metrics, report full file name or only dir
+   * depend on the number of files.
+   *
+   * <p>- Number of files<=100, report full file paths;
+   *
+   * <p>- Number of directory<=100, report directory names (one level up);
+   *
+   * <p>- Otherwise, report top level only.
+   */
+  private static void reportSourceLineage(List<Metadata> expandedFiles) {
+    if (expandedFiles.size() <= 100) {
+      for (Metadata metadata : expandedFiles) {
+        FileSystems.reportSourceLineage(metadata.resourceId());
+      }
+    } else {
+      HashSet<ResourceId> uniqueDirs = new HashSet<>();
+      for (Metadata metadata : expandedFiles) {
+        ResourceId dir = metadata.resourceId().getCurrentDirectory();
+        uniqueDirs.add(dir);
+        if (uniqueDirs.size() > 100) {
+          FileSystems.reportSourceLineage(dir, LineageLevel.TOP_LEVEL);
+          return;
+        }
+      }
+      for (ResourceId uniqueDir : uniqueDirs) {
+        FileSystems.reportSourceLineage(uniqueDir);
       }
     }
   }
@@ -460,23 +508,30 @@ public abstract class FileBasedSource<T> extends OffsetBasedSource<T> {
     @Override
     protected final boolean startImpl() throws IOException {
       FileBasedSource<T> source = getCurrentSource();
-      this.channel = FileSystems.open(source.getSingleFileMetadata().resourceId());
-      if (channel instanceof SeekableByteChannel) {
-        SeekableByteChannel seekChannel = (SeekableByteChannel) channel;
-        seekChannel.position(source.getStartOffset());
-      } else {
-        // Channel is not seekable. Must not be a subrange.
-        checkArgument(
-            source.mode != Mode.SINGLE_FILE_OR_SUBRANGE,
-            "Subrange-based sources must only be defined for file types that support seekable "
-                + " read channels");
-        checkArgument(
-            source.getStartOffset() == 0,
-            "Start offset %s is not zero but channel for reading the file is not seekable.",
-            source.getStartOffset());
-      }
+      ResourceId resourceId = source.getSingleFileMetadata().resourceId();
+      try {
+        this.channel = FileSystems.open(resourceId);
+        if (channel instanceof SeekableByteChannel) {
+          SeekableByteChannel seekChannel = (SeekableByteChannel) channel;
+          seekChannel.position(source.getStartOffset());
+        } else {
+          // Channel is not seekable. Must not be a subrange.
+          checkArgument(
+              source.mode != Mode.SINGLE_FILE_OR_SUBRANGE,
+              "Subrange-based sources must only be defined for file types that support seekable "
+                  + " read channels");
+          checkArgument(
+              source.getStartOffset() == 0,
+              "Start offset %s is not zero but channel for reading the file is not seekable.",
+              source.getStartOffset());
+        }
 
-      startReading(channel);
+        startReading(channel);
+      } catch (IOException e) {
+        LOG.error(
+            "Failed to process {}, which could be corrupted or have a wrong format.", resourceId);
+        throw new IOException(e);
+      }
 
       // Advance once to load the first record.
       return advanceImpl();

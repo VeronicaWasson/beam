@@ -17,9 +17,9 @@
  */
 package org.apache.beam.sdk.io.gcp.pubsub;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import com.google.api.client.util.Clock;
 import java.io.IOException;
@@ -75,9 +75,9 @@ import org.apache.beam.sdk.util.MovingFunction;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.TypeDescriptor;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
@@ -1200,6 +1200,9 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
   /** Whether this source should include the messageId from PubSub. */
   private final boolean needsMessageId;
 
+  /** Whether this source should include the orderingKey from PubSub. */
+  private final boolean needsOrderingKey;
+
   @VisibleForTesting
   PubsubUnboundedSource(
       Clock clock,
@@ -1210,7 +1213,8 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
       @Nullable String timestampAttribute,
       @Nullable String idAttribute,
       boolean needsAttributes,
-      boolean needsMessageId) {
+      boolean needsMessageId,
+      boolean needsOrderingKey) {
     checkArgument(
         (topic == null) != (subscription == null),
         "Exactly one of topic and subscription must be given");
@@ -1223,6 +1227,7 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
     this.idAttribute = idAttribute;
     this.needsAttributes = needsAttributes;
     this.needsMessageId = needsMessageId;
+    this.needsOrderingKey = needsOrderingKey;
   }
 
   /** Construct an unbounded source to consume from the Pubsub {@code subscription}. */
@@ -1243,6 +1248,7 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
         timestampAttribute,
         idAttribute,
         needsAttributes,
+        false,
         false);
   }
 
@@ -1265,6 +1271,7 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
         timestampAttribute,
         idAttribute,
         needsAttributes,
+        false,
         false);
   }
 
@@ -1287,7 +1294,8 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
         timestampAttribute,
         idAttribute,
         needsAttributes,
-        needsMessageId);
+        needsMessageId,
+        false);
   }
 
   /** Get the project path. */
@@ -1333,6 +1341,10 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
     return needsMessageId;
   }
 
+  public boolean getNeedsOrderingKey() {
+    return needsOrderingKey;
+  }
+
   @Override
   public PCollection<PubsubMessage> expand(PBegin input) {
     SerializableFunction<byte[], PubsubMessage> function;
@@ -1342,16 +1354,20 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
       function = new DeserializeBytesIntoPubsubMessagePayloadOnly();
     }
     Coder<PubsubMessage> messageCoder;
-    if (getNeedsMessageId()) {
-      messageCoder =
-          getNeedsAttributes()
-              ? PubsubMessageWithAttributesAndMessageIdCoder.of()
-              : PubsubMessageWithMessageIdCoder.of();
+    if (getNeedsOrderingKey()) {
+      messageCoder = PubsubMessageWithAttributesAndMessageIdAndOrderingKeyCoder.of();
     } else {
-      messageCoder =
-          getNeedsAttributes()
-              ? PubsubMessageWithAttributesCoder.of()
-              : PubsubMessagePayloadOnlyCoder.of();
+      if (getNeedsMessageId()) {
+        messageCoder =
+            getNeedsAttributes()
+                ? PubsubMessageWithAttributesAndMessageIdCoder.of()
+                : PubsubMessageWithMessageIdCoder.of();
+      } else {
+        messageCoder =
+            getNeedsAttributes()
+                ? PubsubMessageWithAttributesCoder.of()
+                : PubsubMessagePayloadOnlyCoder.of();
+      }
     }
     PCollection<PubsubMessage> messages =
         input

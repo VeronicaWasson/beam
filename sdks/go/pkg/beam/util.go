@@ -16,7 +16,7 @@
 package beam
 
 //go:generate go install github.com/apache/beam/sdks/v2/go/cmd/starcgen
-//go:generate starcgen --package=beam --identifiers=addFixedKeyFn,dropKeyFn,dropValueFn,swapKVFn,explodeFn,jsonDec,jsonEnc,protoEnc,protoDec,schemaEnc,schemaDec,makePartitionFn,createFn
+//go:generate starcgen --package=beam --identifiers=addFixedKeyFn,dropKeyFn,dropValueFn,swapKVFn,explodeFn,jsonDec,jsonEnc,protoEnc,protoDec,schemaEnc,schemaDec,makePartitionFn
 //go:generate go fmt
 
 // We have some freedom to create various utilities, users can use depending on
@@ -36,7 +36,7 @@ func NewPipelineWithRoot() (*Pipeline, Scope) {
 
 // Seq is a convenience helper to chain single-input/single-output ParDos together
 // in a sequence.
-func Seq(s Scope, col PCollection, dofns ...interface{}) PCollection {
+func Seq(s Scope, col PCollection, dofns ...any) PCollection {
 	cur := col
 	for _, dofn := range dofns {
 		cur = ParDo(s, dofn, cur)

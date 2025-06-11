@@ -1,5 +1,5 @@
 ---
-title: "Beam Quickstart for Java"
+title: "WordCount quickstart for Java"
 aliases:
   - /get-started/quickstart/
   - /use/quickstart/
@@ -19,7 +19,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Apache Beam Java SDK quickstart
+# WordCount quickstart for Java
 
 This quickstart shows you how to set up a Java development environment and run
 an [example pipeline](/get-started/wordcount-example) written with the
@@ -139,9 +139,9 @@ if (project.hasProperty("dataflow-runner")) {
       {{< /highlight >}}
    4. At the end of the build script, add the following task:
       {{< highlight >}}
-task("execute", JavaExec::class) {
-    classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set(System.getProperty("mainClass"))
+tasks.register<JavaExec>("execute") {
+  mainClass.set(System.getProperty("mainClass"))
+  classpath = sourceSets.main.get().runtimeClasspath
 }
       {{< /highlight >}}
 4. Build your project:
@@ -297,7 +297,37 @@ TODO: document Spark on Gradle: https://github.com/apache/beam/issues/21502
 {{< runner dataflow >}}
 gradle clean execute -DmainClass=org.apache.beam.examples.WordCount \
     --args="--project=<your-gcp-project> --inputFile=gs://apache-beam-samples/shakespeare/* \
-    --output=gs://<your-gcs-bucket>/counts" -Pdataflow-runner
+    --output=gs://<your-gcs-bucket>/counts --runner=DataflowRunner" -Pdataflow-runner
+{{< /runner >}}
+{{< runner samza>}}
+TODO: document Samza on Gradle: https://github.com/apache/beam/issues/21500
+{{< /runner >}}
+{{< runner nemo>}}
+TODO: document Nemo on Gradle: https://github.com/apache/beam/issues/21503
+{{< /runner >}}
+{{< runner jet>}}
+TODO: document Jet on Gradle: https://github.com/apache/beam/issues/21501
+{{< /runner >}}
+
+For Windows PowerShell:
+
+{{< runner direct>}}
+.\gradlew clean execute -D mainClass=org.apache.beam.examples.WordCount \
+--args="--inputFile=sample.txt --output=counts"
+{{< /runner >}}
+{{< runner flink>}}
+TODO: document Flink on Gradle: https://github.com/apache/beam/issues/21498
+{{< /runner >}}
+{{< runner flinkCluster>}}
+TODO: document FlinkCluster on Gradle: https://github.com/apache/beam/issues/21499
+{{< /runner >}}
+{{< runner spark >}}
+TODO: document Spark on Gradle: https://github.com/apache/beam/issues/21502
+{{< /runner >}}
+{{< runner dataflow >}}
+.\gradlew clean execute -DmainClass=org.apache.beam.examples.WordCount \
+    --args="--project=<your-gcp-project> --inputFile=gs://apache-beam-samples/shakespeare/* \
+    --output=gs://<your-gcs-bucket>/counts --runner=DataflowRunner" -Pdataflow-runner
 {{< /runner >}}
 {{< runner samza>}}
 TODO: document Samza on Gradle: https://github.com/apache/beam/issues/21500
@@ -393,7 +423,7 @@ more counts*
 * Take a self-paced tour through our
   [Learning Resources](/documentation/resources/learning-resources).
 * Dive in to some of our favorite
-  [Videos and Podcasts](/documentation/resources/videos-and-podcasts).
+  [Videos and Podcasts](/get-started/resources/videos-and-podcasts).
 * Join the Beam [users@](/community/contact-us) mailing list.
 
 Please don't hesitate to [reach out](/community/contact-us) if you encounter any

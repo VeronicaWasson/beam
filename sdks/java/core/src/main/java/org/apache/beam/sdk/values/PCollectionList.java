@@ -25,8 +25,8 @@ import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.Partition;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
@@ -59,9 +59,6 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  *
  * @param <T> the type of the elements of all the {@link PCollection PCollections} in this list
  */
-@SuppressWarnings({
-  "rawtypes" // TODO(https://github.com/apache/beam/issues/20447)
-})
 public class PCollectionList<T> implements PInput, POutput {
   /**
    * Returns an empty {@link PCollectionList} that is part of the given {@link Pipeline}.
@@ -248,7 +245,7 @@ public class PCollectionList<T> implements PInput, POutput {
     if (!(other instanceof PCollectionList)) {
       return false;
     }
-    PCollectionList that = (PCollectionList) other;
+    PCollectionList<?> that = (PCollectionList<?>) other;
     return this.pipeline.equals(that.pipeline) && this.getAll().equals(that.getAll());
   }
 

@@ -27,7 +27,7 @@ import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.PCollection.IsBounded;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
@@ -70,9 +70,6 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  * Map<TupleTag<?>, PCollection<?>> allPcs = pcs.getAll();
  * }</pre>
  */
-@SuppressWarnings({
-  "rawtypes" // TODO(https://github.com/apache/beam/issues/20447)
-})
 public class PCollectionTuple implements PInput, POutput {
   /**
    * Returns an empty {@link PCollectionTuple} that is part of the given {@link Pipeline}.
@@ -309,7 +306,7 @@ public class PCollectionTuple implements PInput, POutput {
       // erasure as the correct type. When a transform adds
       // elements to `outputCollection` they will be of type T.
       @SuppressWarnings("unchecked")
-      PCollection outputCollection =
+      PCollection<?> outputCollection =
           PCollection.createPrimitiveOutputInternal(
                   pipeline, windowingStrategy, isBounded, (Coder) coders.get(outputTag))
               .setTypeDescriptor(outputTag.getTypeDescriptor());

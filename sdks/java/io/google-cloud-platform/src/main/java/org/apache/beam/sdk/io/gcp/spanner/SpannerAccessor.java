@@ -21,7 +21,9 @@ import com.google.api.gax.grpc.testing.LocalChannelProvider;
 import com.google.api.gax.retrying.RetrySettings;
 import com.google.api.gax.rpc.FixedHeaderProvider;
 import com.google.api.gax.rpc.ServerStreamingCallSettings;
+import com.google.api.gax.rpc.StatusCode.Code;
 import com.google.api.gax.rpc.UnaryCallSettings;
+import com.google.auth.Credentials;
 import com.google.cloud.NoCredentials;
 import com.google.cloud.ServiceFactory;
 import com.google.cloud.spanner.BatchClient;
@@ -30,14 +32,17 @@ import com.google.cloud.spanner.DatabaseClient;
 import com.google.cloud.spanner.DatabaseId;
 import com.google.cloud.spanner.Spanner;
 import com.google.cloud.spanner.SpannerOptions;
+import com.google.cloud.spanner.v1.stub.SpannerStubSettings;
 import com.google.spanner.v1.CommitRequest;
 import com.google.spanner.v1.CommitResponse;
 import com.google.spanner.v1.ExecuteSqlRequest;
 import com.google.spanner.v1.PartialResultSet;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.util.ReleaseInfo;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
 import org.joda.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -59,69 +64,82 @@ public class SpannerAccessor implements AutoCloseable {
   private static final ConcurrentHashMap<SpannerConfig, SpannerAccessor> spannerAccessors =
       new ConcurrentHashMap<>();
 
-  // Keep reference counts of each SpannerAccessor's usage so that we can close
-  // it when it is no longer in use.
-  private static final ConcurrentHashMap<SpannerConfig, AtomicInteger> refcounts =
-      new ConcurrentHashMap<>();
-
   private final Spanner spanner;
   private final DatabaseClient databaseClient;
   private final BatchClient batchClient;
   private final DatabaseAdminClient databaseAdminClient;
   private final SpannerConfig spannerConfig;
+  private final String instanceConfigId;
+  private int refcount = 0;
 
   private SpannerAccessor(
       Spanner spanner,
       DatabaseClient databaseClient,
       DatabaseAdminClient databaseAdminClient,
       BatchClient batchClient,
-      SpannerConfig spannerConfig) {
+      SpannerConfig spannerConfig,
+      String instanceConfigId) {
     this.spanner = spanner;
     this.databaseClient = databaseClient;
     this.databaseAdminClient = databaseAdminClient;
     this.batchClient = batchClient;
     this.spannerConfig = spannerConfig;
+    this.instanceConfigId = instanceConfigId;
   }
 
   public static SpannerAccessor getOrCreate(SpannerConfig spannerConfig) {
 
-    SpannerAccessor self = spannerAccessors.get(spannerConfig);
-    if (self == null) {
-      synchronized (spannerAccessors) {
-        // Re-check that it has not been created before we got the lock.
-        self = spannerAccessors.get(spannerConfig);
-        if (self == null) {
-          // Connect to spanner for this SpannerConfig.
-          LOG.info("Connecting to {}", spannerConfig);
-          self = SpannerAccessor.createAndConnect(spannerConfig);
-          spannerAccessors.put(spannerConfig, self);
-          refcounts.putIfAbsent(spannerConfig, new AtomicInteger(0));
-        }
+    synchronized (spannerAccessors) {
+      SpannerAccessor self = spannerAccessors.get(spannerConfig);
+      if (self == null) {
+        // Connect to spanner for this SpannerConfig.
+        LOG.info("Connecting to {}", spannerConfig);
+        self = SpannerAccessor.createAndConnect(spannerConfig);
+        LOG.info("Successfully connected to {}", spannerConfig);
+        spannerAccessors.put(spannerConfig, self);
       }
+      // Add refcount for this spannerConfig.
+      self.refcount++;
+      LOG.debug("getOrCreate(): refcount={} for {}", self.refcount, spannerConfig);
+      return self;
     }
-    // Add refcount for this spannerConfig.
-    int refcount = refcounts.get(spannerConfig).incrementAndGet();
-    LOG.debug("getOrCreate(): refcount={} for {}", refcount, spannerConfig);
-    return self;
   }
 
-  private static SpannerAccessor createAndConnect(SpannerConfig spannerConfig) {
+  @VisibleForTesting
+  static SpannerOptions buildSpannerOptions(SpannerConfig spannerConfig) {
     SpannerOptions.Builder builder = SpannerOptions.newBuilder();
 
-    // Set retryable codes for all API methods
+    Set<Code> retryableCodes = new HashSet<>();
     if (spannerConfig.getRetryableCodes() != null) {
-      builder
-          .getSpannerStubSettingsBuilder()
-          .applyToAllUnaryMethods(
-              input -> {
-                input.setRetryableCodes(spannerConfig.getRetryableCodes());
-                return null;
-              });
-      builder
-          .getSpannerStubSettingsBuilder()
-          .executeStreamingSqlSettings()
-          .setRetryableCodes(spannerConfig.getRetryableCodes());
+      retryableCodes.addAll(spannerConfig.getRetryableCodes());
     }
+    if (spannerConfig.getDataBoostEnabled() != null && spannerConfig.getDataBoostEnabled().get()) {
+      retryableCodes.add(Code.RESOURCE_EXHAUSTED);
+    }
+    // Add default retryable codes for unary methods
+    Set<Code> unaryMethodRetryableCodes = new HashSet<>(retryableCodes);
+    unaryMethodRetryableCodes.addAll(
+        builder.getSpannerStubSettingsBuilder().getSessionSettings().getRetryableCodes());
+    // Set retryable codes for all API methods
+    builder
+        .getSpannerStubSettingsBuilder()
+        .applyToAllUnaryMethods(
+            input -> {
+              input.setRetryableCodes(unaryMethodRetryableCodes);
+              return null;
+            });
+    // Add default retryable codes for streaming methods
+    Set<Code> streamingMethodRetryableCodes = new HashSet<>(retryableCodes);
+    streamingMethodRetryableCodes.addAll(
+        builder.getSpannerStubSettingsBuilder().executeStreamingSqlSettings().getRetryableCodes());
+    builder
+        .getSpannerStubSettingsBuilder()
+        .executeStreamingSqlSettings()
+        .setRetryableCodes(streamingMethodRetryableCodes);
+    builder
+        .getSpannerStubSettingsBuilder()
+        .streamingReadSettings()
+        .setRetryableCodes(streamingMethodRetryableCodes);
 
     // Set commit retry settings
     UnaryCallSettings.Builder<CommitRequest, CommitResponse> commitSettings =
@@ -135,10 +153,12 @@ public class SpannerAccessor implements AutoCloseable {
           commitSettings.getRetrySettings().toBuilder();
       commitSettings.setRetrySettings(
           commitRetrySettingsBuilder
-              .setTotalTimeout(org.threeten.bp.Duration.ofMillis(commitDeadline.get().getMillis()))
-              .setMaxRpcTimeout(org.threeten.bp.Duration.ofMillis(commitDeadline.get().getMillis()))
-              .setInitialRpcTimeout(
-                  org.threeten.bp.Duration.ofMillis(commitDeadline.get().getMillis()))
+              .setTotalTimeoutDuration(
+                  java.time.Duration.ofMillis(commitDeadline.get().getMillis()))
+              .setMaxRpcTimeoutDuration(
+                  java.time.Duration.ofMillis(commitDeadline.get().getMillis()))
+              .setInitialRpcTimeoutDuration(
+                  java.time.Duration.ofMillis(commitDeadline.get().getMillis()))
               .build());
     }
 
@@ -156,10 +176,38 @@ public class SpannerAccessor implements AutoCloseable {
           executeStreamingSqlSettings.getRetrySettings().toBuilder();
       executeStreamingSqlSettings.setRetrySettings(
           executeSqlStreamingRetrySettings
-              .setInitialRpcTimeout(org.threeten.bp.Duration.ofMinutes(120))
-              .setMaxRpcTimeout(org.threeten.bp.Duration.ofMinutes(120))
-              .setTotalTimeout(org.threeten.bp.Duration.ofMinutes(120))
+              .setInitialRpcTimeoutDuration(java.time.Duration.ofHours(2))
+              .setMaxRpcTimeoutDuration(java.time.Duration.ofHours(2))
+              .setTotalTimeoutDuration(java.time.Duration.ofHours(2))
+              .setRpcTimeoutMultiplier(1.0)
+              .setInitialRetryDelayDuration(java.time.Duration.ofSeconds(2))
+              .setMaxRetryDelayDuration(java.time.Duration.ofSeconds(60))
+              .setRetryDelayMultiplier(1.5)
+              .setMaxAttempts(100)
               .build());
+      // This property sets the default timeout between 2 response packets in the client library.
+      System.setProperty("com.google.cloud.spanner.watchdogTimeoutSeconds", "7200");
+    }
+
+    SpannerStubSettings.Builder spannerStubSettingsBuilder =
+        builder.getSpannerStubSettingsBuilder();
+    ValueProvider<Duration> partitionQueryTimeout = spannerConfig.getPartitionQueryTimeout();
+    if (partitionQueryTimeout != null
+        && partitionQueryTimeout.get() != null
+        && partitionQueryTimeout.get().getMillis() > 0) {
+      spannerStubSettingsBuilder
+          .partitionQuerySettings()
+          .setSimpleTimeoutNoRetries(
+              org.threeten.bp.Duration.ofMillis(partitionQueryTimeout.get().getMillis()));
+    }
+    ValueProvider<Duration> partitionReadTimeout = spannerConfig.getPartitionReadTimeout();
+    if (partitionReadTimeout != null
+        && partitionReadTimeout.get() != null
+        && partitionReadTimeout.get().getMillis() > 0) {
+      spannerStubSettingsBuilder
+          .partitionReadSettings()
+          .setSimpleTimeoutNoRetries(
+              org.threeten.bp.Duration.ofMillis(partitionReadTimeout.get().getMillis()));
     }
 
     ValueProvider<String> projectId = spannerConfig.getProjectId();
@@ -170,10 +218,7 @@ public class SpannerAccessor implements AutoCloseable {
     if (serviceFactory != null) {
       builder.setServiceFactory(serviceFactory);
     }
-    ValueProvider<String> host = spannerConfig.getHost();
-    if (host != null) {
-      builder.setHost(host.get());
-    }
+    builder.setHost(spannerConfig.getHostValue());
     ValueProvider<String> emulatorHost = spannerConfig.getEmulatorHost();
     if (emulatorHost != null) {
       builder.setEmulatorHost(emulatorHost.get());
@@ -185,8 +230,20 @@ public class SpannerAccessor implements AutoCloseable {
     }
     String userAgentString = USER_AGENT_PREFIX + "/" + ReleaseInfo.getReleaseInfo().getVersion();
     builder.setHeaderProvider(FixedHeaderProvider.create("user-agent", userAgentString));
-    SpannerOptions options = builder.build();
+    ValueProvider<String> databaseRole = spannerConfig.getDatabaseRole();
+    if (databaseRole != null && databaseRole.get() != null && !databaseRole.get().isEmpty()) {
+      builder.setDatabaseRole(databaseRole.get());
+    }
+    ValueProvider<Credentials> credentials = spannerConfig.getCredentials();
+    if (credentials != null && credentials.get() != null) {
+      builder.setCredentials(credentials.get());
+    }
 
+    return builder.build();
+  }
+
+  private static SpannerAccessor createAndConnect(SpannerConfig spannerConfig) {
+    SpannerOptions options = buildSpannerOptions(spannerConfig);
     Spanner spanner = options.getService();
     String instanceId = spannerConfig.getInstanceId().get();
     String databaseId = spannerConfig.getDatabaseId().get();
@@ -195,9 +252,24 @@ public class SpannerAccessor implements AutoCloseable {
     BatchClient batchClient =
         spanner.getBatchClient(DatabaseId.of(options.getProjectId(), instanceId, databaseId));
     DatabaseAdminClient databaseAdminClient = spanner.getDatabaseAdminClient();
+    String instanceConfigId = "unknown";
+    try {
+      instanceConfigId =
+          spanner
+              .getInstanceAdminClient()
+              .getInstance(instanceId)
+              .getInstanceConfigId()
+              .getInstanceConfig();
+    } catch (Exception e) {
+      // fetch instanceConfigId is fail-free.
+      // Do not emit warning when serviceFactory is overridden (e.g. in tests).
+      if (spannerConfig.getServiceFactory() == null) {
+        LOG.warn("unable to get Spanner instanceConfigId for {}: {}", instanceId, e.getMessage());
+      }
+    }
 
     return new SpannerAccessor(
-        spanner, databaseClient, databaseAdminClient, batchClient, spannerConfig);
+        spanner, databaseClient, databaseAdminClient, batchClient, spannerConfig, instanceConfigId);
   }
 
   public DatabaseClient getDatabaseClient() {
@@ -212,21 +284,20 @@ public class SpannerAccessor implements AutoCloseable {
     return databaseAdminClient;
   }
 
+  public String getInstanceConfigId() {
+    return instanceConfigId;
+  }
+
   @Override
   public void close() {
     // Only close Spanner when present in map and refcount == 0
-    int refcount = refcounts.getOrDefault(spannerConfig, new AtomicInteger(0)).decrementAndGet();
-    LOG.debug("close(): refcount={} for {}", refcount, spannerConfig);
-
-    if (refcount == 0) {
-      synchronized (spannerAccessors) {
-        // Re-check refcount in case it has increased outside the lock.
-        if (refcounts.get(spannerConfig).get() <= 0) {
-          spannerAccessors.remove(spannerConfig);
-          refcounts.remove(spannerConfig);
-          LOG.info("Closing {} ", spannerConfig);
-          spanner.close();
-        }
+    synchronized (spannerAccessors) {
+      refcount--;
+      LOG.debug("close(): refcount={} for {}", refcount, spannerConfig);
+      if (refcount <= 0) {
+        spannerAccessors.remove(spannerConfig);
+        LOG.info("Closing {} ", spannerConfig);
+        spanner.close();
       }
     }
   }

@@ -19,12 +19,18 @@ package org.apache.beam.sdk.extensions.sql.meta.provider.kafka;
 
 import static org.apache.beam.sdk.extensions.sql.meta.provider.kafka.Schemas.PAYLOAD_FIELD;
 import static org.apache.beam.sdk.util.Preconditions.checkArgumentNotNull;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
-import com.alibaba.fastjson.JSONObject;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.auto.service.AutoService;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map.Entry;
 import java.util.Optional;
+import org.apache.beam.sdk.extensions.sql.TableUtils;
 import org.apache.beam.sdk.extensions.sql.meta.BeamSqlTable;
 import org.apache.beam.sdk.extensions.sql.meta.Table;
 import org.apache.beam.sdk.extensions.sql.meta.provider.InMemoryMetaTableProvider;
@@ -32,10 +38,10 @@ import org.apache.beam.sdk.extensions.sql.meta.provider.TableProvider;
 import org.apache.beam.sdk.schemas.Schema;
 import org.apache.beam.sdk.schemas.io.payloads.PayloadSerializer;
 import org.apache.beam.sdk.schemas.io.payloads.PayloadSerializers;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Splitter;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Strings;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Splitter;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Strings;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
@@ -80,11 +86,11 @@ public class KafkaTableProvider extends InMemoryMetaTableProvider {
     return parsed;
   }
 
-  private static List<String> mergeParam(Optional<String> initial, @Nullable List<Object> toMerge) {
+  private static List<String> mergeParam(Optional<String> initial, @Nullable ArrayNode toMerge) {
     ImmutableList.Builder<String> merged = ImmutableList.builder();
     initial.ifPresent(merged::add);
     if (toMerge != null) {
-      toMerge.forEach(o -> merged.add(o.toString()));
+      toMerge.forEach(o -> merged.add(o.asText()));
     }
     return merged.build();
   }
@@ -92,24 +98,26 @@ public class KafkaTableProvider extends InMemoryMetaTableProvider {
   @Override
   public BeamSqlTable buildBeamSqlTable(Table table) {
     Schema schema = table.getSchema();
-    JSONObject properties = table.getProperties();
+    ObjectNode properties = table.getProperties();
 
     Optional<ParsedLocation> parsedLocation = Optional.empty();
     if (!Strings.isNullOrEmpty(table.getLocation())) {
       parsedLocation = Optional.of(parseLocation(checkArgumentNotNull(table.getLocation())));
     }
     List<String> topics =
-        mergeParam(parsedLocation.map(loc -> loc.topic), properties.getJSONArray("topics"));
+        mergeParam(parsedLocation.map(loc -> loc.topic), (ArrayNode) properties.get("topics"));
     List<String> allBootstrapServers =
         mergeParam(
             parsedLocation.map(loc -> loc.brokerLocation),
-            properties.getJSONArray("bootstrap_servers"));
+            (ArrayNode) properties.get("bootstrap_servers"));
     String bootstrapServers = String.join(",", allBootstrapServers);
 
     Optional<String> payloadFormat =
-        properties.containsKey("format")
-            ? Optional.of(properties.getString("format"))
+        properties.has("format")
+            ? Optional.of(properties.get("format").asText())
             : Optional.empty();
+
+    BeamKafkaTable kafkaTable = null;
     if (Schemas.isNestedSchema(schema)) {
       Optional<PayloadSerializer> serializer =
           payloadFormat.map(
@@ -117,8 +125,8 @@ public class KafkaTableProvider extends InMemoryMetaTableProvider {
                   PayloadSerializers.getSerializer(
                       format,
                       checkArgumentNotNull(schema.getField(PAYLOAD_FIELD).getType().getRowSchema()),
-                      properties.getInnerMap()));
-      return new NestedPayloadKafkaTable(schema, bootstrapServers, topics, serializer);
+                      TableUtils.convertNode2Map(properties)));
+      kafkaTable = new NestedPayloadKafkaTable(schema, bootstrapServers, topics, serializer);
     } else {
       /*
        * CSV is handled separately because multiple rows can be produced from a single message, which
@@ -127,12 +135,30 @@ public class KafkaTableProvider extends InMemoryMetaTableProvider {
        * rows.
        */
       if (payloadFormat.orElse("csv").equals("csv")) {
-        return new BeamKafkaCSVTable(schema, bootstrapServers, topics);
+        kafkaTable = new BeamKafkaCSVTable(schema, bootstrapServers, topics);
+      } else {
+        PayloadSerializer serializer =
+            PayloadSerializers.getSerializer(
+                payloadFormat.get(), schema, TableUtils.convertNode2Map(properties));
+        kafkaTable = new PayloadSerializerKafkaTable(schema, bootstrapServers, topics, serializer);
       }
-      PayloadSerializer serializer =
-          PayloadSerializers.getSerializer(payloadFormat.get(), schema, properties.getInnerMap());
-      return new PayloadSerializerKafkaTable(schema, bootstrapServers, topics, serializer);
     }
+
+    // Get Consumer Properties from Table properties
+    HashMap<String, Object> configUpdates = new HashMap<String, Object>();
+    Iterator<Entry<String, JsonNode>> tableProperties = properties.fields();
+    while (tableProperties.hasNext()) {
+      Entry<String, JsonNode> field = tableProperties.next();
+      if (field.getKey().startsWith("properties.")) {
+        configUpdates.put(field.getKey().replace("properties.", ""), field.getValue().textValue());
+      }
+    }
+
+    if (!configUpdates.isEmpty()) {
+      kafkaTable.updateConsumerProperties(configUpdates);
+    }
+
+    return kafkaTable;
   }
 
   @Override

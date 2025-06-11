@@ -75,20 +75,31 @@ async function processPrComment(
   const commentContents = payload.comment.body;
   const commentAuthor = payload.sender.login;
   const pullAuthor = getPullAuthorFromPayload(payload);
+  console.log(commentContents);
+  const processedCommand = await processCommand(
+    payload,
+    commentAuthor,
+    commentContents,
+    stateClient,
+    reviewerConfig
+  );
+
+  // Check to see if notifications have been stopped before processing further.
+  // Notifications can be stopped by an "R: reviewer" comment,
+  // and then restarted by adding "assign set of reviewers" comment.
+  if (
+    (await stateClient.getPrState(getPullNumberFromPayload(payload)))
+      .stopReviewerNotifications
+  ) {
+    console.log("Notifications have been paused for this pull - skipping");
+    return;
+  }
+
   // If there's been a comment by a non-author, we can remove the slow review label
   if (commentAuthor !== pullAuthor && commentAuthor !== BOT_NAME) {
     await removeSlowReviewLabel(payload);
   }
-  console.log(commentContents);
-  if (
-    await processCommand(
-      payload,
-      commentAuthor,
-      commentContents,
-      stateClient,
-      reviewerConfig
-    )
-  ) {
+  if (processedCommand) {
     // If we've processed a command, don't worry about trying to change the attention set.
     // This is not a meaningful push or comment from the author.
     console.log("Processed command");
@@ -141,11 +152,6 @@ async function processPrUpdate() {
   const pullNumber = getPullNumberFromPayload(payload);
 
   const stateClient = new PersistentState();
-  const prState = await stateClient.getPrState(pullNumber);
-  if (prState.stopReviewerNotifications) {
-    console.log("Notifications have been paused for this pull - skipping");
-    return;
-  }
 
   switch (github.context.eventName) {
     case "issue_comment":
@@ -157,6 +163,12 @@ async function processPrUpdate() {
       await processPrComment(payload, stateClient, reviewerConfig);
       break;
     case "pull_request_target":
+      if (
+        (await stateClient.getPrState(pullNumber)).stopReviewerNotifications
+      ) {
+        console.log("Notifications have been paused for this pull - skipping");
+        return;
+      }
       if (payload.action === "synchronize") {
         console.log("Processing synchronize action");
         await setNextActionReviewers(payload, stateClient);

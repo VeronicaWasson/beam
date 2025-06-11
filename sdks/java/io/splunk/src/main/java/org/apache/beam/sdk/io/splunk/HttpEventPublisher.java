@@ -17,13 +17,16 @@
  */
 package org.apache.beam.sdk.io.splunk;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.api.client.http.ByteArrayContent;
+import com.google.api.client.http.GZipEncoding;
 import com.google.api.client.http.GenericUrl;
+import com.google.api.client.http.HttpBackOffIOExceptionHandler;
 import com.google.api.client.http.HttpBackOffUnsuccessfulResponseHandler;
 import com.google.api.client.http.HttpBackOffUnsuccessfulResponseHandler.BackOffRequired;
 import com.google.api.client.http.HttpContent;
+import com.google.api.client.http.HttpIOExceptionHandler;
 import com.google.api.client.http.HttpMediaType;
 import com.google.api.client.http.HttpRequest;
 import com.google.api.client.http.HttpRequestFactory;
@@ -33,16 +36,23 @@ import com.google.api.client.util.ExponentialBackOff;
 import com.google.auto.value.AutoValue;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
 import java.security.KeyManagementException;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 import java.util.List;
 import javax.net.ssl.HostnameVerifier;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Joiner;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Joiner;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.apache.http.client.config.CookieSpecs;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.conn.ssl.DefaultHostnameVerifier;
@@ -102,7 +112,12 @@ abstract class HttpEventPublisher {
 
   abstract @Nullable Integer maxElapsedMillis();
 
+  @SuppressWarnings("mutable")
+  abstract byte @Nullable [] rootCaCertificate();
+
   abstract Boolean disableCertificateValidation();
+
+  abstract Boolean enableGzipHttpCompression();
 
   /**
    * Executes a POST for the list of {@link SplunkEvent} objects into Splunk's Http Event Collector
@@ -116,12 +131,19 @@ abstract class HttpEventPublisher {
     HttpContent content = getContent(events);
     HttpRequest request = requestFactory().buildPostRequest(genericUrl(), content);
 
+    if (enableGzipHttpCompression()) {
+      request.setEncoding(new GZipEncoding());
+    }
+
     HttpBackOffUnsuccessfulResponseHandler responseHandler =
         new HttpBackOffUnsuccessfulResponseHandler(getConfiguredBackOff());
 
     responseHandler.setBackOffRequired(BackOffRequired.ON_SERVER_ERROR);
 
     request.setUnsuccessfulResponseHandler(responseHandler);
+    HttpIOExceptionHandler ioExceptionHandler =
+        new HttpBackOffIOExceptionHandler(getConfiguredBackOff());
+    request.setIOExceptionHandler(ioExceptionHandler);
     setHeaders(request, token());
 
     return request.execute();
@@ -163,6 +185,10 @@ abstract class HttpEventPublisher {
    */
   private void setHeaders(HttpRequest request, String token) {
     request.getHeaders().setAuthorization(String.format(AUTHORIZATION_SCHEME, token));
+
+    if (enableGzipHttpCompression()) {
+      request.getHeaders().setContentEncoding("gzip");
+    }
   }
 
   /**
@@ -208,6 +234,12 @@ abstract class HttpEventPublisher {
 
     abstract Boolean disableCertificateValidation();
 
+    abstract Builder setRootCaCertificate(byte[] certificate);
+
+    abstract byte[] rootCaCertificate();
+
+    abstract Builder setEnableGzipHttpCompression(Boolean enableGzipHttpCompression);
+
     abstract Builder setMaxElapsedMillis(Integer maxElapsedMillis);
 
     abstract Integer maxElapsedMillis();
@@ -251,6 +283,30 @@ abstract class HttpEventPublisher {
     }
 
     /**
+     * Method to set the root CA certificate.
+     *
+     * @param certificate User provided root CA certificate
+     * @return {@link Builder}
+     */
+    public Builder withRootCaCertificate(byte[] certificate) {
+      checkNotNull(certificate, "withRootCaCertificate(certificate) called with null input.");
+      return setRootCaCertificate(certificate);
+    }
+
+    /**
+     * Method to specify if HTTP requests sent to Splunk HEC should be GZIP encoded.
+     *
+     * @param enableGzipHttpCompression whether to enable Gzip encoding.
+     * @return {@link Builder}
+     */
+    public Builder withEnableGzipHttpCompression(Boolean enableGzipHttpCompression) {
+      checkNotNull(
+          enableGzipHttpCompression,
+          "withEnableGzipHttpCompression(enableGzipHttpCompression) called with null input.");
+      return setEnableGzipHttpCompression(enableGzipHttpCompression);
+    }
+
+    /**
      * Method to max timeout for {@link ExponentialBackOff}. Otherwise uses the default setting for
      * {@link ExponentialBackOff}.
      *
@@ -269,7 +325,8 @@ abstract class HttpEventPublisher {
      * @return {@link HttpEventPublisher}
      */
     HttpEventPublisher build()
-        throws NoSuchAlgorithmException, KeyStoreException, KeyManagementException {
+        throws NoSuchAlgorithmException, KeyStoreException, KeyManagementException, IOException,
+            CertificateException {
 
       checkNotNull(token(), "Authentication token needs to be specified via withToken(token).");
       checkNotNull(genericUrl(), "URL needs to be specified via withUrl(url).");
@@ -287,7 +344,8 @@ abstract class HttpEventPublisher {
       }
 
       CloseableHttpClient httpClient =
-          getHttpClient(DEFAULT_MAX_CONNECTIONS, disableCertificateValidation());
+          getHttpClient(
+              DEFAULT_MAX_CONNECTIONS, disableCertificateValidation(), rootCaCertificate());
 
       setTransport(new ApacheHttpTransport(httpClient));
       setRequestFactory(transport().createRequestFactory());
@@ -312,10 +370,12 @@ abstract class HttpEventPublisher {
      *
      * @param maxConnections max number of parallel connections
      * @param disableCertificateValidation should disable certificate validation
+     * @param rootCaCertificate root CA certificate
      */
     private CloseableHttpClient getHttpClient(
-        int maxConnections, boolean disableCertificateValidation)
-        throws NoSuchAlgorithmException, KeyStoreException, KeyManagementException {
+        int maxConnections, boolean disableCertificateValidation, byte[] rootCaCertificate)
+        throws NoSuchAlgorithmException, KeyStoreException, KeyManagementException, IOException,
+            CertificateException {
 
       HttpClientBuilder builder = ApacheHttpTransport.newDefaultHttpClientBuilder();
 
@@ -327,14 +387,24 @@ abstract class HttpEventPublisher {
                 ? NoopHostnameVerifier.INSTANCE
                 : new DefaultHostnameVerifier();
 
-        SSLContextBuilder sslContextBuilder = SSLContextBuilder.create();
+        SSLContext sslContext = SSLContextBuilder.create().build();
         if (disableCertificateValidation) {
           LOG.info("Certificate validation is disabled");
-          sslContextBuilder.loadTrustMaterial((TrustStrategy) (chain, authType) -> true);
+          sslContext =
+              SSLContextBuilder.create()
+                  .loadTrustMaterial((TrustStrategy) (chain, authType) -> true)
+                  .build();
+        } else if (rootCaCertificate != null) {
+          LOG.info("Self-Signed Certificate provided");
+          InputStream inStream = new ByteArrayInputStream(rootCaCertificate);
+          CertificateFactory cf = CertificateFactory.getInstance("X.509");
+          X509Certificate cert = (X509Certificate) cf.generateCertificate(inStream);
+          CustomX509TrustManager customTrustManager = new CustomX509TrustManager(cert);
+          sslContext.init(null, new TrustManager[] {customTrustManager}, null);
         }
 
         SSLConnectionSocketFactory connectionSocketFactory =
-            new SSLConnectionSocketFactory(sslContextBuilder.build(), hostnameVerifier);
+            new SSLConnectionSocketFactory(sslContext, hostnameVerifier);
         builder.setSSLSocketFactory(connectionSocketFactory);
       }
 

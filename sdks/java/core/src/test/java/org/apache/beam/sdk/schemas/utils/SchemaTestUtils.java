@@ -32,8 +32,8 @@ import org.apache.beam.sdk.schemas.Schema.Field;
 import org.apache.beam.sdk.schemas.Schema.FieldType;
 import org.apache.beam.sdk.schemas.Schema.TypeName;
 import org.apache.beam.sdk.values.Row;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
 import org.hamcrest.BaseMatcher;
 import org.hamcrest.Description;
 import org.hamcrest.Matcher;
@@ -126,6 +126,8 @@ public class SchemaTestUtils {
             (Map<Object, Object>) expected,
             (Map<Object, Object>) actual,
             fieldType.getMapValueType());
+      } else if (fieldType.getTypeName() == TypeName.ROW) {
+        return rowsEquivalent((Row) expected, (Row) actual);
       } else {
         return Objects.equals(expected, actual);
       }

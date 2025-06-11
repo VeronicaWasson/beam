@@ -23,7 +23,7 @@ import org.apache.beam.sdk.coders.CoderProvider;
 import org.apache.beam.sdk.coders.CoderProviderRegistrar;
 import org.apache.beam.sdk.coders.CoderProviders;
 import org.apache.beam.sdk.values.TypeDescriptor;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 
 /** A {@link CoderProviderRegistrar} for standard types used with {@link PubsubIO}. */
 @AutoService(CoderProviderRegistrar.class)
@@ -37,6 +37,9 @@ public class PubsubCoderProviderRegistrar implements CoderProviderRegistrar {
             TypeDescriptor.of(PubsubMessage.class), PubsubMessageWithMessageIdCoder.of()),
         CoderProviders.forCoder(
             TypeDescriptor.of(PubsubMessage.class),
-            PubsubMessageWithAttributesAndMessageIdCoder.of()));
+            PubsubMessageWithAttributesAndMessageIdCoder.of()),
+        CoderProviders.forCoder(
+            TypeDescriptor.of(PubsubMessage.class),
+            PubsubMessageWithAttributesAndMessageIdAndOrderingKeyCoder.of()));
   }
 }

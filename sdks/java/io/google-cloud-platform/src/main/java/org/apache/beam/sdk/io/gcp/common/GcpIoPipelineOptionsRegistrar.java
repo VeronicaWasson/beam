@@ -20,10 +20,13 @@ package org.apache.beam.sdk.io.gcp.common;
 import com.google.auto.service.AutoService;
 import org.apache.beam.sdk.annotations.Internal;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryOptions;
+import org.apache.beam.sdk.io.gcp.bigquery.TestBigQueryOptions;
+import org.apache.beam.sdk.io.gcp.bigtable.changestreams.BigtableChangeStreamTestOptions;
+import org.apache.beam.sdk.io.gcp.firestore.FirestoreOptions;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubOptions;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsRegistrar;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 
 /** A registrar containing the default GCP options. */
 @AutoService(PipelineOptionsRegistrar.class)
@@ -34,6 +37,9 @@ public class GcpIoPipelineOptionsRegistrar implements PipelineOptionsRegistrar {
     return ImmutableList.<Class<? extends PipelineOptions>>builder()
         .add(BigQueryOptions.class)
         .add(PubsubOptions.class)
+        .add(FirestoreOptions.class)
+        .add(TestBigQueryOptions.class)
+        .add(BigtableChangeStreamTestOptions.class)
         .build();
   }
 }

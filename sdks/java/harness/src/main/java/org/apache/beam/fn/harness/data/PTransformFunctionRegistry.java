@@ -17,29 +17,26 @@
  */
 package org.apache.beam.fn.harness.data;
 
-import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.beam.fn.harness.control.ExecutionStateSampler.ExecutionState;
 import org.apache.beam.fn.harness.control.ExecutionStateSampler.ExecutionStateTracker;
 import org.apache.beam.model.pipeline.v1.MetricsApi.MonitoringInfo;
-import org.apache.beam.runners.core.metrics.MetricsContainerImpl;
-import org.apache.beam.runners.core.metrics.MetricsContainerStepMap;
 import org.apache.beam.runners.core.metrics.MonitoringInfoConstants;
 import org.apache.beam.runners.core.metrics.MonitoringInfoConstants.Urns;
 import org.apache.beam.runners.core.metrics.ShortIdMap;
 import org.apache.beam.runners.core.metrics.SimpleMonitoringInfoBuilder;
 import org.apache.beam.sdk.function.ThrowingRunnable;
-import org.apache.beam.sdk.metrics.MetricsEnvironment;
 
 /**
- * A class to to register and retrieve functions for bundle processing (i.e. the start, or finish
+ * A class to register and retrieve functions for bundle processing (i.e. the start, or finish
  * function). The purpose of this class is to wrap these functions with instrumentation for metrics
  * and other telemetry collection.
  *
- * <p>Usage: // Instantiate and use the registry for each class of functions. i.e. start. finish.
+ * <p>Usage:
  *
  * <pre>
+ * // Instantiate and use the registry for each class of functions. i.e. start. finish.
  * PTransformFunctionRegistry startFunctionRegistry;
  * PTransformFunctionRegistry finishFunctionRegistry;
  * startFunctionRegistry.register(myStartThrowingRunnable);
@@ -58,7 +55,6 @@ import org.apache.beam.sdk.metrics.MetricsEnvironment;
  */
 public class PTransformFunctionRegistry {
 
-  private MetricsContainerStepMap metricsContainerRegistry;
   private final ExecutionStateTracker stateTracker;
   private final String executionStateUrn;
   private final ShortIdMap shortIds;
@@ -68,16 +64,12 @@ public class PTransformFunctionRegistry {
   /**
    * Construct the registry to run for either start or finish bundle functions.
    *
-   * @param metricsContainerRegistry - Used to enable a metric container to properly account for the
-   *     pTransform in user metrics.
+   * @param shortIds - Provides short ids for {@link MonitoringInfo}.
    * @param stateTracker - The tracker to enter states in order to calculate execution time metrics.
    * @param executionStateUrn - The URN for the execution state .
    */
   public PTransformFunctionRegistry(
-      MetricsContainerStepMap metricsContainerRegistry,
-      ShortIdMap shortIds,
-      ExecutionStateTracker stateTracker,
-      String executionStateUrn) {
+      ShortIdMap shortIds, ExecutionStateTracker stateTracker, String executionStateUrn) {
     switch (executionStateUrn) {
       case Urns.START_BUNDLE_MSECS:
         stateName = org.apache.beam.runners.core.metrics.ExecutionStateTracker.START_STATE_NAME;
@@ -88,7 +80,6 @@ public class PTransformFunctionRegistry {
       default:
         throw new IllegalArgumentException(String.format("Unknown URN %s", executionStateUrn));
     }
-    this.metricsContainerRegistry = metricsContainerRegistry;
     this.shortIds = shortIds;
     this.executionStateUrn = executionStateUrn;
     this.stateTracker = stateTracker;
@@ -118,17 +109,13 @@ public class PTransformFunctionRegistry {
     ExecutionState executionState =
         stateTracker.create(shortId, pTransformId, pTransformUniqueName, stateName);
 
-    MetricsContainerImpl container = metricsContainerRegistry.getContainer(pTransformId);
-
     ThrowingRunnable wrapped =
         () -> {
-          try (Closeable metricCloseable = MetricsEnvironment.scopedMetricsContainer(container)) {
-            executionState.activate();
-            try {
-              runnable.run();
-            } finally {
-              executionState.deactivate();
-            }
+          executionState.activate();
+          try {
+            runnable.run();
+          } finally {
+            executionState.deactivate();
           }
         };
     runnables.add(wrapped);

@@ -18,7 +18,7 @@
 package org.apache.beam.sdk.io.gcp.bigquery;
 
 import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryResourceNaming.createTempTableReference;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import com.google.api.services.bigquery.model.EncryptionConfiguration;
 import com.google.api.services.bigquery.model.Job;
@@ -92,6 +92,7 @@ class BigQueryQueryHelper {
       QueryPriority priority,
       @Nullable String location,
       @Nullable String queryTempDatasetId,
+      @Nullable String queryTempProjectId,
       @Nullable String kmsKey)
       throws InterruptedException, IOException {
     // Step 1: Find the effective location of the query.
@@ -119,17 +120,24 @@ class BigQueryQueryHelper {
       }
 
       // Step 2: Create a temporary dataset in the query location only if the user has not specified
-      // a temp dataset.
-      String queryJobId =
+      // a temp dataset. The temp table name may be deterministic but the query job ID has to be
+      // non-deterministic to protect against retries. If BigQuery sees a repeated query job ID, it
+      // will be skipped.
+      String tempTableID =
           BigQueryResourceNaming.createJobIdPrefix(options.getJobName(), stepUuid, JobType.QUERY);
+      String queryJobId =
+          BigQueryResourceNaming.createJobIdPrefix(
+              options.getJobName(), stepUuid, JobType.QUERY, BigQueryHelpers.randomUUIDString());
       Optional<String> queryTempDatasetOpt = Optional.ofNullable(queryTempDatasetId);
+      String project = queryTempProjectId;
+      if (project == null) {
+        project =
+            options.getBigQueryProject() == null
+                ? options.getProject()
+                : options.getBigQueryProject();
+      }
       TableReference queryResultTable =
-          createTempTableReference(
-              options.getBigQueryProject() == null
-                  ? options.getProject()
-                  : options.getBigQueryProject(),
-              queryJobId,
-              queryTempDatasetOpt);
+          createTempTableReference(project, tempTableID, queryTempDatasetOpt);
 
       boolean beamToCreateTempDataset = !queryTempDatasetOpt.isPresent();
       // Create dataset only if it has not been set by the user
@@ -148,7 +156,7 @@ class BigQueryQueryHelper {
         Table destTable = tableService.getTable(queryResultTable);
         checkArgument(
             destTable == null,
-            "Refusing to write on existing table {} in the specified temp dataset {}",
+            "Refusing to write on existing table %s in the specified temp dataset %s",
             queryResultTable.getTableId(),
             queryResultTable.getDatasetId());
       }

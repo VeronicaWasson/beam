@@ -20,14 +20,17 @@ package org.apache.beam.runners.flink.translation.wrappers;
 import java.io.IOException;
 import java.util.List;
 import org.apache.beam.runners.core.construction.SerializablePipelineOptions;
+import org.apache.beam.runners.flink.FlinkPipelineOptions;
 import org.apache.beam.runners.flink.metrics.FlinkMetricContainer;
 import org.apache.beam.runners.flink.metrics.ReaderInvocationUtil;
 import org.apache.beam.sdk.io.BoundedSource;
+import org.apache.beam.sdk.io.FileBasedSource;
 import org.apache.beam.sdk.io.Source;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.transforms.windowing.GlobalWindow;
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
 import org.apache.flink.api.common.io.DefaultInputSplitAssigner;
 import org.apache.flink.api.common.io.InputFormat;
 import org.apache.flink.api.common.io.RichInputFormat;
@@ -108,12 +111,30 @@ public class SourceInputFormat<T> extends RichInputFormat<WindowedValue<T>, Sour
     return null;
   }
 
+  private long getDesiredSizeBytes(int numSplits) throws Exception {
+    long totalSize = initialSource.getEstimatedSizeBytes(options);
+    long defaultSplitSize = totalSize / numSplits;
+    long maxSplitSize = 0;
+    if (options != null) {
+      maxSplitSize = options.as(FlinkPipelineOptions.class).getFileInputSplitMaxSizeMB();
+    }
+    if (initialSource instanceof FileBasedSource && maxSplitSize > 0) {
+      // Most of the time parallelism is < number of files in source.
+      // Each file becomes a unique split which commonly create skew.
+      // This limits the size of splits to reduce skew.
+      return Math.min(defaultSplitSize, maxSplitSize * 1024 * 1024);
+    } else {
+      return defaultSplitSize;
+    }
+  }
+
   @Override
   @SuppressWarnings("unchecked")
   public SourceInputSplit<T>[] createInputSplits(int numSplits) throws IOException {
     try {
-      long desiredSizeBytes = initialSource.getEstimatedSizeBytes(options) / numSplits;
+      long desiredSizeBytes = getDesiredSizeBytes(numSplits);
       List<? extends Source<T>> shards = initialSource.split(desiredSizeBytes, options);
+
       int numShards = shards.size();
       SourceInputSplit<T>[] sourceInputSplits = new SourceInputSplit[numShards];
       for (int i = 0; i < numShards; i++) {
@@ -142,7 +163,7 @@ public class SourceInputFormat<T> extends RichInputFormat<WindowedValue<T>, Sour
       final Instant timestamp = reader.getCurrentTimestamp();
       // advance reader to have a record ready next time
       inputAvailable = readerInvoker.invokeAdvance(reader);
-      return WindowedValue.of(current, timestamp, GlobalWindow.INSTANCE, PaneInfo.NO_FIRING);
+      return WindowedValues.of(current, timestamp, GlobalWindow.INSTANCE, PaneInfo.NO_FIRING);
     }
 
     return null;

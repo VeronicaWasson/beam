@@ -18,7 +18,7 @@
 package org.apache.beam.runners.spark.structuredstreaming.metrics;
 
 import static org.apache.beam.runners.core.metrics.MetricsContainerStepMap.asAttemptedOnlyMetricResults;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Predicates.not;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Predicates.not;
 
 import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Metric;
@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
+import org.apache.beam.runners.core.metrics.MetricsContainerStepMap;
 import org.apache.beam.sdk.metrics.DistributionResult;
 import org.apache.beam.sdk.metrics.GaugeResult;
 import org.apache.beam.sdk.metrics.MetricKey;
@@ -35,22 +36,27 @@ import org.apache.beam.sdk.metrics.MetricName;
 import org.apache.beam.sdk.metrics.MetricQueryResults;
 import org.apache.beam.sdk.metrics.MetricResult;
 import org.apache.beam.sdk.metrics.MetricResults;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Strings;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Streams;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Strings;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Streams;
 
 /**
- * An adapter between the {@link SparkMetricsContainerStepMap} and the Dropwizard {@link Metric}
+ * An adapter between the {@link MetricsContainerStepMap} and the Dropwizard {@link Metric}
  * interface.
  */
 class SparkBeamMetric extends BeamMetricSet {
 
   private static final String ILLEGAL_CHARACTERS = "[^A-Za-z0-9-]";
 
+  private final MetricsAccumulator metrics;
+
+  SparkBeamMetric(MetricsAccumulator metrics) {
+    this.metrics = metrics;
+  }
+
   @Override
   public Map<String, Gauge<Double>> getValue(String prefix, MetricFilter filter) {
-    MetricResults metricResults =
-        asAttemptedOnlyMetricResults(MetricsAccumulator.getInstance().value());
+    MetricResults metricResults = asAttemptedOnlyMetricResults(metrics.value());
     Map<String, Gauge<Double>> metrics = new HashMap<>();
     MetricQueryResults allMetrics = metricResults.allMetrics();
     for (MetricResult<Long> metricResult : allMetrics.getCounters()) {

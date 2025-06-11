@@ -19,15 +19,6 @@
 
 # pytype: skip-file
 
-# beam-playground:
-#   name: StreamingWordCountITTest
-#   description: Unit-test for the streaming WordCount example.
-#   multifile: false
-#   context_line: 45
-#   categories:
-#     - Streaming
-#     - IO
-
 import logging
 import unittest
 import uuid
@@ -48,7 +39,7 @@ INPUT_SUB = 'wc_subscription_input'
 OUTPUT_SUB = 'wc_subscription_output'
 
 DEFAULT_INPUT_NUMBERS = 500
-WAIT_UNTIL_FINISH_DURATION = 6 * 60 * 1000  # in milliseconds
+WAIT_UNTIL_FINISH_DURATION = 20 * 60 * 1000  # in milliseconds
 
 
 class StreamingWordCountIT(unittest.TestCase):

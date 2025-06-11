@@ -21,15 +21,18 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
-import com.alibaba.fastjson.JSONArray;
-import com.alibaba.fastjson.JSONObject;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.util.List;
+import java.util.Map;
 import org.apache.beam.sdk.extensions.protobuf.PayloadMessages;
+import org.apache.beam.sdk.extensions.sql.TableUtils;
 import org.apache.beam.sdk.extensions.sql.meta.BeamSqlTable;
 import org.apache.beam.sdk.extensions.sql.meta.Table;
 import org.apache.beam.sdk.io.thrift.payloads.SimpleThriftMessage;
 import org.apache.beam.sdk.schemas.Schema;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.apache.thrift.TBase;
 import org.apache.thrift.protocol.TCompactProtocol;
 import org.apache.thrift.protocol.TProtocolFactory;
@@ -81,6 +84,32 @@ public class KafkaTableProviderTest {
     BeamKafkaCSVTable kafkaTable = (BeamKafkaCSVTable) sqlTable;
     assertEquals(LOCATION_BROKER, kafkaTable.getBootstrapServers());
     assertEquals(ImmutableList.of(LOCATION_TOPIC, "topic2", "topic3"), kafkaTable.getTopics());
+  }
+
+  @Test
+  public void testBuildWithExtraProperties() {
+    Table table =
+        mockTableWithExtraProperties(
+            "hello",
+            ImmutableMap.of(
+                "properties.ssl.truststore.location",
+                "/path/to/kafka.client.truststore.jks",
+                "properties.security.protocol",
+                "SASL_SSL"));
+    BeamSqlTable sqlTable = provider.buildBeamSqlTable(table);
+
+    assertNotNull(sqlTable);
+    assertTrue(sqlTable instanceof BeamKafkaCSVTable);
+
+    BeamKafkaCSVTable kafkaTable = (BeamKafkaCSVTable) sqlTable;
+    assertEquals(LOCATION_BROKER, kafkaTable.getBootstrapServers());
+    assertEquals(
+        ImmutableMap.of(
+            "ssl.truststore.location",
+            "/path/to/kafka.client.truststore.jks",
+            "security.protocol",
+            "SASL_SSL"),
+        kafkaTable.getConfigUpdates());
   }
 
   @Test
@@ -156,23 +185,28 @@ public class KafkaTableProviderTest {
   }
 
   private static Table mockTable(String name) {
-    return mockTable(name, false, null, null, null, null, null, null);
+    return mockTable(name, false, null, null, null, null, null, null, null);
   }
 
   private static Table mockTableWithExtraServers(String name, List<String> extraBootstrapServers) {
-    return mockTable(name, false, extraBootstrapServers, null, null, null, null, null);
+    return mockTable(name, false, extraBootstrapServers, null, null, null, null, null, null);
   }
 
   private static Table mockTableWithExtraTopics(String name, List<String> extraTopics) {
-    return mockTable(name, false, null, extraTopics, null, null, null, null);
+    return mockTable(name, false, null, extraTopics, null, null, null, null, null);
+  }
+
+  private static Table mockTableWithExtraProperties(
+      String name, Map<String, String> extraProperties) {
+    return mockTable(name, false, null, null, extraProperties, null, null, null, null);
   }
 
   private static Table mockTable(String name, String payloadFormat) {
-    return mockTable(name, false, null, null, payloadFormat, null, null, null);
+    return mockTable(name, false, null, null, null, payloadFormat, null, null, null);
   }
 
   private static Table mockProtoTable(String name, Class<?> protoClass) {
-    return mockTable(name, false, null, null, "proto", protoClass, null, null);
+    return mockTable(name, false, null, null, null, "proto", protoClass, null, null);
   }
 
   private static Table mockThriftTable(
@@ -180,11 +214,11 @@ public class KafkaTableProviderTest {
       Class<? extends TBase<?, ?>> thriftClass,
       Class<? extends TProtocolFactory> thriftProtocolFactoryClass) {
     return mockTable(
-        name, false, null, null, "thrift", null, thriftClass, thriftProtocolFactoryClass);
+        name, false, null, null, null, "thrift", null, thriftClass, thriftProtocolFactoryClass);
   }
 
   private static Table mockNestedBytesTable(String name) {
-    return mockTable(name, true, null, null, null, null, null, null);
+    return mockTable(name, true, null, null, null, null, null, null, null);
   }
 
   private static Table mockNestedThriftTable(
@@ -192,7 +226,7 @@ public class KafkaTableProviderTest {
       Class<? extends TBase<?, ?>> thriftClass,
       Class<? extends TProtocolFactory> thriftProtocolFactoryClass) {
     return mockTable(
-        name, true, null, null, "thrift", null, thriftClass, thriftProtocolFactoryClass);
+        name, true, null, null, null, "thrift", null, thriftClass, thriftProtocolFactoryClass);
   }
 
   private static Table mockTable(
@@ -200,21 +234,32 @@ public class KafkaTableProviderTest {
       boolean isNested,
       @Nullable List<String> extraBootstrapServers,
       @Nullable List<String> extraTopics,
+      @Nullable Map<String, String> extraProperties,
       @Nullable String payloadFormat,
       @Nullable Class<?> protoClass,
       @Nullable Class<? extends TBase<?, ?>> thriftClass,
       @Nullable Class<? extends TProtocolFactory> thriftProtocolFactoryClass) {
-    JSONObject properties = new JSONObject();
+    ObjectNode properties = TableUtils.emptyProperties();
 
     if (extraBootstrapServers != null) {
-      JSONArray bootstrapServers = new JSONArray();
-      bootstrapServers.addAll(extraBootstrapServers);
+      ArrayNode bootstrapServers = TableUtils.getObjectMapper().createArrayNode();
+      for (String server : extraBootstrapServers) {
+        bootstrapServers.add(server);
+      }
       properties.put("bootstrap_servers", bootstrapServers);
     }
     if (extraTopics != null) {
-      JSONArray topics = new JSONArray();
-      topics.addAll(extraTopics);
+      ArrayNode topics = TableUtils.getObjectMapper().createArrayNode();
+      for (String topic : extraTopics) {
+        topics.add(topic);
+      }
       properties.put("topics", topics);
+    }
+
+    if (extraProperties != null) {
+      for (Map.Entry<String, String> property : extraProperties.entrySet()) {
+        properties.put(property.getKey(), property.getValue());
+      }
     }
 
     if (payloadFormat != null) {

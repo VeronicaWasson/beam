@@ -134,8 +134,8 @@ prerequisites and additional information.
 
 ```sh
 export DOCKER_ROOT="Your Docker Repository Root"
-./gradlew :sdks:java:container:java8:docker -Pdocker-repository-root=$DOCKER_ROOT -Pdocker-tag=latest
-docker push $DOCKER_ROOT/beam_java8_sdk:latest
+./gradlew :sdks:java:container:java11:docker -Pdocker-repository-root=$DOCKER_ROOT -Pdocker-tag=latest
+docker push $DOCKER_ROOT/beam_java11_sdk:latest
 ```
 
 For portable Flink/Spark in local mode, instead of above command just build the
@@ -157,9 +157,9 @@ Install Beam and dependencies and build a Beam distribution.
 
 ```sh
 cd beam/sdks/python
-pip install -r build-requirements.txt
 pip install -e '.[gcp]'
-python setup.py sdist
+pip install -q build
+python -m build --sdist
 ```
 
 Run the Beam pipeline. You can either use the default Kafka topic name or specify
@@ -184,5 +184,5 @@ python -m apache_beam.examples.kafkataxi.kafka_taxi \
   --num_workers $NUM_WORKERS \
   --job_name $JOB_NAME \
   --bootstrap_servers $BOOTSTRAP_SERVER \
-  --sdk_harness_container_image_overrides ".*java.*,${DOCKER_ROOT}/beam_java8_sdk:latest"
+  --sdk_harness_container_image_overrides ".*java.*,${DOCKER_ROOT}/beam_java11_sdk:latest"
 ```

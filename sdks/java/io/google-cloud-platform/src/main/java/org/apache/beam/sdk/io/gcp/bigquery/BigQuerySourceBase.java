@@ -17,6 +17,8 @@
  */
 package org.apache.beam.sdk.io.gcp.bigquery;
 
+import static java.util.stream.Collectors.collectingAndThen;
+import static java.util.stream.Collectors.toList;
 import static org.apache.beam.sdk.io.FileSystems.match;
 import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.resolveTempLocation;
 import static org.apache.beam.sdk.util.Preconditions.checkArgumentNotNull;
@@ -28,24 +30,21 @@ import com.google.api.services.bigquery.model.Table;
 import com.google.api.services.bigquery.model.TableReference;
 import com.google.api.services.bigquery.model.TableSchema;
 import java.io.IOException;
-import java.io.Serializable;
 import java.util.List;
+import java.util.stream.Stream;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.coders.Coder;
-import org.apache.beam.sdk.io.AvroSource;
+import org.apache.beam.sdk.extensions.avro.io.AvroSource;
 import org.apache.beam.sdk.io.BoundedSource;
 import org.apache.beam.sdk.io.fs.MatchResult;
 import org.apache.beam.sdk.io.fs.ResourceId;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.Status;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryResourceNaming.JobType;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices.JobService;
+import org.apache.beam.sdk.metrics.Lineage;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.transforms.SerializableFunction;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Function;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Supplier;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Suppliers;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -74,7 +73,7 @@ abstract class BigQuerySourceBase<T> extends BoundedSource<T> {
   protected final BigQueryServices bqServices;
 
   private transient @Nullable List<BoundedSource<T>> cachedSplitResult = null;
-  private SerializableFunction<SchemaAndRecord, T> parseFn;
+  private SerializableFunction<TableSchema, AvroSource.DatumReaderFactory<T>> readerFactory;
   private Coder<T> coder;
   private final boolean useAvroLogicalTypes;
 
@@ -82,12 +81,12 @@ abstract class BigQuerySourceBase<T> extends BoundedSource<T> {
       String stepUuid,
       BigQueryServices bqServices,
       Coder<T> coder,
-      SerializableFunction<SchemaAndRecord, T> parseFn,
+      SerializableFunction<TableSchema, AvroSource.DatumReaderFactory<T>> readerFactory,
       boolean useAvroLogicalTypes) {
     this.stepUuid = checkArgumentNotNull(stepUuid, "stepUuid");
     this.bqServices = checkArgumentNotNull(bqServices, "bqServices");
     this.coder = checkArgumentNotNull(coder, "coder");
-    this.parseFn = checkArgumentNotNull(parseFn, "parseFn");
+    this.readerFactory = checkArgumentNotNull(readerFactory, "readerFactory");
     this.useAvroLogicalTypes = useAvroLogicalTypes;
   }
 
@@ -121,6 +120,9 @@ abstract class BigQuerySourceBase<T> extends BoundedSource<T> {
                 "Cannot start an export job since table %s does not exist",
                 BigQueryHelpers.toTableSpec(tableToExtract)));
       }
+      // emit this table ID as a lineage source
+      Lineage.getSources()
+          .add("bigquery", BigQueryHelpers.dataCatalogSegments(tableToExtract, bqOptions));
 
       TableSchema schema = table.getSchema();
       JobService jobService = bqServices.getJobService(bqOptions);
@@ -154,7 +156,6 @@ abstract class BigQuerySourceBase<T> extends BoundedSource<T> {
     if (cachedSplitResult == null) {
       ExtractResult res = extractFiles(options);
       LOG.info("Extract job produced {} files", res.extractedFiles.size());
-
       if (res.extractedFiles.size() > 0) {
         BigQueryOptions bqOptions = options.as(BigQueryOptions.class);
         final String extractDestinationDir =
@@ -239,43 +240,26 @@ abstract class BigQuerySourceBase<T> extends BoundedSource<T> {
     return BigQueryIO.getExtractFilePaths(extractDestinationDir, extractJob);
   }
 
-  private static class TableSchemaFunction
-      implements Serializable, Function<@Nullable String, @Nullable TableSchema> {
-    @Override
-    public @Nullable TableSchema apply(@Nullable String input) {
-      return BigQueryHelpers.fromJsonString(input, TableSchema.class);
-    }
-  }
-
   List<BoundedSource<T>> createSources(
       List<ResourceId> files, TableSchema schema, @Nullable List<MatchResult.Metadata> metadata)
       throws IOException, InterruptedException {
+    String avroSchema = BigQueryAvroUtils.toGenericAvroSchema(schema).toString();
 
-    final String jsonSchema = BigQueryIO.JSON_FACTORY.toString(schema);
-    SerializableFunction<GenericRecord, T> fnWrapper =
-        new SerializableFunction<GenericRecord, T>() {
-          private Supplier<TableSchema> schema =
-              Suppliers.memoize(
-                  Suppliers.compose(new TableSchemaFunction(), Suppliers.ofInstance(jsonSchema)));
+    AvroSource.DatumReaderFactory<T> factory = readerFactory.apply(schema);
 
-          @Override
-          public T apply(GenericRecord input) {
-            return parseFn.apply(new SchemaAndRecord(input, schema.get()));
-          }
-        };
-
-    List<BoundedSource<T>> avroSources = Lists.newArrayList();
+    Stream<AvroSource<GenericRecord>> avroSources;
     // If metadata is available, create AvroSources with said metadata in SINGLE_FILE_OR_SUBRANGE
     // mode.
     if (metadata != null) {
-      for (MatchResult.Metadata file : metadata) {
-        avroSources.add(AvroSource.from(file).withParseFn(fnWrapper, getOutputCoder()));
-      }
+      avroSources = metadata.stream().map(AvroSource::from);
     } else {
-      for (ResourceId file : files) {
-        avroSources.add(AvroSource.from(file.toString()).withParseFn(fnWrapper, getOutputCoder()));
-      }
+      avroSources = files.stream().map(ResourceId::toString).map(AvroSource::from);
     }
-    return ImmutableList.copyOf(avroSources);
+
+    return avroSources
+        .map(s -> s.withSchema(avroSchema))
+        .map(s -> (AvroSource<T>) s.withDatumReaderFactory(factory))
+        .map(s -> s.withCoder(coder))
+        .collect(collectingAndThen(toList(), ImmutableList::copyOf));
   }
 }

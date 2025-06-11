@@ -23,8 +23,17 @@ import (
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/testing/passert"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/testing/ptest"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/protoadapt"
 )
+
+func TestMain(m *testing.M) {
+	ptest.Main(m)
+}
+
+func init() {
+	beam.RegisterType(reflect.TypeOf((*wc)(nil)).Elem())
+	beam.RegisterType(reflect.TypeOf((*testProto)(nil)).Elem())
+}
 
 type wc struct {
 	K string
@@ -33,16 +42,16 @@ type wc struct {
 
 func TestCreate(t *testing.T) {
 	tests := []struct {
-		values []interface{}
+		values []any
 	}{
-		{[]interface{}{1, 2, 3}},
-		{[]interface{}{"1", "2", "3"}},
-		{[]interface{}{float32(0.1), float32(0.2), float32(0.3)}},
-		{[]interface{}{float64(0.1), float64(0.2), float64(0.3)}},
-		{[]interface{}{uint(1), uint(2), uint(3)}},
-		{[]interface{}{false, true, true, false, true}},
-		{[]interface{}{wc{"a", 23}, wc{"b", 42}, wc{"c", 5}}},
-		{[]interface{}{&testProto{}, &testProto{stringValue("test")}}}, // Test for BEAM-4401
+		{[]any{1, 2, 3}},
+		{[]any{"1", "2", "3"}},
+		{[]any{float32(0.1), float32(0.2), float32(0.3)}},
+		{[]any{float64(0.1), float64(0.2), float64(0.3)}},
+		{[]any{uint(1), uint(2), uint(3)}},
+		{[]any{false, true, true, false, true}},
+		{[]any{wc{"a", 23}, wc{"b", 42}, wc{"c", 5}}},
+		{[]any{&testProto{}, &testProto{stringValue("test")}}}, // Test for BEAM-4401
 	}
 
 	for _, test := range tests {
@@ -58,7 +67,7 @@ func TestCreate(t *testing.T) {
 
 func TestCreateList(t *testing.T) {
 	tests := []struct {
-		values interface{}
+		values any
 	}{
 		{[]int{1, 2, 3}},
 		{[]string{"1", "2", "3"}},
@@ -66,15 +75,15 @@ func TestCreateList(t *testing.T) {
 		{[]float64{float64(0.1), float64(0.2), float64(0.3)}},
 		{[]uint{uint(1), uint(2), uint(3)}},
 		{[]bool{false, true, true, false, true}},
-		{[]wc{wc{"a", 23}, wc{"b", 42}, wc{"c", 5}}},
-		{[]*testProto{&testProto{}, &testProto{stringValue("test")}}}, // Test for BEAM-4401
+		{[]wc{{"a", 23}, {"b", 42}, {"c", 5}}},
+		{[]*testProto{{}, {stringValue("test")}}}, // Test for BEAM-4401
 	}
 
 	for _, test := range tests {
 		p, s := beam.NewPipelineWithRoot()
 		c := beam.CreateList(s, test.values)
 
-		var values []interface{}
+		var values []any
 		v := reflect.ValueOf(test.values)
 		for i := 0; i < v.Len(); i++ {
 			values = append(values, v.Index(i).Interface())
@@ -89,7 +98,7 @@ func TestCreateList(t *testing.T) {
 
 func TestCreateEmptyList(t *testing.T) {
 	tests := []struct {
-		values interface{}
+		values any
 	}{
 		{[]int{}},
 		{[]string{}},
@@ -148,7 +157,5 @@ func (t *testProto) Unmarshal(b []byte) error {
 // Ensure testProto is detected as a proto.Message and can be (un)marshalled by
 // the proto library.
 var (
-	_ proto.Message     = &testProto{}
-	_ proto.Marshaler   = &testProto{}
-	_ proto.Unmarshaler = &testProto{}
+	_ protoadapt.MessageV1 = &testProto{}
 )

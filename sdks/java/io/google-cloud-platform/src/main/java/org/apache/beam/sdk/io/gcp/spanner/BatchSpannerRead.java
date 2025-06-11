@@ -17,6 +17,8 @@
  */
 package org.apache.beam.sdk.io.gcp.spanner;
 
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
+
 import com.google.auto.value.AutoValue;
 import com.google.cloud.spanner.BatchReadOnlyTransaction;
 import com.google.cloud.spanner.Options;
@@ -27,20 +29,22 @@ import com.google.cloud.spanner.Struct;
 import com.google.cloud.spanner.TimestampBound;
 import java.io.Serializable;
 import java.util.List;
+import java.util.Objects;
 import org.apache.beam.runners.core.metrics.ServiceCallMetric;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.io.gcp.spanner.SpannerIO.ReadAll;
+import org.apache.beam.sdk.metrics.Lineage;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.Reshuffle;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.cache.CacheBuilder;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.cache.CacheLoader;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.cache.LoadingCache;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.cache.CacheBuilder;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.cache.CacheLoader;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.cache.LoadingCache;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -118,8 +122,7 @@ abstract class BatchSpannerRead
         SpannerConfig config, PCollectionView<? extends Transaction> txView) {
       this.config = config;
       this.txView = txView;
-      Preconditions.checkNotNull(config.getRpcPriority());
-      Preconditions.checkNotNull(config.getRpcPriority().get());
+      checkNotNull(config.getRpcPriority());
     }
 
     @Setup
@@ -138,6 +141,8 @@ abstract class BatchSpannerRead
       BatchReadOnlyTransaction batchTx =
           spannerAccessor.getBatchClient().batchReadOnlyTransaction(tx.transactionId());
       ReadOperation op = c.element();
+      boolean dataBoostEnabled =
+          config.getDataBoostEnabled() != null && config.getDataBoostEnabled().get();
 
       // While this creates a ServiceCallMetric for every input element, in reality, the number
       // of input elements will either be very few (normally 1!), or they will differ and
@@ -152,7 +157,8 @@ abstract class BatchSpannerRead
               batchTx.partitionQuery(
                   op.getPartitionOptions(),
                   op.getQuery(),
-                  Options.priority(config.getRpcPriority().get()));
+                  Options.priority(config.getRpcPriority().get()),
+                  Options.dataBoostEnabled(dataBoostEnabled));
         } else if (op.getIndex() != null) {
           // Read with index was selected.
           partitions =
@@ -162,7 +168,8 @@ abstract class BatchSpannerRead
                   op.getIndex(),
                   op.getKeySet(),
                   op.getColumns(),
-                  Options.priority(config.getRpcPriority().get()));
+                  Options.priority(config.getRpcPriority().get()),
+                  Options.dataBoostEnabled(dataBoostEnabled));
         } else {
           // Read from table was selected.
           partitions =
@@ -171,7 +178,8 @@ abstract class BatchSpannerRead
                   op.getTable(),
                   op.getKeySet(),
                   op.getColumns(),
-                  Options.priority(config.getRpcPriority().get()));
+                  Options.priority(config.getRpcPriority().get()),
+                  Options.dataBoostEnabled(dataBoostEnabled));
         }
         metric.call("ok");
       } catch (SpannerException e) {
@@ -191,6 +199,10 @@ abstract class BatchSpannerRead
 
     private transient SpannerAccessor spannerAccessor;
     private transient LoadingCache<ReadOperation, ServiceCallMetric> metricsForReadOperation;
+
+    // resolved at runtime for metrics report purpose. SpannerConfig may not have projectId set.
+    private transient String projectId;
+    private transient @Nullable String reportedLineage;
 
     public ReadFromPartitionFn(
         SpannerConfig config, PCollectionView<? extends Transaction> txView) {
@@ -216,6 +228,7 @@ abstract class BatchSpannerRead
                       return ReadAll.buildServiceCallMetricForReadOp(config, op);
                     }
                   });
+      projectId = SpannerIO.resolveSpannerProjectId(config);
     }
 
     @Teardown
@@ -241,10 +254,27 @@ abstract class BatchSpannerRead
         }
       } catch (SpannerException e) {
         serviceCallMetric.call(e.getErrorCode().getGrpcStatusCode().toString());
-        LOG.error("Error while processing element", e);
+        LOG.error(
+            "Error while reading partition for operation: " + op.getReadOperation().toString(), e);
         throw (e);
       }
       serviceCallMetric.call("ok");
+      // Report Lineage metrics
+      @Nullable String tableName = op.getReadOperation().tryGetTableName();
+      if (!Objects.equals(reportedLineage, tableName)) {
+        ImmutableList.Builder<String> segments =
+            ImmutableList.<String>builder()
+                .add(
+                    projectId,
+                    spannerAccessor.getInstanceConfigId(),
+                    config.getInstanceId().get(),
+                    config.getDatabaseId().get());
+        if (tableName != null) {
+          segments.add(tableName);
+        }
+        Lineage.getSources().add("spanner", segments.build());
+        reportedLineage = tableName;
+      }
     }
   }
 }

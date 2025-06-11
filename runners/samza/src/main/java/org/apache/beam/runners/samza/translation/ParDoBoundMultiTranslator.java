@@ -32,16 +32,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.model.pipeline.v1.RunnerApi.ExecutableStagePayload.SideInputId;
-import org.apache.beam.runners.core.construction.ParDoTranslation;
-import org.apache.beam.runners.core.construction.RunnerPCollectionView;
-import org.apache.beam.runners.core.construction.graph.PipelineNode;
-import org.apache.beam.runners.core.construction.graph.QueryablePipeline;
 import org.apache.beam.runners.samza.SamzaPipelineOptions;
 import org.apache.beam.runners.samza.runtime.DoFnOp;
 import org.apache.beam.runners.samza.runtime.Op;
 import org.apache.beam.runners.samza.runtime.OpAdapter;
 import org.apache.beam.runners.samza.runtime.OpEmitter;
 import org.apache.beam.runners.samza.runtime.OpMessage;
+import org.apache.beam.runners.samza.runtime.PortableDoFnOp;
 import org.apache.beam.runners.samza.runtime.SamzaDoFnInvokerRegistrar;
 import org.apache.beam.runners.samza.util.SamzaPipelineTranslatorUtils;
 import org.apache.beam.runners.samza.util.StateUtils;
@@ -59,7 +56,10 @@ import org.apache.beam.sdk.transforms.join.RawUnionValue;
 import org.apache.beam.sdk.transforms.reflect.DoFnSignature;
 import org.apache.beam.sdk.transforms.reflect.DoFnSignatures;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.ParDoTranslation;
+import org.apache.beam.sdk.util.construction.RunnerPCollectionView;
+import org.apache.beam.sdk.util.construction.graph.PipelineNode;
+import org.apache.beam.sdk.util.construction.graph.QueryablePipeline;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
@@ -67,11 +67,14 @@ import org.apache.beam.sdk.values.PCollectionViews;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TypeDescriptor;
 import org.apache.beam.sdk.values.TypeDescriptors;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
 import org.apache.beam.sdk.values.WindowingStrategy;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterators;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterators;
 import org.apache.samza.operators.MessageStream;
 import org.apache.samza.operators.functions.FlatMapFunction;
 import org.apache.samza.operators.functions.WatermarkFunction;
+import org.apache.samza.storage.kv.RocksDbKeyValueStorageEngineFactory;
 import org.joda.time.Instant;
 
 /**
@@ -161,6 +164,13 @@ class ParDoBoundMultiTranslator<InT, OutT>
     Map<String, PCollectionView<?>> sideInputMapping =
         ParDoTranslation.getSideInputMapping(ctx.getCurrentTransform());
 
+    final DoFnSignature signature = DoFnSignatures.getSignature(transform.getFn().getClass());
+    final Map<String, String> stateIdToStoreMapping = new HashMap<>();
+    for (String stateId : signature.stateDeclarations().keySet()) {
+      final String transformFullName = node.getEnclosingNode().getFullName();
+      final String storeId = ctx.getStoreIdGenerator().getId(stateId, transformFullName);
+      stateIdToStoreMapping.put(stateId, storeId);
+    }
     final DoFnOp<InT, OutT, RawUnionValue> op =
         new DoFnOp<>(
             transform.getMainOutputTag(),
@@ -182,7 +192,8 @@ class ParDoBoundMultiTranslator<InT, OutT>
             null,
             Collections.emptyMap(),
             doFnSchemaInformation,
-            sideInputMapping);
+            sideInputMapping,
+            stateIdToStoreMapping);
 
     final MessageStream<OpMessage<InT>> mergedStreams;
     if (sideInputStreams.isEmpty()) {
@@ -194,7 +205,7 @@ class ParDoBoundMultiTranslator<InT, OutT>
     }
 
     final MessageStream<OpMessage<RawUnionValue>> taggedOutputStream =
-        mergedStreams.flatMapAsync(OpAdapter.adapt(op));
+        mergedStreams.flatMapAsync(OpAdapter.adapt(op, ctx));
 
     for (int outputIndex : tagToIndexMap.values()) {
       @SuppressWarnings("unchecked")
@@ -204,7 +215,7 @@ class ParDoBoundMultiTranslator<InT, OutT>
                   message ->
                       message.getType() != OpMessage.Type.ELEMENT
                           || message.getElement().getValue().getUnionTag() == outputIndex)
-              .flatMapAsync(OpAdapter.adapt(new RawUnionValueToValue()));
+              .flatMapAsync(OpAdapter.adapt(new RawUnionValueToValue(), ctx));
 
       ctx.registerMessageStream(indexToPCollectionMap.get(outputIndex), outputStream);
     }
@@ -252,8 +263,8 @@ class ParDoBoundMultiTranslator<InT, OutT>
               .getInputsOrThrow(sideInputId.getLocalName());
       final WindowingStrategy<?, BoundedWindow> windowingStrategy =
           WindowUtils.getWindowStrategy(sideInputCollectionId, components);
-      final WindowedValue.WindowedValueCoder<?> coder =
-          (WindowedValue.WindowedValueCoder) instantiateCoder(sideInputCollectionId, components);
+      final WindowedValues.WindowedValueCoder<?> coder =
+          (WindowedValues.WindowedValueCoder) instantiateCoder(sideInputCollectionId, components);
 
       // Create a runner-side view
       final PCollectionView<?> view = createPCollectionView(sideInputId, coder, windowingStrategy);
@@ -295,7 +306,7 @@ class ParDoBoundMultiTranslator<InT, OutT>
               index.incrementAndGet();
             });
 
-    WindowedValue.WindowedValueCoder<InT> windowedInputCoder =
+    WindowedValues.WindowedValueCoder<InT> windowedInputCoder =
         WindowUtils.instantiateWindowedCoder(inputId, pipeline.getComponents());
 
     // TODO: support schema and side inputs for portable runner
@@ -305,18 +316,21 @@ class ParDoBoundMultiTranslator<InT, OutT>
 
     final RunnerApi.PCollection input = pipeline.getComponents().getPcollectionsOrThrow(inputId);
     final PCollection.IsBounded isBounded = SamzaPipelineTranslatorUtils.isBounded(input);
-    final Coder<?> keyCoder =
-        StateUtils.isStateful(stagePayload)
+
+    // No key coder information required for handing the stateless stage or stage with user states
+    // The key coder information is required for handing the stage with user timers
+    final Coder<?> timerKeyCoder =
+        stagePayload.getTimersCount() > 0
             ? ((KvCoder)
-                    ((WindowedValue.FullWindowedValueCoder) windowedInputCoder).getValueCoder())
+                    ((WindowedValues.FullWindowedValueCoder) windowedInputCoder).getValueCoder())
                 .getKeyCoder()
             : null;
 
-    final DoFnOp<InT, OutT, RawUnionValue> op =
-        new DoFnOp<>(
+    final PortableDoFnOp<InT, OutT, RawUnionValue> op =
+        new PortableDoFnOp<>(
             mainOutputTag,
             new NoOpDoFn<>(),
-            keyCoder,
+            timerKeyCoder,
             windowedInputCoder.getValueCoder(), // input coder not in use
             windowedInputCoder,
             Collections.emptyMap(), // output coders not in use
@@ -333,7 +347,8 @@ class ParDoBoundMultiTranslator<InT, OutT>
             ctx.getJobInfo(),
             idToTupleTagMap,
             doFnSchemaInformation,
-            sideInputMapping);
+            sideInputMapping,
+            Collections.emptyMap());
 
     final MessageStream<OpMessage<InT>> mergedStreams;
     if (sideInputStreams.isEmpty()) {
@@ -345,7 +360,7 @@ class ParDoBoundMultiTranslator<InT, OutT>
     }
 
     final MessageStream<OpMessage<RawUnionValue>> taggedOutputStream =
-        mergedStreams.flatMapAsync(OpAdapter.adapt(op));
+        mergedStreams.flatMapAsync(OpAdapter.adapt(op, ctx));
 
     for (int outputIndex : tagToIndexMap.values()) {
       @SuppressWarnings("unchecked")
@@ -355,7 +370,7 @@ class ParDoBoundMultiTranslator<InT, OutT>
                   message ->
                       message.getType() != OpMessage.Type.ELEMENT
                           || message.getElement().getValue().getUnionTag() == outputIndex)
-              .flatMapAsync(OpAdapter.adapt(new RawUnionValueToValue()));
+              .flatMapAsync(OpAdapter.adapt(new RawUnionValueToValue(), ctx));
 
       ctx.registerMessageStream(indexToIdMap.get(outputIndex), outputStream);
     }
@@ -376,18 +391,11 @@ class ParDoBoundMultiTranslator<InT, OutT>
 
     if (signature.usesState()) {
       // set up user state configs
-      for (DoFnSignature.StateDeclaration state : signature.stateDeclarations().values()) {
-        final String storeId = state.id();
-
-        // TODO: remove validation after we support same state id in different ParDo.
-        if (!ctx.addStateId(storeId)) {
-          throw new IllegalStateException(
-              "Duplicate StateId " + storeId + " found in multiple ParDo.");
-        }
-
+      for (String stateId : signature.stateDeclarations().keySet()) {
+        final String transformFullName = node.getEnclosingNode().getFullName();
+        final String storeId = ctx.getStoreIdGenerator().getId(stateId, transformFullName);
         config.put(
-            "stores." + storeId + ".factory",
-            "org.apache.samza.storage.kv.RocksDbKeyValueStorageEngineFactory");
+            "stores." + storeId + ".factory", RocksDbKeyValueStorageEngineFactory.class.getName());
         config.put("stores." + storeId + ".key.serde", "byteArraySerde");
         config.put("stores." + storeId + ".msg.serde", "stateValueSerde");
         config.put("stores." + storeId + ".rocksdb.compression", "lz4");
@@ -430,8 +438,7 @@ class ParDoBoundMultiTranslator<InT, OutT>
       final String storeId = stateId.getLocalName();
 
       config.put(
-          "stores." + storeId + ".factory",
-          "org.apache.samza.storage.kv.RocksDbKeyValueStorageEngineFactory");
+          "stores." + storeId + ".factory", RocksDbKeyValueStorageEngineFactory.class.getName());
       config.put("stores." + storeId + ".key.serde", "byteArraySerde");
       config.put("stores." + storeId + ".msg.serde", "stateValueSerde");
       config.put("stores." + storeId + ".rocksdb.compression", "lz4");
@@ -457,7 +464,7 @@ class ParDoBoundMultiTranslator<InT, OutT>
   // PCollectionView to represent a portable side input.
   private static PCollectionView<?> createPCollectionView(
       SideInputId sideInputId,
-      WindowedValue.WindowedValueCoder<?> coder,
+      WindowedValues.WindowedValueCoder<?> coder,
       WindowingStrategy<?, BoundedWindow> windowingStrategy) {
 
     return new RunnerPCollectionView<>(
@@ -478,7 +485,7 @@ class ParDoBoundMultiTranslator<InT, OutT>
           String sideInputCollectionId,
           RunnerApi.PCollection sideInputPCollection,
           WindowingStrategy<SideInputT, BoundedWindow> windowingStrategy,
-          WindowedValue.WindowedValueCoder<SideInputT> coder,
+          WindowedValues.WindowedValueCoder<SideInputT> coder,
           PortableTranslationContext ctx) {
     final MessageStream<OpMessage<SideInputT>> sideInput =
         ctx.getMessageStreamById(sideInputCollectionId);
@@ -488,7 +495,7 @@ class ParDoBoundMultiTranslator<InT, OutT>
               WindowedValue<SideInputT> wv = opMessage.getElement();
               return OpMessage.ofElement(wv.withValue(KV.of(null, wv.getValue())));
             });
-    final WindowedValue.WindowedValueCoder<KV<Void, SideInputT>> kvCoder =
+    final WindowedValues.WindowedValueCoder<KV<Void, SideInputT>> kvCoder =
         coder.withValueCoder(KvCoder.of(VoidCoder.of(), coder.getValueCoder()));
     final MessageStream<OpMessage<KV<Void, Iterable<SideInputT>>>> groupedSideInput =
         GroupByKeyTranslator.doTranslatePortable(
@@ -510,7 +517,7 @@ class ParDoBoundMultiTranslator<InT, OutT>
             coder.withValueCoder(IterableCoder.of(coder.getValueCoder())),
             ctx.getTransformId(),
             getSideInputUniqueId(sideInputId),
-            ctx.getSamzaPipelineOptions());
+            ctx.getPipelineOptions());
 
     return broadcastSideInput;
   }

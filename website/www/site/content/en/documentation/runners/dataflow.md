@@ -26,7 +26,7 @@ The Cloud Dataflow Runner and service are suitable for large scale, continuous j
 
 * a fully managed service
 * [autoscaling](https://cloud.google.com/dataflow/service/dataflow-service-desc#autoscaling) of the number of workers throughout the lifetime of the job
-* [dynamic work rebalancing](https://cloud.google.com/blog/big-data/2016/05/no-shard-left-behind-dynamic-work-rebalancing-in-google-cloud-dataflow)
+* [dynamic work rebalancing](https://cloud.google.com/blog/products/gcp/no-shard-left-behind-dynamic-work-rebalancing-in-google-cloud-dataflow)
 
 The [Beam Capability Matrix](/documentation/runners/capability-matrix/) documents the supported capabilities of the Cloud Dataflow Runner.
 
@@ -101,7 +101,7 @@ Then, add the mainClass name in the Maven JAR plugin.
 {{< /highlight >}}
 
 {{< paragraph class="language-java" >}}
-After running <code>mvn package</code>, run <code>ls target</code> and you should see (assuming your artifactId is `beam-examples` and the version is 1.0.0) the following output.
+After running <code>mvn package -Pdataflow-runner</code>, run <code>ls target</code> and you should see (assuming your artifactId is `beam-examples` and the version is 1.0.0) the following output.
 {{< /paragraph >}}
 
 {{< highlight java >}}
@@ -117,7 +117,8 @@ java -jar target/beam-examples-bundled-1.0.0.jar \
   --runner=DataflowRunner \
   --project=<YOUR_GCP_PROJECT_ID> \
   --region=<GCP_REGION> \
-  --tempLocation=gs://<YOUR_GCS_BUCKET>/temp/
+  --tempLocation=gs://<YOUR_GCS_BUCKET>/temp/ \
+  --output=gs://<YOUR_GCS_BUCKET>/output
 {{< /highlight >}}
 
 ## Pipeline options for the Cloud Dataflow Runner {#pipeline-options}
@@ -125,6 +126,7 @@ java -jar target/beam-examples-bundled-1.0.0.jar \
 <span class="language-java">When executing your pipeline with the Cloud Dataflow Runner (Java), consider these common pipeline options.</span>
 <span class="language-py">When executing your pipeline with the Cloud Dataflow Runner (Python), consider these common pipeline options.</span>
 
+<div class="table-container-wrapper">
 <table class="table table-bordered">
 <tr>
   <th>Field</th>
@@ -205,6 +207,7 @@ java -jar target/beam-examples-bundled-1.0.0.jar \
 
 
 </table>
+</div>
 
 See the reference documentation for the
 <span class="language-java">[DataflowPipelineOptions](https://beam.apache.org/releases/javadoc/{{< param release_latest >}}/index.html?org/apache/beam/runners/dataflow/options/DataflowPipelineOptions.html)</span>

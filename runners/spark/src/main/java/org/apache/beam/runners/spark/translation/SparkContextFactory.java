@@ -17,7 +17,7 @@
  */
 package org.apache.beam.runners.spark.translation;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
 
 import javax.annotation.Nullable;
 import org.apache.beam.runners.spark.SparkContextOptions;
@@ -143,12 +143,6 @@ public final class SparkContextFactory {
     conf.setAppName(options.getAppName());
     // register immutable collections serializers because the SDK uses them.
     conf.set("spark.kryo.registrator", SparkRunnerKryoRegistrator.class.getName());
-    JavaSparkContext jsc = new JavaSparkContext(conf);
-    if (jsc.sc().version().startsWith("2")) {
-      LOG.warn(
-          "Support for Spark 2 is deprecated, this runner will be removed in a few releases.\n"
-              + "Spark 2 is reaching its EOL, consider migrating to Spark 3.");
-    }
-    return jsc;
+    return new JavaSparkContext(conf);
   }
 }

@@ -18,15 +18,19 @@
 package org.apache.beam.runners.fnexecution.control;
 
 import static org.apache.beam.sdk.options.ExperimentalOptions.addExperiment;
-import static org.apache.beam.sdk.util.WindowedValue.valueInGlobalWindow;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.sdk.values.WindowedValues.valueInGlobalWindow;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.hamcrest.Matchers.not;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -59,20 +63,13 @@ import java.util.function.Function;
 import org.apache.beam.fn.harness.Caches;
 import org.apache.beam.fn.harness.FnHarness;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi;
+import org.apache.beam.model.fnexecution.v1.BeamFnApi.LogEntry.Severity;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi.ProcessBundleProgressResponse;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi.ProcessBundleResponse;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi.ProcessBundleSplitResponse;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi.ProcessBundleSplitResponse.ChannelSplit;
 import org.apache.beam.model.pipeline.v1.MetricsApi.MonitoringInfo;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
-import org.apache.beam.runners.core.construction.PTransformTranslation;
-import org.apache.beam.runners.core.construction.PipelineTranslation;
-import org.apache.beam.runners.core.construction.graph.ExecutableStage;
-import org.apache.beam.runners.core.construction.graph.FusedPipeline;
-import org.apache.beam.runners.core.construction.graph.GreedyPipelineFuser;
-import org.apache.beam.runners.core.construction.graph.PipelineNode.PTransformNode;
-import org.apache.beam.runners.core.construction.graph.ProtoOverrides;
-import org.apache.beam.runners.core.construction.graph.SplittableParDoExpander;
 import org.apache.beam.runners.core.metrics.DistributionData;
 import org.apache.beam.runners.core.metrics.MonitoringInfoConstants;
 import org.apache.beam.runners.core.metrics.MonitoringInfoConstants.TypeUrns;
@@ -83,7 +80,7 @@ import org.apache.beam.runners.fnexecution.control.ProcessBundleDescriptors.Exec
 import org.apache.beam.runners.fnexecution.control.SdkHarnessClient.BundleProcessor;
 import org.apache.beam.runners.fnexecution.data.GrpcDataService;
 import org.apache.beam.runners.fnexecution.logging.GrpcLoggingService;
-import org.apache.beam.runners.fnexecution.logging.Slf4jLogWriter;
+import org.apache.beam.runners.fnexecution.logging.LogWriter;
 import org.apache.beam.runners.fnexecution.state.GrpcStateService;
 import org.apache.beam.runners.fnexecution.state.StateRequestHandler;
 import org.apache.beam.runners.fnexecution.state.StateRequestHandlers;
@@ -132,17 +129,26 @@ import org.apache.beam.sdk.transforms.windowing.GlobalWindow;
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
 import org.apache.beam.sdk.util.ByteStringOutputStream;
 import org.apache.beam.sdk.util.CoderUtils;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.PTransformTranslation;
+import org.apache.beam.sdk.util.construction.PipelineTranslation;
+import org.apache.beam.sdk.util.construction.graph.ExecutableStage;
+import org.apache.beam.sdk.util.construction.graph.FusedPipeline;
+import org.apache.beam.sdk.util.construction.graph.GreedyPipelineFuser;
+import org.apache.beam.sdk.util.construction.graph.PipelineNode.PTransformNode;
+import org.apache.beam.sdk.util.construction.graph.ProtoOverrides;
+import org.apache.beam.sdk.util.construction.graph.SplittableParDoExpander;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionList;
 import org.apache.beam.sdk.values.PCollectionView;
-import org.apache.beam.vendor.grpc.v1p43p2.com.google.protobuf.ByteString;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Optional;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterators;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.ByteString;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Optional;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterators;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.hamcrest.Matcher;
 import org.hamcrest.Matchers;
 import org.hamcrest.collection.IsEmptyIterable;
@@ -152,8 +158,10 @@ import org.joda.time.Duration;
 import org.junit.After;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import org.slf4j.LoggerFactory;
 
 /**
  * Tests the execution of a pipeline from specification time to executing a single fused stage,
@@ -168,7 +176,7 @@ import org.junit.runners.JUnit4;
   "unused"
 })
 public class RemoteExecutionTest implements Serializable {
-
+  @Rule public transient Timeout globalTimeout = Timeout.seconds(600);
   @Rule public transient ResetDateTimeProvider resetDateTimeProvider = new ResetDateTimeProvider();
 
   private static final String WORKER_ID = "remote_test";
@@ -176,6 +184,7 @@ public class RemoteExecutionTest implements Serializable {
   private transient GrpcFnServer<FnApiControlClientPoolService> controlServer;
   private transient GrpcFnServer<GrpcDataService> dataServer;
   private transient GrpcFnServer<GrpcStateService> stateServer;
+  private transient LogCapturer logCapturer;
   private transient GrpcFnServer<GrpcLoggingService> loggingServer;
   private transient GrpcStateService stateDelegator;
   private transient SdkHarnessClient controlClient;
@@ -183,6 +192,15 @@ public class RemoteExecutionTest implements Serializable {
   private transient ExecutorService serverExecutor;
   private transient ExecutorService sdkHarnessExecutor;
   private transient Future<?> sdkHarnessExecutorFuture;
+
+  private static class LogCapturer implements LogWriter {
+    List<BeamFnApi.LogEntry> capturedLogs = Collections.synchronizedList(new ArrayList<>());
+
+    @Override
+    public void log(BeamFnApi.LogEntry entry) {
+      capturedLogs.add(entry);
+    }
+  }
 
   public void launchSdkHarness(PipelineOptions options) throws Exception {
     // Setup execution-time servers
@@ -196,9 +214,10 @@ public class RemoteExecutionTest implements Serializable {
                 serverExecutor,
                 OutboundObserverFactory.serverDirect()),
             serverFactory);
+    logCapturer = new LogCapturer();
     loggingServer =
         GrpcFnServer.allocatePortAndCreateFor(
-            GrpcLoggingService.forWriter(Slf4jLogWriter.getDefault()), serverFactory);
+            GrpcLoggingService.forWriter(logCapturer), serverFactory);
     stateDelegator = GrpcStateService.create();
     stateServer = GrpcFnServer.allocatePortAndCreateFor(stateDelegator, serverFactory);
 
@@ -230,7 +249,7 @@ public class RemoteExecutionTest implements Serializable {
               }
             });
     InstructionRequestHandler controlClient =
-        clientPool.getSource().take(WORKER_ID, java.time.Duration.ofSeconds(2));
+        clientPool.getSource().take(WORKER_ID, java.time.Duration.ofSeconds(10));
     this.controlClient = SdkHarnessClient.usingFnApiClient(controlClient, dataServer.getService());
   }
 
@@ -246,13 +265,16 @@ public class RemoteExecutionTest implements Serializable {
     try {
       sdkHarnessExecutorFuture.get();
     } catch (ExecutionException e) {
-      if (e.getCause() instanceof RuntimeException
-          && e.getCause().getCause() instanceof InterruptedException) {
-        // expected
-      } else {
+      Throwable ex = e.getCause();
+      while (ex instanceof RuntimeException) {
+        ex = ex.getCause();
+      }
+      // InterruptedException at call tree is expected
+      if (!(ex instanceof InterruptedException)) {
         throw e;
       }
     }
+    logCapturer = null;
   }
 
   @Test
@@ -313,8 +335,8 @@ public class RemoteExecutionTest implements Serializable {
               (Coder) remoteOutputCoder.getValue(),
               (FnDataReceiver<? super WindowedValue<?>>) outputContents::add));
     }
-    // The impulse example
 
+    // The impulse example
     try (RemoteBundle bundle =
         processor.newBundle(outputReceivers, BundleProgressHandler.ignored())) {
       Iterables.getOnlyElement(bundle.getInputReceivers().values())
@@ -328,6 +350,115 @@ public class RemoteExecutionTest implements Serializable {
               valueInGlobalWindow(byteValueOf("foo", 4)),
               valueInGlobalWindow(byteValueOf("foo", 3)),
               valueInGlobalWindow(byteValueOf("foo", 3))));
+    }
+  }
+
+  @Test
+  public void testLogging() throws Exception {
+    long startTime = System.currentTimeMillis();
+    launchSdkHarness(PipelineOptionsFactory.create());
+    Pipeline p = Pipeline.create();
+    p.apply("impulse", Impulse.create())
+        .apply(
+            "create",
+            ParDo.of(
+                new DoFn<byte[], String>() {
+                  @ProcessElement
+                  public void process(ProcessContext ctxt) {
+                    ctxt.output("zero");
+                  }
+                }))
+        .apply(
+            "len",
+            ParDo.of(
+                new DoFn<String, Long>() {
+                  @ProcessElement
+                  public void process(ProcessContext ctxt) {
+                    org.slf4j.Logger logger = LoggerFactory.getLogger(RemoteExecutionTest.class);
+                    logger.warn("TEST" + ctxt.element());
+                    logger.error("TEST_EXCEPTION" + ctxt.element(), new Exception());
+                  }
+                }))
+        .apply("addKeys", WithKeys.of("foo"))
+        // Use some unknown coders
+        .setCoder(KvCoder.of(StringUtf8Coder.of(), BigEndianLongCoder.of()))
+        // Force the output to be materialized
+        .apply("gbk", GroupByKey.create());
+
+    RunnerApi.Pipeline pipelineProto = PipelineTranslation.toProto(p);
+    FusedPipeline fused = GreedyPipelineFuser.fuse(pipelineProto);
+    checkState(fused.getFusedStages().size() == 1, "Expected exactly one fused stage");
+    ExecutableStage stage = fused.getFusedStages().iterator().next();
+
+    ExecutableProcessBundleDescriptor descriptor =
+        ProcessBundleDescriptors.fromExecutableStage(
+            "my_stage", stage, dataServer.getApiServiceDescriptor());
+    String ptransformId = null;
+    for (Map.Entry<String, RunnerApi.PTransform> entry :
+        descriptor.getProcessBundleDescriptor().getTransformsMap().entrySet()) {
+      if (entry.getValue().getUniqueName().contains("len")) {
+        ptransformId = entry.getKey();
+      }
+    }
+    assertNotNull(ptransformId);
+    BundleProcessor processor =
+        controlClient.getProcessor(
+            descriptor.getProcessBundleDescriptor(), descriptor.getRemoteInputDestinations());
+    Map<String, ? super Coder<WindowedValue<?>>> remoteOutputCoders =
+        descriptor.getRemoteOutputCoders();
+    Map<String, RemoteOutputReceiver<?>> outputReceivers = new HashMap<>();
+    for (Entry<String, ? super Coder<WindowedValue<?>>> remoteOutputCoder :
+        remoteOutputCoders.entrySet()) {
+      List<? super WindowedValue<?>> outputContents =
+          Collections.synchronizedList(new ArrayList<>());
+      outputReceivers.put(
+          remoteOutputCoder.getKey(),
+          RemoteOutputReceiver.of(
+              (Coder) remoteOutputCoder.getValue(),
+              (FnDataReceiver<? super WindowedValue<?>>) outputContents::add));
+    }
+
+    String instructionId;
+    // Execute a bundle that logs.
+    try (RemoteBundle bundle =
+        processor.newBundle(outputReceivers, BundleProgressHandler.ignored())) {
+      instructionId = bundle.getId();
+      Iterables.getOnlyElement(bundle.getInputReceivers().values())
+          .accept(valueInGlobalWindow(new byte[0]));
+    }
+
+    while (System.currentTimeMillis() - startTime < 30_000L) {
+      BeamFnApi.LogEntry[] logs = logCapturer.capturedLogs.toArray(new BeamFnApi.LogEntry[0]);
+      boolean foundPTransformLog = false;
+      boolean foundExceptionLog = false;
+      for (BeamFnApi.LogEntry log : logs) {
+        assertThat(
+            log.getTimestamp().getSeconds() * 1000 + log.getTimestamp().getNanos() / 1_000_000,
+            allOf(greaterThanOrEqualTo(startTime), lessThanOrEqualTo(System.currentTimeMillis())));
+        assertThat(log.getThread(), not(""));
+        assertThat(log.getLogLocation(), not(""));
+
+        if ("TESTzero".equals(log.getMessage())) {
+          assertThat(log.getSeverity(), equalTo(Severity.Enum.WARN));
+          assertThat(log.getInstructionId(), equalTo(instructionId));
+          assertThat(log.getLogLocation(), equalTo(RemoteExecutionTest.class.getCanonicalName()));
+          assertThat(log.getTransformId(), equalTo(ptransformId));
+          assertThat(log.getTrace(), equalTo(""));
+          foundPTransformLog = true;
+        } else if ("TEST_EXCEPTIONzero".equals(log.getMessage())) {
+          assertThat(log.getSeverity(), equalTo(Severity.Enum.ERROR));
+          assertThat(log.getInstructionId(), equalTo(instructionId));
+          assertThat(log.getLogLocation(), equalTo(RemoteExecutionTest.class.getCanonicalName()));
+          assertThat(log.getTransformId(), equalTo(ptransformId));
+          assertThat(log.getTrace(), containsString("RemoteExecutionTest"));
+          foundExceptionLog = true;
+        }
+      }
+      if (foundPTransformLog && foundExceptionLog) {
+        break;
+      }
+      // Wait till we get more logs from the SDK.
+      Thread.sleep(500);
     }
   }
 
@@ -1712,23 +1843,21 @@ public class RemoteExecutionTest implements Serializable {
           RemoteOutputReceiver.of(
               (Coder<WindowedValue<?>>) remoteOutputCoder.getValue(), outputContents::add));
     }
-    Map<KV<String, String>, Collection<org.apache.beam.runners.core.construction.Timer<?>>>
+    Map<KV<String, String>, Collection<org.apache.beam.sdk.util.construction.Timer<?>>>
         timerValues = new HashMap<>();
-    Map<
-            KV<String, String>,
-            RemoteOutputReceiver<org.apache.beam.runners.core.construction.Timer<?>>>
+    Map<KV<String, String>, RemoteOutputReceiver<org.apache.beam.sdk.util.construction.Timer<?>>>
         timerReceivers = new HashMap<>();
     for (Map.Entry<String, Map<String, ProcessBundleDescriptors.TimerSpec>> transformTimerSpecs :
         descriptor.getTimerSpecs().entrySet()) {
       for (ProcessBundleDescriptors.TimerSpec timerSpec : transformTimerSpecs.getValue().values()) {
         KV<String, String> key = KV.of(timerSpec.transformId(), timerSpec.timerId());
-        List<org.apache.beam.runners.core.construction.Timer<?>> outputContents =
+        List<org.apache.beam.sdk.util.construction.Timer<?>> outputContents =
             Collections.synchronizedList(new ArrayList<>());
         timerValues.put(key, outputContents);
         timerReceivers.put(
             key,
             RemoteOutputReceiver.of(
-                (Coder<org.apache.beam.runners.core.construction.Timer<?>>) timerSpec.coder(),
+                (Coder<org.apache.beam.sdk.util.construction.Timer<?>>) timerSpec.coder(),
                 outputContents::add));
       }
     }
@@ -1786,13 +1915,13 @@ public class RemoteExecutionTest implements Serializable {
           outputValues.get(mainOutputTransform),
           containsInAnyOrder(
               valueInGlobalWindow(KV.of("mainX", "")),
-              WindowedValue.timestampedValueInGlobalWindow(
+              WindowedValues.timestampedValueInGlobalWindow(
                   KV.of("event", "Y"),
                   BoundedWindow.TIMESTAMP_MIN_VALUE.plus(Duration.millis(100L))),
-              WindowedValue.timestampedValueInGlobalWindow(
+              WindowedValues.timestampedValueInGlobalWindow(
                   KV.of("processing", "Z"),
                   BoundedWindow.TIMESTAMP_MIN_VALUE.plus(Duration.millis(200L))),
-              WindowedValue.timestampedValueInGlobalWindow(
+              WindowedValues.timestampedValueInGlobalWindow(
                   KV.of("onWindowExpiration", "key"),
                   BoundedWindow.TIMESTAMP_MIN_VALUE.plus(Duration.millis(5000L)))));
       assertThat(
@@ -2117,9 +2246,9 @@ public class RemoteExecutionTest implements Serializable {
     return KV.of(key, CoderUtils.encodeToByteArray(BigEndianLongCoder.of(), value));
   }
 
-  private org.apache.beam.runners.core.construction.Timer<String> timerForTest(
+  private org.apache.beam.sdk.util.construction.Timer<String> timerForTest(
       String key, long fireTimestamp, long holdTimestamp) {
-    return org.apache.beam.runners.core.construction.Timer.of(
+    return org.apache.beam.sdk.util.construction.Timer.of(
         key,
         "",
         Collections.singletonList(GlobalWindow.INSTANCE),

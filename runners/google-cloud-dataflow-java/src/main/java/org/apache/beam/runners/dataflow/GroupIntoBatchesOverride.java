@@ -21,8 +21,6 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import org.apache.beam.runners.core.construction.PTransformReplacements;
-import org.apache.beam.runners.core.construction.ReplacementOutputs;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.runners.AppliedPTransform;
@@ -37,10 +35,12 @@ import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.transforms.SimpleFunction;
 import org.apache.beam.sdk.util.ShardedKey;
+import org.apache.beam.sdk.util.construction.PTransformReplacements;
+import org.apache.beam.sdk.util.construction.ReplacementOutputs;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.TupleTag;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
 
 @SuppressWarnings({
   "rawtypes" // TODO(https://github.com/apache/beam/issues/20447)
@@ -117,10 +117,19 @@ public class GroupIntoBatchesOverride {
                       List<V> currentBatch = Lists.newArrayList();
                       long batchSizeBytes = 0;
                       for (V element : c.element().getValue()) {
-                        currentBatch.add(element);
+                        long currentSizeBytes = 0;
                         if (weigher != null) {
-                          batchSizeBytes += weigher.apply(element);
+                          currentSizeBytes += weigher.apply(element);
+                          // Ensure that the batch is smaller than the byte size limit
+                          if (currentSizeBytes + batchSizeBytes > maxBatchSizeBytes
+                              && !currentBatch.isEmpty()) {
+                            c.output(KV.of(c.element().getKey(), currentBatch));
+                            currentBatch = Lists.newArrayList();
+                            batchSizeBytes = 0;
+                          }
                         }
+                        currentBatch.add(element);
+                        batchSizeBytes += currentSizeBytes;
                         if (currentBatch.size() == maxBatchSizeElements
                             || (maxBatchSizeBytes != Long.MAX_VALUE
                                 && batchSizeBytes >= maxBatchSizeBytes)) {

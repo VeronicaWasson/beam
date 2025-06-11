@@ -20,7 +20,6 @@ package org.apache.beam.runners.dataflow.worker;
 import static org.apache.beam.runners.dataflow.util.Structs.addString;
 import static org.apache.beam.runners.dataflow.worker.DataflowOutputCounter.getElementCounterName;
 import static org.apache.beam.runners.dataflow.worker.DataflowOutputCounter.getMeanByteCounterName;
-import static org.apache.beam.runners.dataflow.worker.DataflowOutputCounter.getObjectCounterName;
 import static org.apache.beam.runners.dataflow.worker.counters.CounterName.named;
 import static org.apache.beam.sdk.util.SerializableUtils.serializeToByteArray;
 import static org.apache.beam.sdk.util.StringUtils.byteArrayToJsonString;
@@ -30,9 +29,9 @@ import static org.hamcrest.Matchers.instanceOf;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
-import static org.mockito.Matchers.anyBoolean;
-import static org.mockito.Matchers.anyLong;
-import static org.mockito.Matchers.eq;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
@@ -95,15 +94,15 @@ import org.apache.beam.sdk.util.AppliedCombineFn;
 import org.apache.beam.sdk.util.DoFnInfo;
 import org.apache.beam.sdk.util.SerializableUtils;
 import org.apache.beam.sdk.util.StringUtils;
-import org.apache.beam.sdk.util.WindowedValue;
-import org.apache.beam.sdk.util.WindowedValue.FullWindowedValueCoder;
 import org.apache.beam.sdk.values.TupleTag;
+import org.apache.beam.sdk.values.WindowedValues;
+import org.apache.beam.sdk.values.WindowedValues.FullWindowedValueCoder;
 import org.apache.beam.sdk.values.WindowingStrategy;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableSet;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.graph.MutableNetwork;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.graph.Network;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableSet;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.graph.MutableNetwork;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.graph.Network;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.junit.Before;
 import org.junit.Test;
@@ -117,6 +116,7 @@ import org.mockito.MockitoAnnotations;
 @RunWith(JUnit4.class)
 @SuppressWarnings({
   "rawtypes", // TODO(https://github.com/apache/beam/issues/20447)
+  "DoNotMock", // TODO: Use NetworkBuilder to create a real instance
 })
 public class IntrinsicMapTaskExecutorFactoryTest {
   private static final String STAGE = "test";
@@ -129,7 +129,7 @@ public class IntrinsicMapTaskExecutorFactoryTest {
 
   private static final CloudObject windowedStringCoder =
       CloudObjects.asCloudObject(
-          WindowedValue.getValueOnlyCoder(StringUtf8Coder.of()), /*sdkComponents=*/ null);
+          WindowedValues.getValueOnlyCoder(StringUtf8Coder.of()), /*sdkComponents=*/ null);
 
   private IntrinsicMapTaskExecutorFactory mapTaskExecutorFactory;
   private PipelineOptions options;
@@ -179,10 +179,6 @@ public class IntrinsicMapTaskExecutorFactoryTest {
 
     try (DataflowMapTaskExecutor executor =
         mapTaskExecutorFactory.create(
-            null /* beamFnControlClientHandler */,
-            null /* GrpcFnServer<GrpcDataService> */,
-            null /* ApiServiceDescriptor */,
-            null, /* GrpcFnServer<GrpcStateService> */
             mapTaskToNetwork.apply(mapTask),
             options,
             STAGE,
@@ -246,8 +242,6 @@ public class IntrinsicMapTaskExecutorFactoryTest {
       verify(updateExtractor)
           .longSum(eq(named(getElementCounterName(outputName))), anyBoolean(), anyLong());
       verify(updateExtractor)
-          .longSum(eq(named(getObjectCounterName(outputName))), anyBoolean(), anyLong());
-      verify(updateExtractor)
           .longMean(
               eq(named(getMeanByteCounterName(outputName))),
               anyBoolean(),
@@ -273,10 +267,6 @@ public class IntrinsicMapTaskExecutorFactoryTest {
 
     try (DataflowMapTaskExecutor executor =
         mapTaskExecutorFactory.create(
-            null /* beamFnControlClientHandler */,
-            null /* beamFnDataService */,
-            null /* beamFnStateService */,
-            null,
             mapTaskToNetwork.apply(mapTask),
             options,
             STAGE,

@@ -43,7 +43,7 @@ import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionList;
 import org.apache.beam.sdk.values.TimestampedValue;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -218,14 +218,6 @@ public class SqlBoundedSideInputJoinTest {
     @Override
     protected SqlBoundedSideInputJoin getQuery(NexmarkConfiguration configuration) {
       return SqlBoundedSideInputJoin.calciteSqlBoundedSideInputJoin(configuration);
-    }
-  }
-
-  @RunWith(JUnit4.class)
-  public static class SqlBoundedSideInputJoinTestZetaSql extends SqlBoundedSideInputJoinTestCases {
-    @Override
-    protected SqlBoundedSideInputJoin getQuery(NexmarkConfiguration configuration) {
-      return SqlBoundedSideInputJoin.zetaSqlBoundedSideInputJoin(configuration);
     }
   }
 }

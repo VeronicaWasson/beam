@@ -190,7 +190,6 @@ from apache_beam.transforms import window
 from apache_beam.transforms.display import DisplayDataItem
 from apache_beam.typehints import with_input_types
 from apache_beam.typehints import with_output_types
-from apache_beam.utils.annotations import experimental
 
 # Protect against environments where spanner library is not available.
 # pylint: disable=wrong-import-order, wrong-import-position, ungrouped-imports
@@ -676,21 +675,30 @@ class _ReadFromPartitionFn(DoFn):
       self._snapshot.close()
 
 
-@experimental(extra_message="No backwards-compatibility guarantees.")
 class ReadFromSpanner(PTransform):
   """
   A PTransform to perform reads from cloud spanner.
   ReadFromSpanner uses BatchAPI to perform all read operations.
   """
-
-  def __init__(self, project_id, instance_id, database_id, pool=None,
-               read_timestamp=None, exact_staleness=None, credentials=None,
-               sql=None, params=None, param_types=None,  # with_query
-               table=None, query_name=None, columns=None, index="",
-               keyset=None,  # with_table
-               read_operations=None,  # for read all
-               transaction=None
-              ):
+  def __init__(
+      self,
+      project_id,
+      instance_id,
+      database_id,
+      pool=None,
+      read_timestamp=None,
+      exact_staleness=None,
+      credentials=None,
+      sql=None,
+      params=None,
+      param_types=None,  # with_query
+      table=None,
+      query_name=None,
+      columns=None,
+      index="",
+      keyset=None,  # with_table
+      read_operations=None,  # for read all
+      transaction=None):
     """
     A PTransform that uses Spanner Batch API to perform reads.
 
@@ -817,7 +825,6 @@ class ReadFromSpanner(PTransform):
     return res
 
 
-@experimental(extra_message="No backwards-compatibility guarantees.")
 class WriteToSpanner(PTransform):
   def __init__(
       self,
@@ -898,7 +905,12 @@ class _Mutator(namedtuple('_Mutator',
 
   @property
   def byte_size(self):
-    return self.mutation.ByteSize()
+    if hasattr(self.mutation, '_pb'):
+      # google-cloud-spanner 3.x
+      return self.mutation._pb.ByteSize()
+    else:
+      # google-cloud-spanner 1.x
+      return self.mutation.ByteSize()
 
 
 class MutationGroup(deque):
@@ -984,11 +996,8 @@ class WriteMutation(object):
     self._replace = replace
     self._delete = delete
 
-    if sum([1 for x in [self._insert,
-                        self._update,
-                        self._insert_or_update,
-                        self._replace,
-                        self._delete] if x is not None]) != 1:
+    if sum([1 for x in [self._insert, self._update, self._insert_or_update,
+                        self._replace, self._delete] if x is not None]) != 1:
       raise ValueError(
           "No or more than one write mutation operation "
           "provided: <%s: %s>" % (self.__class__.__name__, str(self.__dict__)))

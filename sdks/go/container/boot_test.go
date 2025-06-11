@@ -16,15 +16,16 @@
 package main
 
 import (
-	"io/ioutil"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/apache/beam/sdks/v2/go/container/tools"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/artifact"
 	fnpb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/fnexecution_v1"
 	pipepb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/pipeline_v1"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestEnsureEndpointsSet_AllSet(t *testing.T) {
@@ -76,7 +77,7 @@ func TestEnsureEndpointsSet_OneMissing(t *testing.T) {
 }
 
 func TestGetGoWorkerArtifactName_NoArtifacts(t *testing.T) {
-	_, err := getGoWorkerArtifactName([]*pipepb.ArtifactInformation{})
+	_, err := getGoWorkerArtifactName(context.Background(), &tools.Logger{}, []*pipepb.ArtifactInformation{})
 	if err == nil {
 		t.Fatalf("getGoWorkerArtifactName() = nil, want non-nil error")
 	}
@@ -86,7 +87,7 @@ func TestGetGoWorkerArtifactName_OneArtifact(t *testing.T) {
 	artifact := constructArtifactInformation(t, artifact.URNGoWorkerBinaryRole, "test/path", "sha")
 	artifacts := []*pipepb.ArtifactInformation{&artifact}
 
-	val, err := getGoWorkerArtifactName(artifacts)
+	val, err := getGoWorkerArtifactName(context.Background(), &tools.Logger{}, artifacts)
 	if err != nil {
 		t.Fatalf("getGoWorkerArtifactName() = %v, want nil", err)
 	}
@@ -100,7 +101,7 @@ func TestGetGoWorkerArtifactName_MultipleArtifactsFirstIsWorker(t *testing.T) {
 	artifact2 := constructArtifactInformation(t, "other role", "test/path2", "sha")
 	artifacts := []*pipepb.ArtifactInformation{&artifact1, &artifact2}
 
-	val, err := getGoWorkerArtifactName(artifacts)
+	val, err := getGoWorkerArtifactName(context.Background(), &tools.Logger{}, artifacts)
 	if err != nil {
 		t.Fatalf("getGoWorkerArtifactName() = %v, want nil", err)
 	}
@@ -114,7 +115,7 @@ func TestGetGoWorkerArtifactName_MultipleArtifactsSecondIsWorker(t *testing.T) {
 	artifact2 := constructArtifactInformation(t, artifact.URNGoWorkerBinaryRole, "test/path2", "sha")
 	artifacts := []*pipepb.ArtifactInformation{&artifact1, &artifact2}
 
-	val, err := getGoWorkerArtifactName(artifacts)
+	val, err := getGoWorkerArtifactName(context.Background(), &tools.Logger{}, artifacts)
 	if err != nil {
 		t.Fatalf("getGoWorkerArtifactName() = %v, want nil", err)
 	}
@@ -128,7 +129,7 @@ func TestGetGoWorkerArtifactName_MultipleArtifactsLegacyWay(t *testing.T) {
 	artifact2 := constructArtifactInformation(t, "other role", "worker", "sha")
 	artifacts := []*pipepb.ArtifactInformation{&artifact1, &artifact2}
 
-	val, err := getGoWorkerArtifactName(artifacts)
+	val, err := getGoWorkerArtifactName(context.Background(), &tools.Logger{}, artifacts)
 	if err != nil {
 		t.Fatalf("getGoWorkerArtifactName() = %v, want nil", err)
 	}
@@ -142,7 +143,7 @@ func TestGetGoWorkerArtifactName_MultipleArtifactsNoneMatch(t *testing.T) {
 	artifact2 := constructArtifactInformation(t, "other role", "test/path2", "sha")
 	artifacts := []*pipepb.ArtifactInformation{&artifact1, &artifact2}
 
-	_, err := getGoWorkerArtifactName(artifacts)
+	_, err := getGoWorkerArtifactName(context.Background(), &tools.Logger{}, artifacts)
 	if err == nil {
 		t.Fatalf("getGoWorkerArtifactName() = nil, want non-nil error")
 	}
@@ -152,14 +153,14 @@ func TestCopyExe(t *testing.T) {
 	testExeContent := []byte("testContent")
 
 	// Make temp directory to cleanup at the end
-	d, err := ioutil.TempDir(os.Getenv("TEST_TMPDIR"), "copyExe-*")
+	d, err := os.MkdirTemp(os.Getenv("TEST_TMPDIR"), "copyExe-*")
 	if err != nil {
 		t.Fatalf("failed to make temp directory, got %v", err)
 	}
 	t.Cleanup(func() { os.RemoveAll(d) })
 
 	// Make our source file and write to it
-	src, err := ioutil.TempFile(d, "src.exe")
+	src, err := os.CreateTemp(d, "src.exe")
 	if err != nil {
 		t.Fatalf("failed to make temp file, got %v", err)
 	}
@@ -183,12 +184,12 @@ func TestCopyExe(t *testing.T) {
 	if _, err := os.Stat(destPath); err != nil {
 		t.Fatalf("After running copyExe, os.Stat() = %v, want nil", err)
 	}
-	destContents, err := ioutil.ReadFile(destPath)
+	destContents, err := os.ReadFile(destPath)
 	if err != nil {
-		t.Fatalf("After running copyExe, ioutil.ReadFile() = %v, want nil", err)
+		t.Fatalf("After running copyExe, os.ReadFile() = %v, want nil", err)
 	}
 	if got, want := string(destContents), string(testExeContent); got != want {
-		t.Fatalf("After running copyExe, ioutil.ReadFile() = %v, want %v", got, want)
+		t.Fatalf("After running copyExe, os.ReadFile() = %v, want %v", got, want)
 	}
 }
 
@@ -201,5 +202,61 @@ func constructArtifactInformation(t *testing.T, roleUrn string, path string, sha
 		RoleUrn:     roleUrn,
 		TypeUrn:     artifact.URNFileArtifact,
 		TypePayload: typePayload,
+	}
+}
+
+func TestConfigureGoogleCloudProfilerEnvVars(t *testing.T) {
+	tests := []struct {
+		name          string
+		inputMetadata map[string]string
+		expectedName  string
+		expectedID    string
+		expectedError string
+	}{
+		{
+			"nil metadata",
+			nil,
+			"",
+			"",
+			"enable_google_cloud_profiler is set to true, but no metadata is received from provision server, profiling will not be enabled",
+		},
+		{
+			"missing name",
+			map[string]string{"job_id": "12345"},
+			"",
+			"",
+			"required job_name missing from metadata, profiling will not be enabled without it",
+		},
+		{
+			"missing id",
+			map[string]string{"job_name": "my_job"},
+			"",
+			"",
+			"required job_id missing from metadata, profiling will not be enabled without it",
+		},
+		{
+			"correct",
+			map[string]string{"job_name": "my_job", "job_id": "42"},
+			"my_job",
+			"42",
+			"",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Cleanup(os.Clearenv)
+			err := configureGoogleCloudProfilerEnvVars(context.Background(), &tools.Logger{}, test.inputMetadata)
+			if err != nil {
+				if got, want := err.Error(), test.expectedError; got != want {
+					t.Errorf("got error %v, want error %v", got, want)
+				}
+			}
+			if got, want := os.Getenv(cloudProfilingJobName), test.expectedName; got != want {
+				t.Errorf("got job name %v, want %v", got, want)
+			}
+			if got, want := os.Getenv(cloudProfilingJobID), test.expectedID; got != want {
+				t.Errorf("got job id %v, want %v", got, want)
+			}
+		})
 	}
 }

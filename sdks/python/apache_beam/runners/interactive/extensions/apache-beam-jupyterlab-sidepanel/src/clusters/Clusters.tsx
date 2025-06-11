@@ -17,9 +17,11 @@ import { ISessionContext } from '@jupyterlab/apputils';
 import { Button } from '@rmwc/button';
 import {
   DataTable,
+  DataTableBody,
   DataTableContent,
-  DataTableRow,
-  DataTableHeadCell
+  DataTableHead,
+  DataTableHeadCell,
+  DataTableRow
 } from '@rmwc/data-table';
 
 import {
@@ -157,7 +159,7 @@ export class Clusters extends React.Component<IClustersProps, IClustersState> {
 
   deleteCluster(cluster_id: string): void {
     const deleteClusterCode =
-      'ie.current_env().clusters.delete_cluster' +
+      'ie.current_env().clusters.cleanup' +
       `(ie.current_env().inspector.get_cluster_master_url('${cluster_id}'))`;
     this.queryKernel(deleteClusterCode);
     if (this.state.defaultClusterId === cluster_id) {
@@ -207,7 +209,7 @@ export class Clusters extends React.Component<IClustersProps, IClustersState> {
                   style={{ backgroundColor: 'var(--mdc-theme-error)' }}
                   theme={['onError']}
                   mini
-                  onClick={e => {
+                  onClick={() => {
                     this.displayDialog(true, key, value['cluster_name']);
                   }}
                 />
@@ -232,7 +234,9 @@ export class Clusters extends React.Component<IClustersProps, IClustersState> {
             label="Default cluster"
             enhanced
             options={clusterNames}
-            onChange={e => this.setDefaultCluster(e.currentTarget.value)}
+            onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
+              this.setDefaultCluster(e.currentTarget.value)
+            }
             value={this.state.defaultClusterId}
           />
           <Dialog
@@ -251,7 +255,7 @@ export class Clusters extends React.Component<IClustersProps, IClustersState> {
               </DialogButton>
               <DialogButton
                 action="accept"
-                onClick={e => {
+                onClick={() => {
                   this.deleteCluster(this.state.selectedId);
                 }}
               >
@@ -262,15 +266,17 @@ export class Clusters extends React.Component<IClustersProps, IClustersState> {
           <div className="Clusters">
             <DataTable>
               <DataTableContent>
-                <DataTableRow>
-                  <DataTableHeadCell>Cluster</DataTableHeadCell>
-                  <DataTableHeadCell>Project</DataTableHeadCell>
-                  <DataTableHeadCell>Region</DataTableHeadCell>
-                  <DataTableHeadCell>Master URL</DataTableHeadCell>
-                  <DataTableHeadCell>Pipelines</DataTableHeadCell>
-                  <DataTableHeadCell>Dashboard Link</DataTableHeadCell>
-                </DataTableRow>
-                {clusters}
+                <DataTableHead>
+                  <DataTableRow>
+                    <DataTableHeadCell>Cluster</DataTableHeadCell>
+                    <DataTableHeadCell>Project</DataTableHeadCell>
+                    <DataTableHeadCell>Region</DataTableHeadCell>
+                    <DataTableHeadCell>Master URL</DataTableHeadCell>
+                    <DataTableHeadCell>Pipelines</DataTableHeadCell>
+                    <DataTableHeadCell>Dashboard Link</DataTableHeadCell>
+                  </DataTableRow>
+                </DataTableHead>
+                <DataTableBody>{clusters}</DataTableBody>
               </DataTableContent>
             </DataTable>
           </div>
@@ -282,7 +288,7 @@ export class Clusters extends React.Component<IClustersProps, IClustersState> {
 
   private _inspectKernelCode: string;
   private _model: KernelModel;
-  private _queryKernelTimerId: number;
-  private _updateRenderTimerId: number;
-  private _updateSessionInfoTimerId: number;
+  private _queryKernelTimerId: ReturnType<typeof setInterval>;
+  private _updateRenderTimerId: ReturnType<typeof setInterval>;
+  private _updateSessionInfoTimerId: ReturnType<typeof setInterval>;
 }

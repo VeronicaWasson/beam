@@ -24,12 +24,8 @@ import heapq
 import itertools
 import operator
 import random
+from collections.abc import Iterable
 from typing import Any
-from typing import Dict
-from typing import Iterable
-from typing import List
-from typing import Set
-from typing import Tuple
 from typing import TypeVar
 from typing import Union
 
@@ -47,7 +43,22 @@ from apache_beam.utils.timestamp import Duration
 from apache_beam.utils.timestamp import Timestamp
 
 __all__ = [
-    'Count', 'Mean', 'Sample', 'Top', 'ToDict', 'ToList', 'ToSet', 'Latest'
+    'Count',
+    'Mean',
+    'Sample',
+    'Top',
+    'ToDict',
+    'ToList',
+    'ToSet',
+    'Latest',
+    'CountCombineFn',
+    'MeanCombineFn',
+    'SampleCombineFn',
+    'TopCombineFn',
+    'ToDictCombineFn',
+    'ToListCombineFn',
+    'ToSetCombineFn',
+    'LatestCombineFn',
 ]
 
 # Type variables
@@ -131,15 +142,15 @@ class Count(object):
       else:
         return pcoll | core.CombineGlobally(CountCombineFn()).without_defaults()
 
-  @with_input_types(Tuple[K, V])
-  @with_output_types(Tuple[K, int])
+  @with_input_types(tuple[K, V])
+  @with_output_types(tuple[K, int])
   class PerKey(ptransform.PTransform):
     """combiners.Count.PerKey counts how many elements each unique key has."""
     def expand(self, pcoll):
       return pcoll | core.CombinePerKey(CountCombineFn())
 
   @with_input_types(T)
-  @with_output_types(Tuple[T, int])
+  @with_output_types(tuple[T, int])
   class PerElement(ptransform.PTransform):
     """combiners.Count.PerElement counts how many times each element occurs."""
     def expand(self, pcoll):
@@ -178,13 +189,13 @@ class Top(object):
 
   # pylint: disable=no-self-argument
   @with_input_types(T)
-  @with_output_types(List[T])
+  @with_output_types(list[T])
   class Of(CombinerWithoutDefaults):
-    """Obtain a list of the compare-most N elements in a PCollection.
+    """Returns the n greatest elements in the PCollection.
 
     This transform will retrieve the n greatest elements in the PCollection
-    to which it is applied, where "greatest" is determined by the comparator
-    function supplied as the compare argument.
+    to which it is applied, where "greatest" is determined by a
+    function supplied as the `key` or `reverse` arguments.
     """
     def __init__(self, n, key=None, reverse=False):
       """Creates a global Top operation.
@@ -231,15 +242,15 @@ class Top(object):
               TopCombineFn(self._n, self._key,
                            self._reverse)).without_defaults()
 
-  @with_input_types(Tuple[K, V])
-  @with_output_types(Tuple[K, List[V]])
+  @with_input_types(tuple[K, V])
+  @with_output_types(tuple[K, list[V]])
   class PerKey(ptransform.PTransform):
-    """Identifies the compare-most N elements associated with each key.
+    """Identifies the N greatest elements associated with each key.
 
     This transform will produce a PCollection mapping unique keys in the input
     PCollection to the n greatest elements with which they are associated, where
-    "greatest" is determined by the comparator function supplied as the compare
-    argument in the initializer.
+    "greatest" is determined by a function supplied as the `key` or
+    `reverse` arguments.
     """
     def __init__(self, n, key=None, reverse=False):
       """Creates a per-key Top operation.
@@ -265,7 +276,7 @@ class Top(object):
       """Expands the transform.
 
       Raises TypeCheckError: If the output type of the input PCollection is not
-      compatible with Tuple[A, B].
+      compatible with tuple[A, B].
 
       Args:
         pcoll: PCollection to process
@@ -278,37 +289,37 @@ class Top(object):
 
   @staticmethod
   @ptransform.ptransform_fn
-  def Largest(pcoll, n, has_defaults=True):
+  def Largest(pcoll, n, has_defaults=True, key=None):
     """Obtain a list of the greatest N elements in a PCollection."""
     if has_defaults:
-      return pcoll | Top.Of(n)
+      return pcoll | Top.Of(n, key)
     else:
-      return pcoll | Top.Of(n).without_defaults()
+      return pcoll | Top.Of(n, key).without_defaults()
 
   @staticmethod
   @ptransform.ptransform_fn
-  def Smallest(pcoll, n, has_defaults=True):
+  def Smallest(pcoll, n, has_defaults=True, key=None):
     """Obtain a list of the least N elements in a PCollection."""
     if has_defaults:
-      return pcoll | Top.Of(n, reverse=True)
+      return pcoll | Top.Of(n, key, reverse=True)
     else:
-      return pcoll | Top.Of(n, reverse=True).without_defaults()
+      return pcoll | Top.Of(n, key, reverse=True).without_defaults()
 
   @staticmethod
   @ptransform.ptransform_fn
-  def LargestPerKey(pcoll, n):
+  def LargestPerKey(pcoll, n, key=None):
     """Identifies the N greatest elements associated with each key."""
-    return pcoll | Top.PerKey(n)
+    return pcoll | Top.PerKey(n, key)
 
   @staticmethod
   @ptransform.ptransform_fn
-  def SmallestPerKey(pcoll, n, reverse=True):
+  def SmallestPerKey(pcoll, n, *, key=None):
     """Identifies the N least elements associated with each key."""
-    return pcoll | Top.PerKey(n, reverse=True)
+    return pcoll | Top.PerKey(n, key, reverse=True)
 
 
 @with_input_types(T)
-@with_output_types(Tuple[None, List[T]])
+@with_output_types(tuple[None, list[T]])
 class _TopPerBundle(core.DoFn):
   def __init__(self, n, key, reverse):
     self._n = n
@@ -341,8 +352,8 @@ class _TopPerBundle(core.DoFn):
       yield window.GlobalWindows.windowed_value((None, self._heap))
 
 
-@with_input_types(Tuple[None, Iterable[List[T]]])
-@with_output_types(List[T])
+@with_input_types(tuple[None, Iterable[list[T]]])
+@with_output_types(list[T])
 class _MergeTopPerBundle(core.DoFn):
   def __init__(self, n, key, reverse):
     self._n = n
@@ -365,7 +376,7 @@ class _MergeTopPerBundle(core.DoFn):
         return False
 
     if self._compare or self._key:
-      heapc = []  # type: List[cy_combiners.ComparableValue]
+      heapc: list[cy_combiners.ComparableValue] = []
       for bundle in bundles:
         if not heapc:
           heapc = [
@@ -406,11 +417,11 @@ class _MergeTopPerBundle(core.DoFn):
 
 
 @with_input_types(T)
-@with_output_types(List[T])
+@with_output_types(list[T])
 class TopCombineFn(core.CombineFn):
   """CombineFn doing the combining for all of the Top transforms.
 
-  This CombineFn uses a key or comparison operator to rank the elements.
+  This CombineFn uses a `key` or `reverse` operator to rank the elements.
 
   Args:
     key: (optional) a mapping of elements to a comparable key, similar to
@@ -452,7 +463,7 @@ class TopCombineFn(core.CombineFn):
     }
 
   # The accumulator type is a tuple
-  # (bool, Union[List[T], List[ComparableValue[T]])
+  # (bool, Union[list[T], list[ComparableValue[T]])
   # where the boolean indicates whether the second slot contains a List of T
   # (False) or List of ComparableValue[T] (True). In either case, the List
   # maintains heap invariance. When the contents of the List are
@@ -549,7 +560,7 @@ class Sample(object):
   # pylint: disable=no-self-argument
 
   @with_input_types(T)
-  @with_output_types(List[T])
+  @with_output_types(list[T])
   class FixedSizeGlobally(CombinerWithoutDefaults):
     """Sample n elements from the input PCollection without replacement."""
     def __init__(self, n):
@@ -569,8 +580,8 @@ class Sample(object):
     def default_label(self):
       return 'FixedSizeGlobally(%d)' % self._n
 
-  @with_input_types(Tuple[K, V])
-  @with_output_types(Tuple[K, List[V]])
+  @with_input_types(tuple[K, V])
+  @with_output_types(tuple[K, list[V]])
   class FixedSizePerKey(ptransform.PTransform):
     """Sample n elements associated with each key without replacement."""
     def __init__(self, n):
@@ -587,7 +598,7 @@ class Sample(object):
 
 
 @with_input_types(T)
-@with_output_types(List[T])
+@with_output_types(list[T])
 class SampleCombineFn(core.CombineFn):
   """CombineFn for all Sample transforms."""
   def __init__(self, n):
@@ -665,21 +676,21 @@ class _TupleCombineFnBase(core.CombineFn):
       if len(accumulators_batch) == 1:
         break
       result = [
-          c.merge_accumulators(a, *args, **kwargs) for c,
-          a in zip(self._combiners, zip(*accumulators_batch))
+          c.merge_accumulators(a, *args, **kwargs)
+          for c, a in zip(self._combiners, zip(*accumulators_batch))
       ]
     return result
 
   def compact(self, accumulator, *args, **kwargs):
     return [
-        c.compact(a, *args, **kwargs) for c,
-        a in zip(self._combiners, accumulator)
+        c.compact(a, *args, **kwargs)
+        for c, a in zip(self._combiners, accumulator)
     ]
 
   def extract_output(self, accumulator, *args, **kwargs):
     return tuple(
-        c.extract_output(a, *args, **kwargs) for c,
-        a in zip(self._combiners, accumulator))
+        c.extract_output(a, *args, **kwargs)
+        for c, a in zip(self._combiners, accumulator))
 
   def teardown(self, *args, **kwargs):
     for c in reversed(self._combiners):
@@ -695,9 +706,8 @@ class TupleCombineFn(_TupleCombineFnBase):
   """
   def add_input(self, accumulator, element, *args, **kwargs):
     return [
-        c.add_input(a, e, *args, **kwargs) for c,
-        a,
-        e in zip(self._combiners, accumulator, element)
+        c.add_input(a, e, *args, **kwargs)
+        for c, a, e in zip(self._combiners, accumulator, element)
     ]
 
   def with_common_input(self):
@@ -713,13 +723,13 @@ class SingleInputTupleCombineFn(_TupleCombineFnBase):
   """
   def add_input(self, accumulator, element, *args, **kwargs):
     return [
-        c.add_input(a, element, *args, **kwargs) for c,
-        a in zip(self._combiners, accumulator)
+        c.add_input(a, element, *args, **kwargs)
+        for c, a in zip(self._combiners, accumulator)
     ]
 
 
 @with_input_types(T)
-@with_output_types(List[T])
+@with_output_types(list[T])
 class ToList(CombinerWithoutDefaults):
   """A global CombineFn that condenses a PCollection into a single list."""
   def expand(self, pcoll):
@@ -731,7 +741,7 @@ class ToList(CombinerWithoutDefaults):
 
 
 @with_input_types(T)
-@with_output_types(List[T])
+@with_output_types(list[T])
 class ToListCombineFn(core.CombineFn):
   """CombineFn for to_list."""
   def create_accumulator(self):
@@ -748,8 +758,25 @@ class ToListCombineFn(core.CombineFn):
     return accumulator
 
 
-@with_input_types(Tuple[K, V])
-@with_output_types(Dict[K, V])
+@with_input_types(T)
+@with_output_types(T)
+class ConcatListCombineFn(core.CombineFn):
+  """CombineFn for concatenating lists together."""
+  def create_accumulator(self):
+    return []
+
+  def add_input(self, accumulator, element):
+    return accumulator + element
+
+  def merge_accumulators(self, accumulators):
+    return sum(accumulators, [])
+
+  def extract_output(self, accumulator):
+    return accumulator
+
+
+@with_input_types(tuple[K, V])
+@with_output_types(dict[K, V])
 class ToDict(CombinerWithoutDefaults):
   """A global CombineFn that condenses a PCollection into a single dict.
 
@@ -765,8 +792,8 @@ class ToDict(CombinerWithoutDefaults):
           ToDictCombineFn()).without_defaults()
 
 
-@with_input_types(Tuple[K, V])
-@with_output_types(Dict[K, V])
+@with_input_types(tuple[K, V])
+@with_output_types(dict[K, V])
 class ToDictCombineFn(core.CombineFn):
   """CombineFn for to_dict."""
   def create_accumulator(self):
@@ -788,7 +815,7 @@ class ToDictCombineFn(core.CombineFn):
 
 
 @with_input_types(T)
-@with_output_types(Set[T])
+@with_output_types(set[T])
 class ToSet(CombinerWithoutDefaults):
   """A global CombineFn that condenses a PCollection into a set."""
   def expand(self, pcoll):
@@ -800,7 +827,7 @@ class ToSet(CombinerWithoutDefaults):
 
 
 @with_input_types(T)
-@with_output_types(Set[T])
+@with_output_types(set[T])
 class ToSetCombineFn(core.CombineFn):
   """CombineFn for ToSet."""
   def create_accumulator(self):
@@ -909,17 +936,17 @@ class Latest(object):
         return (
             pcoll
             | core.ParDo(self.add_timestamp).with_output_types(
-                Tuple[T, TimestampType])
+                tuple[T, TimestampType])
             | core.CombineGlobally(LatestCombineFn()))
       else:
         return (
             pcoll
             | core.ParDo(self.add_timestamp).with_output_types(
-                Tuple[T, TimestampType])
+                tuple[T, TimestampType])
             | core.CombineGlobally(LatestCombineFn()).without_defaults())
 
-  @with_input_types(Tuple[K, V])
-  @with_output_types(Tuple[K, V])
+  @with_input_types(tuple[K, V])
+  @with_output_types(tuple[K, V])
   class PerKey(ptransform.PTransform):
     """Compute elements with the latest timestamp for each key
     from a keyed PCollection"""
@@ -932,11 +959,11 @@ class Latest(object):
       return (
           pcoll
           | core.ParDo(self.add_timestamp).with_output_types(
-              Tuple[K, Tuple[T, TimestampType]])
+              tuple[K, tuple[T, TimestampType]])
           | core.CombinePerKey(LatestCombineFn()))
 
 
-@with_input_types(Tuple[T, TimestampType])
+@with_input_types(tuple[T, TimestampType])
 @with_output_types(T)
 class LatestCombineFn(core.CombineFn):
   """CombineFn to get the element with the latest timestamp

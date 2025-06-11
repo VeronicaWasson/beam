@@ -207,9 +207,9 @@ class OffsetRangeTracker(iobase.RangeTracker):
           if self._split_points_unclaimed_callback else
           iobase.RangeTracker.SPLIT_POINTS_UNKNOWN)
       split_points_remaining = (
-          iobase.RangeTracker.SPLIT_POINTS_UNKNOWN
-          if split_points_unclaimed == iobase.RangeTracker.SPLIT_POINTS_UNKNOWN
-          else (split_points_unclaimed + 1))
+          iobase.RangeTracker.SPLIT_POINTS_UNKNOWN if split_points_unclaimed
+          == iobase.RangeTracker.SPLIT_POINTS_UNKNOWN else
+          (split_points_unclaimed + 1))
 
       return (split_points_consumed, split_points_remaining)
 
@@ -312,7 +312,7 @@ class UnsplittableRangeTracker(iobase.RangeTracker):
     Args:
       range_tracker (~apache_beam.io.iobase.RangeTracker): a
         :class:`~apache_beam.io.iobase.RangeTracker` to which all method
-        calls expect calls to :meth:`.try_split()` will be delegated.
+        calls except calls to :meth:`.try_split()` will be delegated.
     """
     assert isinstance(range_tracker, iobase.RangeTracker)
     self._range_tracker = range_tracker

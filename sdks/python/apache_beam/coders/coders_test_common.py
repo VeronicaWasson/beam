@@ -18,11 +18,13 @@
 """Tests common to all coder implementations."""
 # pytype: skip-file
 
+import base64
 import collections
 import enum
 import logging
 import math
 import unittest
+from decimal import Decimal
 from typing import Any
 from typing import List
 from typing import NamedTuple
@@ -51,7 +53,7 @@ try:
 except ImportError:
   dataclasses = None  # type: ignore
 
-MyNamedTuple = collections.namedtuple('A', ['x', 'y'])
+MyNamedTuple = collections.namedtuple('A', ['x', 'y'])  # type: ignore[name-match]
 MyTypedNamedTuple = NamedTuple('MyTypedNamedTuple', [('f1', int), ('f2', str)])
 
 
@@ -119,7 +121,7 @@ class CodersTest(unittest.TestCase):
       -1,
       1.5,
       b'str\0str',
-      u'unicode\0\u0101',
+      'unicode\0\u0101',
       (),
       (1, 2, 3),
       [],
@@ -158,7 +160,11 @@ class CodersTest(unittest.TestCase):
         coders.ListLikeCoder,
         coders.ProtoCoder,
         coders.ProtoPlusCoder,
-        coders.ToBytesCoder
+        coders.BigEndianShortCoder,
+        coders.SinglePrecisionFloatCoder,
+        coders.ToBytesCoder,
+        coders.BigIntegerCoder,  # tested in DecimalCoder
+        coders.TimestampPrefixingOpaqueWindowCoder,
     ])
     cls.seen_nested -= set(
         [coders.ProtoCoder, coders.ProtoPlusCoder, CustomCoder])
@@ -208,6 +214,13 @@ class CodersTest(unittest.TestCase):
   def test_pickle_coder(self):
     coder = coders.PickleCoder()
     self.check_coder(coder, *self.test_values)
+
+  def test_cloudpickle_pickle_coder(self):
+    cell_value = (lambda x: lambda: x)(0).__closure__[0]
+    self.check_coder(coders.CloudpickleCoder(), 'a', 1, cell_value)
+    self.check_coder(
+        coders.TupleCoder((coders.VarIntCoder(), coders.CloudpickleCoder())),
+        (1, cell_value))
 
   def test_memoizing_pickle_coder(self):
     coder = coders._MemoizingPickleCoder()
@@ -312,6 +325,20 @@ class CodersTest(unittest.TestCase):
             for k in range(0, int(math.log(MAX_64_BIT_INT)))
         ])
 
+  def test_varint32_coder(self):
+    # Small ints.
+    self.check_coder(coders.VarInt32Coder(), *range(-10, 10))
+    # Multi-byte encoding starts at 128
+    self.check_coder(coders.VarInt32Coder(), *range(120, 140))
+    # Large values
+    MAX_32_BIT_INT = 0x7fffffff
+    self.check_coder(
+        coders.VarIntCoder(),
+        *[
+            int(math.pow(-1, k) * math.exp(k))
+            for k in range(0, int(math.log(MAX_32_BIT_INT)))
+        ])
+
   def test_float_coder(self):
     self.check_coder(
         coders.FloatCoder(), *[float(0.1 * x) for x in range(-100, 100)])
@@ -341,6 +368,18 @@ class CodersTest(unittest.TestCase):
     self.check_coder(
         coders.TupleCoder((coders.IntervalWindowCoder(), )),
         (window.IntervalWindow(0, 10), ))
+
+  def test_paneinfo_window_coder(self):
+    self.check_coder(
+        coders.PaneInfoCoder(),
+        *[
+            windowed_value.PaneInfo(
+                is_first=y == 0,
+                is_last=y == 9,
+                timing=windowed_value.PaneInfoTiming.EARLY,
+                index=y,
+                nonspeculative_index=-1) for y in range(0, 10)
+        ])
 
   def test_timestamp_coder(self):
     self.check_coder(
@@ -382,16 +421,6 @@ class CodersTest(unittest.TestCase):
 
   def test_tuple_coder(self):
     kv_coder = coders.TupleCoder((coders.VarIntCoder(), coders.BytesCoder()))
-    # Verify cloud object representation
-    self.assertEqual({
-        '@type': 'kind:pair',
-        'is_pair_like': True,
-        'component_encodings': [
-            coders.VarIntCoder().as_cloud_object(),
-            coders.BytesCoder().as_cloud_object()
-        ],
-    },
-                     kv_coder.as_cloud_object())
     # Test binary representation
     self.assertEqual(b'\x04abc', kv_coder.encode((4, b'abc')))
     # Test unnested
@@ -402,7 +431,7 @@ class CodersTest(unittest.TestCase):
             coders.TupleCoder((coders.PickleCoder(), coders.VarIntCoder())),
             coders.StrUtf8Coder(),
             coders.BooleanCoder())), ((1, 2), 'a', True),
-        ((-2, 5), u'a\u0101' * 100, False), ((300, 1), 'abc\0' * 5, True))
+        ((-2, 5), 'a\u0101' * 100, False), ((300, 1), 'abc\0' * 5, True))
 
   def test_tuple_sequence_coder(self):
     int_tuple_coder = coders.TupleSequenceCoder(coders.VarIntCoder())
@@ -415,17 +444,10 @@ class CodersTest(unittest.TestCase):
     self.check_coder(coders.Base64PickleCoder(), 'a', 1, 1.5, (1, 2, 3))
 
   def test_utf8_coder(self):
-    self.check_coder(coders.StrUtf8Coder(), 'a', u'ab\u00FF', u'\u0101\0')
+    self.check_coder(coders.StrUtf8Coder(), 'a', 'ab\u00FF', '\u0101\0')
 
   def test_iterable_coder(self):
     iterable_coder = coders.IterableCoder(coders.VarIntCoder())
-    # Verify cloud object representation
-    self.assertEqual({
-        '@type': 'kind:stream',
-        'is_stream_like': True,
-        'component_encodings': [coders.VarIntCoder().as_cloud_object()]
-    },
-                     iterable_coder.as_cloud_object())
     # Test unnested
     self.check_coder(iterable_coder, [1], [-1, 0, 100])
     # Test nested
@@ -502,16 +524,6 @@ class CodersTest(unittest.TestCase):
   def test_windowed_value_coder(self):
     coder = coders.WindowedValueCoder(
         coders.VarIntCoder(), coders.GlobalWindowCoder())
-    # Verify cloud object representation
-    self.assertEqual({
-        '@type': 'kind:windowed_value',
-        'is_wrapper': True,
-        'component_encodings': [
-            coders.VarIntCoder().as_cloud_object(),
-            coders.GlobalWindowCoder().as_cloud_object(),
-        ],
-    },
-                     coder.as_cloud_object())
     # Test binary representation
     self.assertEqual(
         b'\x7f\xdf;dZ\x1c\xac\t\x00\x00\x00\x01\x0f\x01',
@@ -546,6 +558,7 @@ class CodersTest(unittest.TestCase):
   def test_param_windowed_value_coder(self):
     from apache_beam.transforms.window import IntervalWindow
     from apache_beam.utils.windowed_value import PaneInfo
+    # pylint: disable=too-many-function-args
     wv = windowed_value.create(
         b'',
         # Milliseconds to microseconds
@@ -599,10 +612,10 @@ class CodersTest(unittest.TestCase):
     ma = test_message.MessageA()
     mab = ma.field2.add()
     mab.field1 = True
-    ma.field1 = u'hello world'
+    ma.field1 = 'hello world'
 
     mb = test_message.MessageA()
-    mb.field1 = u'beam'
+    mb.field1 = 'beam'
 
     proto_coder = coders.ProtoCoder(ma.__class__)
     self.check_coder(proto_coder, ma)
@@ -613,8 +626,6 @@ class CodersTest(unittest.TestCase):
   def test_global_window_coder(self):
     coder = coders.GlobalWindowCoder()
     value = window.GlobalWindow()
-    # Verify cloud object representation
-    self.assertEqual({'@type': 'kind:global_window'}, coder.as_cloud_object())
     # Test binary representation
     self.assertEqual(b'', coder.encode(value))
     self.assertEqual(value, coder.decode(b''))
@@ -625,12 +636,6 @@ class CodersTest(unittest.TestCase):
 
   def test_length_prefix_coder(self):
     coder = coders.LengthPrefixCoder(coders.BytesCoder())
-    # Verify cloud object representation
-    self.assertEqual({
-        '@type': 'kind:length_prefix',
-        'component_encodings': [coders.BytesCoder().as_cloud_object()]
-    },
-                     coder.as_cloud_object())
     # Test binary representation
     self.assertEqual(b'\x00', coder.encode(b''))
     self.assertEqual(b'\x01a', coder.encode(b'a'))
@@ -661,7 +666,7 @@ class CodersTest(unittest.TestCase):
 
     # Test nested tuple observable.
     coder = coders.TupleCoder((coders.StrUtf8Coder(), iter_coder))
-    value = (u'123', observ)
+    value = ('123', observ)
     self.assertEqual(
         coder.get_impl().get_estimated_size_and_observables(value)[1],
         [(observ, elem_coder.get_impl())])
@@ -701,9 +706,14 @@ class CodersTest(unittest.TestCase):
 
   def test_map_coder(self):
     values = [
-        {1: "one", 300: "three hundred"}, # force yapf to be nice
+        {
+            1: "one", 300: "three hundred"
+        },  # force yapf to be nice
         {},
-        {i: str(i) for i in range(5000)}
+        {
+            i: str(i)
+            for i in range(5000)
+        }
     ]
     map_coder = coders.MapCoder(coders.VarIntCoder(), coders.StrUtf8Coder())
     self.check_coder(map_coder, *values)
@@ -720,12 +730,6 @@ class CodersTest(unittest.TestCase):
 
     for key, bytes_repr, key_coder in key_and_coders:
       coder = coders.ShardedKeyCoder(key_coder)
-      # Verify cloud object representation
-      self.assertEqual({
-          '@type': 'kind:sharded_key',
-          'component_encodings': [key_coder.as_cloud_object()]
-      },
-                       coder.as_cloud_object())
 
       # Test str repr
       self.assertEqual('%s' % coder, 'ShardedKeyCoder[%s]' % key_coder)
@@ -774,6 +778,43 @@ class CodersTest(unittest.TestCase):
             coders.TimestampPrefixingWindowCoder(
                 coders.IntervalWindowCoder()), )),
         (window.IntervalWindow(0, 10), ))
+
+  def test_timestamp_prefixing_opaque_window_coder(self):
+    sdk_coder = coders.TimestampPrefixingWindowCoder(
+        coders.LengthPrefixCoder(coders.PickleCoder()))
+    safe_coder = coders.TimestampPrefixingOpaqueWindowCoder()
+    for w in [window.IntervalWindow(1, 123), window.GlobalWindow()]:
+      round_trip = sdk_coder.decode(
+          safe_coder.encode(safe_coder.decode(sdk_coder.encode(w))))
+      self.assertEqual(w, round_trip)
+
+  def test_decimal_coder(self):
+    test_coder = coders.DecimalCoder()
+
+    test_values = [
+        Decimal("-10.5"),
+        Decimal("-1"),
+        Decimal(),
+        Decimal("1"),
+        Decimal("13.258"),
+    ]
+
+    test_encodings = ("AZc", "AP8", "AAA", "AAE", "AzPK")
+
+    self.check_coder(test_coder, *test_values)
+
+    for idx, value in enumerate(test_values):
+      self.assertEqual(
+          test_encodings[idx],
+          base64.b64encode(test_coder.encode(value)).decode().rstrip("="))
+
+  def test_OrderedUnionCoder(self):
+    test_coder = coders._OrderedUnionCoder((str, coders.StrUtf8Coder()),
+                                           (int, coders.VarIntCoder()),
+                                           fallback_coder=coders.FloatCoder())
+    self.check_coder(test_coder, 's')
+    self.check_coder(test_coder, 123)
+    self.check_coder(test_coder, 1.5)
 
 
 if __name__ == '__main__':

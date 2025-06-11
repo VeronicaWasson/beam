@@ -18,7 +18,7 @@
 package org.apache.beam.sdk.io.gcp.bigquery;
 
 import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryResourceNaming.createTempTableReference;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.api.services.bigquery.model.JobStatistics;
 import com.google.api.services.bigquery.model.TableReference;
@@ -27,12 +27,10 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.coders.Coder;
+import org.apache.beam.sdk.extensions.avro.io.AvroSource;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryResourceNaming.JobType;
 import org.apache.beam.sdk.options.ValueProvider;
-import org.apache.beam.sdk.schemas.Schema;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
@@ -48,6 +46,7 @@ class BigQueryQuerySourceDef implements BigQuerySourceDef {
   private final BigQueryIO.TypedRead.QueryPriority priority;
   private final String location;
   private final String tempDatasetId;
+  private final String tempProjectId;
   private final String kmsKey;
 
   private transient AtomicReference<@Nullable JobStatistics> dryRunJobStats;
@@ -60,9 +59,18 @@ class BigQueryQuerySourceDef implements BigQuerySourceDef {
       BigQueryIO.TypedRead.QueryPriority priority,
       String location,
       String tempDatasetId,
+      String tempProjectId,
       String kmsKey) {
     return new BigQueryQuerySourceDef(
-        bqServices, query, flattenResults, useLegacySql, priority, location, tempDatasetId, kmsKey);
+        bqServices,
+        query,
+        flattenResults,
+        useLegacySql,
+        priority,
+        location,
+        tempDatasetId,
+        tempProjectId,
+        kmsKey);
   }
 
   private BigQueryQuerySourceDef(
@@ -73,6 +81,7 @@ class BigQueryQuerySourceDef implements BigQuerySourceDef {
       BigQueryIO.TypedRead.QueryPriority priority,
       String location,
       String tempDatasetId,
+      String tempProjectId,
       String kmsKey) {
     this.query = checkNotNull(query, "query");
     this.flattenResults = checkNotNull(flattenResults, "flattenResults");
@@ -81,6 +90,7 @@ class BigQueryQuerySourceDef implements BigQuerySourceDef {
     this.priority = priority;
     this.location = location;
     this.tempDatasetId = tempDatasetId;
+    this.tempProjectId = tempProjectId;
     this.kmsKey = kmsKey;
     dryRunJobStats = new AtomicReference<>();
   }
@@ -122,16 +132,22 @@ class BigQueryQuerySourceDef implements BigQuerySourceDef {
         priority,
         location,
         tempDatasetId,
+        tempProjectId,
         kmsKey);
   }
 
   void cleanupTempResource(BigQueryOptions bqOptions, String stepUuid) throws Exception {
     Optional<String> queryTempDatasetOpt = Optional.ofNullable(tempDatasetId);
+    String project = tempProjectId;
+    if (project == null) {
+      project =
+          bqOptions.getBigQueryProject() == null
+              ? bqOptions.getProject()
+              : bqOptions.getBigQueryProject();
+    }
     TableReference tableToRemove =
         createTempTableReference(
-            bqOptions.getBigQueryProject() == null
-                ? bqOptions.getProject()
-                : bqOptions.getBigQueryProject(),
+            project,
             BigQueryResourceNaming.createJobIdPrefix(
                 bqOptions.getJobName(), stepUuid, JobType.QUERY),
             queryTempDatasetOpt);
@@ -153,16 +169,15 @@ class BigQueryQuerySourceDef implements BigQuerySourceDef {
   public <T> BigQuerySourceBase<T> toSource(
       String stepUuid,
       Coder<T> coder,
-      SerializableFunction<SchemaAndRecord, T> parseFn,
+      SerializableFunction<TableSchema, AvroSource.DatumReaderFactory<T>> readerFactory,
       boolean useAvroLogicalTypes) {
     return BigQueryQuerySource.create(
-        stepUuid, this, bqServices, coder, parseFn, useAvroLogicalTypes);
+        stepUuid, this, bqServices, coder, readerFactory, useAvroLogicalTypes);
   }
 
   /** {@inheritDoc} */
-  @Experimental(Kind.SCHEMAS)
   @Override
-  public Schema getBeamSchema(BigQueryOptions bqOptions) {
+  public TableSchema getTableSchema(BigQueryOptions bqOptions) {
     try {
       JobStatistics stats =
           BigQueryQueryHelper.dryRunQueryIfNeeded(
@@ -173,8 +188,7 @@ class BigQueryQuerySourceDef implements BigQuerySourceDef {
               flattenResults,
               useLegacySql,
               location);
-      TableSchema tableSchema = stats.getQuery().getSchema();
-      return BigQueryUtils.fromTableSchema(tableSchema);
+      return stats.getQuery().getSchema();
     } catch (IOException | InterruptedException | NullPointerException e) {
       throw new BigQuerySchemaRetrievalException(
           "Exception while trying to retrieve schema of query", e);

@@ -19,27 +19,34 @@ package org.apache.beam.sdk.io.gcp.spanner.changestreams.action;
 
 import com.google.cloud.Timestamp;
 import java.util.Optional;
-import org.apache.beam.sdk.io.gcp.spanner.changestreams.model.ChildPartitionsRecord;
+import org.apache.beam.sdk.io.gcp.spanner.changestreams.dofn.ReadChangeStreamPartitionDoFn;
+import org.apache.beam.sdk.io.gcp.spanner.changestreams.estimator.ThroughputEstimator;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.model.DataChangeRecord;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.model.PartitionMetadata;
+import org.apache.beam.sdk.io.gcp.spanner.changestreams.restriction.RestrictionInterrupter;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.restriction.TimestampRange;
 import org.apache.beam.sdk.transforms.DoFn.OutputReceiver;
 import org.apache.beam.sdk.transforms.DoFn.ProcessContinuation;
 import org.apache.beam.sdk.transforms.splittabledofn.ManualWatermarkEstimator;
 import org.apache.beam.sdk.transforms.splittabledofn.RestrictionTracker;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
 import org.joda.time.Instant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * This class is part of the process for {@link
- * org.apache.beam.sdk.io.gcp.spanner.changestreams.dofn.ReadChangeStreamPartitionDoFn} SDF. It is
+ * This class is part of the process for {@link ReadChangeStreamPartitionDoFn} SDF. It is
  * responsible for processing {@link DataChangeRecord}s. The records will simply be emitted to the
  * received output receiver.
  */
 public class DataChangeRecordAction {
   private static final Logger LOG = LoggerFactory.getLogger(DataChangeRecordAction.class);
+  private final ThroughputEstimator<DataChangeRecord> throughputEstimator;
+
+  /** @param throughputEstimator an estimator to calculate local throughput of this action. */
+  public DataChangeRecordAction(ThroughputEstimator<DataChangeRecord> throughputEstimator) {
+    this.throughputEstimator = throughputEstimator;
+  }
 
   /**
    * This is the main processing function for a {@link DataChangeRecord}. It returns an {@link
@@ -60,38 +67,48 @@ public class DataChangeRecordAction {
    *
    * @param partition the current partition being processed
    * @param record the change stream data record received
-   * @param tracker the restriction tracker of the {@link
-   *     org.apache.beam.sdk.io.gcp.spanner.changestreams.dofn.ReadChangeStreamPartitionDoFn} SDF
-   * @param outputReceiver the output receiver of the {@link
-   *     org.apache.beam.sdk.io.gcp.spanner.changestreams.dofn.ReadChangeStreamPartitionDoFn} SDF
-   * @param watermarkEstimator the watermark estimator of the {@link
-   *     org.apache.beam.sdk.io.gcp.spanner.changestreams.dofn.ReadChangeStreamPartitionDoFn} SDF
+   * @param tracker the restriction tracker of the {@link ReadChangeStreamPartitionDoFn} SDF
+   * @param interrupter the restriction interrupter suggesting early termination of the processing
+   * @param outputReceiver the output receiver of the {@link ReadChangeStreamPartitionDoFn} SDF
+   * @param watermarkEstimator the watermark estimator of the {@link ReadChangeStreamPartitionDoFn}
+   *     SDF
    * @return {@link Optional#empty()} if the caller can continue processing more records. A non
    *     empty {@link Optional} with {@link ProcessContinuation#stop()} if this function was unable
-   *     to claim the {@link ChildPartitionsRecord} timestamp
+   *     to claim the {@link DataChangeRecord} timestamp. A non empty {@link Optional} with {@link
+   *     ProcessContinuation#resume()} if this function should commit what has already been
+   *     processed and resume.
    */
   @VisibleForTesting
   public Optional<ProcessContinuation> run(
       PartitionMetadata partition,
       DataChangeRecord record,
       RestrictionTracker<TimestampRange, Timestamp> tracker,
+      RestrictionInterrupter<Timestamp> interrupter,
       OutputReceiver<DataChangeRecord> outputReceiver,
       ManualWatermarkEstimator<Instant> watermarkEstimator) {
 
     final String token = partition.getPartitionToken();
-    LOG.debug("[" + token + "] Processing data record " + record.getCommitTimestamp());
+    LOG.debug("[{}] Processing data record {}", token, record.getCommitTimestamp());
 
     final Timestamp commitTimestamp = record.getCommitTimestamp();
     final Instant commitInstant = new Instant(commitTimestamp.toSqlTimestamp().getTime());
-    if (!tracker.tryClaim(commitTimestamp)) {
+    if (interrupter.tryInterrupt(commitTimestamp)) {
       LOG.debug(
-          "[" + token + "] Could not claim queryChangeStream(" + commitTimestamp + "), stopping");
+          "[{}] Soft deadline reached with data change record at {}, rescheduling",
+          token,
+          commitTimestamp);
+      return Optional.of(ProcessContinuation.resume());
+    }
+    if (!tracker.tryClaim(commitTimestamp)) {
+      LOG.debug("[{}] Could not claim queryChangeStream({}), stopping", token, commitTimestamp);
       return Optional.of(ProcessContinuation.stop());
     }
     outputReceiver.outputWithTimestamp(record, commitInstant);
     watermarkEstimator.setWatermark(commitInstant);
 
-    LOG.debug("[" + token + "] Data record action completed successfully");
+    throughputEstimator.update(Timestamp.now(), record);
+
+    LOG.debug("[{}] Data record action completed successfully", token);
     return Optional.empty();
   }
 }

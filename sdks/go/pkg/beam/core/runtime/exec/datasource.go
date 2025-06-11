@@ -23,12 +23,15 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph/coder"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/sdf"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/util/ioutilx"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/internal/errors"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/log"
+	"golang.org/x/exp/maps"
 )
 
 // DataSource is a Root execution unit.
@@ -39,9 +42,12 @@ type DataSource struct {
 	Coder *coder.Coder
 	Out   Node
 	PCol  PCollection // Handles size metrics. Value instead of pointer so it's initialized by default in tests.
+	// OnTimerTransforms maps PtransformIDs to their execution nodes that handle OnTimer callbacks.
+	OnTimerTransforms map[string]*ParDo
 
-	source DataManager
-	state  StateReader
+	source  DataManager
+	state   StateReader
+	curInst string
 
 	index    int64
 	splitIdx int64
@@ -55,6 +61,12 @@ type DataSource struct {
 	su chan SplittableUnit
 
 	mu sync.Mutex
+
+	// Whether the downstream transform only iterates a GBK coder once.
+	singleIterate bool
+
+	// represents if the SDK is consuming received data.
+	consumingReceivedData atomic.Bool
 }
 
 // InitSplittable initializes the SplittableUnit channel from the output unit,
@@ -75,26 +87,88 @@ func (n *DataSource) ID() UnitID {
 
 // Up initializes this datasource.
 func (n *DataSource) Up(ctx context.Context) error {
+	safeToSingleIterate := true
+	switch n.Out.(type) {
+	case *Expand, *Multiplex:
+		// CoGBK Expands aren't safe, as they may re-iterate the GBK stream.
+		// Multiplexes aren't safe, since they re-iterate the GBK stream by default.
+		safeToSingleIterate = false
+	}
+	n.singleIterate = safeToSingleIterate
 	return nil
 }
 
 // StartBundle initializes this datasource for the bundle.
 func (n *DataSource) StartBundle(ctx context.Context, id string, data DataContext) error {
 	n.mu.Lock()
+	n.curInst = id
 	n.source = data.Data
 	n.state = data.State
 	n.start = time.Now()
-	n.index = -1
+	n.index = 0
 	n.splitIdx = math.MaxInt64
 	n.mu.Unlock()
 	return n.Out.StartBundle(ctx, id, data)
+}
+
+// process handles converting elements from the data source to timers.
+//
+// The data and timer callback functions must return an io.EOF if the reader terminates to signal that an additional
+// buffer is desired.
+func (n *DataSource) process(ctx context.Context, data func(bcr *byteCountReader, ptransformID string) error, timer func(bcr *byteCountReader, ptransformID, timerFamilyID string) error) error {
+	// The SID contains this instruction's expected data processing transform (this one).
+	elms, err := n.source.OpenElementChan(ctx, n.SID, maps.Keys(n.OnTimerTransforms))
+	if err != nil {
+		return err
+	}
+
+	n.PCol.resetSize() // initialize the size distribution for this bundle.
+	var r bytes.Reader
+
+	var byteCount int
+	bcr := byteCountReader{reader: &r, count: &byteCount}
+
+	for {
+		n.consumingReceivedData.Store(false)
+		var err error
+		select {
+		case e, ok := <-elms:
+			n.consumingReceivedData.Store(true)
+			// Channel closed, so time to exit
+			if !ok {
+				return nil
+			}
+			if len(e.Data) > 0 {
+				r.Reset(e.Data)
+				err = data(&bcr, e.PtransformID)
+			}
+			if err != nil && err != io.EOF {
+				return errors.Wrapf(err, "source failed processing data")
+			}
+			// Process any simultaneously sent timers.
+			// If the data channel has split though
+			if len(e.Timers) > 0 {
+				r.Reset(e.Timers)
+				err = timer(&bcr, e.PtransformID, e.TimerFamilyID)
+			}
+			if err != nil && err != io.EOF {
+				return errors.Wrap(err, "source failed processing timers")
+			}
+			// io.EOF means the reader successfully drained.
+			// We're ready for a new buffer.
+		case <-ctx.Done():
+			// now that it is done processing received data, we set it to false.
+			n.consumingReceivedData.Store(false)
+			return nil
+		}
+	}
 }
 
 // ByteCountReader is a passthrough reader that counts all the bytes read through it.
 // It trusts the nested reader to return accurate byte information.
 type byteCountReader struct {
 	count  *int
-	reader io.ReadCloser
+	reader io.Reader
 }
 
 func (r *byteCountReader) Read(p []byte) (int, error) {
@@ -104,7 +178,10 @@ func (r *byteCountReader) Read(p []byte) (int, error) {
 }
 
 func (r *byteCountReader) Close() error {
-	return r.reader.Close()
+	if c, ok := r.reader.(io.Closer); ok {
+		c.Close()
+	}
+	return nil
 }
 
 func (r *byteCountReader) reset() int {
@@ -114,16 +191,7 @@ func (r *byteCountReader) reset() int {
 }
 
 // Process opens the data source, reads and decodes data, kicking off element processing.
-func (n *DataSource) Process(ctx context.Context) error {
-	r, err := n.source.OpenRead(ctx, n.SID)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-	n.PCol.resetSize() // initialize the size distribution for this bundle.
-	var byteCount int
-	bcr := byteCountReader{reader: r, count: &byteCount}
-
+func (n *DataSource) Process(ctx context.Context) ([]*Checkpoint, error) {
 	c := coder.SkipW(n.Coder)
 	wc := MakeWindowDecoder(n.Coder.Window)
 
@@ -141,51 +209,120 @@ func (n *DataSource) Process(ctx context.Context) error {
 		cp = MakeElementDecoder(c)
 	}
 
-	for {
-		if n.incrementIndexAndCheckSplit() {
+	hasSplit := map[string]bool{}
+	var checkpoints []*Checkpoint
+	err := n.process(ctx, func(bcr *byteCountReader, ptransformID string) error {
+		// Check if this transform has already successfully, and if so, skip reading and decoding of the elements in the buffer.
+		if hasSplit[ptransformID] {
 			return nil
 		}
-		// TODO(lostluck) 2020/02/22: Should we include window headers or just count the element sizes?
-		ws, t, pn, err := DecodeWindowedValueHeader(wc, r)
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return errors.Wrap(err, "source failed")
-		}
-
-		// Decode key or parallel element.
-		pe, err := cp.Decode(&bcr)
-		if err != nil {
-			return errors.Wrap(err, "source decode failed")
-		}
-		pe.Timestamp = t
-		pe.Windows = ws
-		pe.Pane = pn
-
-		var valReStreams []ReStream
-		for _, cv := range cvs {
-			values, err := n.makeReStream(ctx, pe, cv, &bcr)
+		for {
+			// TODO(lostluck) 2020/02/22: Should we include window headers or just count the element sizes?
+			ws, t, pn, err := DecodeWindowedValueHeader(wc, bcr.reader)
 			if err != nil {
 				return err
 			}
-			valReStreams = append(valReStreams, values)
-		}
 
-		if err := n.Out.ProcessElement(ctx, pe, valReStreams...); err != nil {
-			return err
+			// Decode key or parallel element.
+			pe, err := cp.Decode(bcr)
+			if err != nil {
+				return errors.Wrap(err, "source decode failed")
+			}
+			pe.Timestamp = t
+			pe.Windows = ws
+			pe.Pane = pn
+
+			var valReStreams []ReStream
+			for _, cv := range cvs {
+				values, err := n.makeReStream(ctx, cv, bcr, len(cvs) == 1 && n.singleIterate)
+				if err != nil {
+					return err
+				}
+				valReStreams = append(valReStreams, values)
+			}
+
+			if err := n.Out.ProcessElement(ctx, pe, valReStreams...); err != nil {
+				return err
+			}
+			// Collect the actual size of the element, and reset the bytecounter reader.
+			// TODO(zechenj18) 2023-12-07: currently we never sample anything from the DataSource, we need to validate CoGBKs and similar types with the sampling implementation
+			n.PCol.addSize(int64(bcr.reset()))
+
+			// Check if there's a continuation and return residuals
+			// Needs to be done immediately after processing to not lose the element.
+			if c := n.getProcessContinuation(); c != nil {
+				cp, err := n.checkpointThis(ctx, c)
+				if err != nil {
+					// Errors during checkpointing should fail a bundle.
+					return err
+				}
+				if cp != nil {
+					checkpoints = append(checkpoints, cp)
+				}
+			}
+			//	We've finished processing an element, check if we have finished a split.
+			if n.incrementIndexAndCheckSplit() {
+				hasSplit[ptransformID] = true
+				return nil
+			}
 		}
-		// Collect the actual size of the element, and reset the bytecounter reader.
-		n.PCol.addSize(int64(bcr.reset()))
-		bcr.reader = r
-	}
+	},
+		func(bcr *byteCountReader, ptransformID, timerFamilyID string) error {
+			if node, ok := n.OnTimerTransforms[ptransformID]; ok {
+				if err := node.ProcessTimers(timerFamilyID, bcr); err != nil {
+					log.Warnf(ctx, "expected transform %v to have an OnTimer method attached to handle"+
+						"Timer Family ID: %v callback, but it did not. Please file an issue with Apache Beam"+
+						"if you have defined OnTimer method with reproducible code at https://github.com/apache/beam/issues", ptransformID, timerFamilyID)
+					return errors.WithContext(err, "ontimer callback invocation failed")
+				}
+			}
+			return nil
+		})
+
+	return checkpoints, err
 }
 
-func (n *DataSource) makeReStream(ctx context.Context, key *FullValue, cv ElementDecoder, bcr *byteCountReader) (ReStream, error) {
+func (n *DataSource) makeReStream(ctx context.Context, cv ElementDecoder, bcr *byteCountReader, onlyStream bool) (ReStream, error) {
 	// TODO(lostluck) 2020/02/22: Do we include the chunk size, or just the element sizes?
 	size, err := coder.DecodeInt32(bcr.reader)
 	if err != nil {
 		return nil, errors.Wrap(err, "stream size decoding failed")
+	}
+
+	if onlyStream {
+		// If we know the stream won't be re-iterated,
+		// decode elements on demand instead to reduce memory usage.
+		switch {
+		case size >= 0:
+			return &singleUseReStream{
+				r:    bcr,
+				d:    cv,
+				size: int(size),
+			}, nil
+		case size == -1:
+			return &singleUseMultiChunkReStream{
+				r: bcr,
+				d: cv,
+				open: func(bcr *byteCountReader) (Stream, error) {
+					tokenLen, err := coder.DecodeVarInt(bcr.reader)
+					if err != nil {
+						return nil, err
+					}
+					token, err := ioutilx.ReadN(bcr.reader, (int)(tokenLen))
+					if err != nil {
+						return nil, err
+					}
+					r, err := n.state.OpenIterable(ctx, n.SID, token)
+					if err != nil {
+						return nil, err
+					}
+					// We can't re-use the original bcr, since we may get new iterables,
+					// but we can re-use the count itself.
+					r = &byteCountReader{reader: r, count: bcr.count}
+					return &elementStream{r: r, ec: cv}, nil
+				},
+			}, nil
+		}
 	}
 
 	switch {
@@ -249,7 +386,7 @@ func (n *DataSource) makeReStream(ctx context.Context, key *FullValue, cv Elemen
 	}
 }
 
-func readStreamToBuffer(cv ElementDecoder, r io.ReadCloser, size int64, buf []FullValue) ([]FullValue, error) {
+func readStreamToBuffer(cv ElementDecoder, r io.Reader, size int64, buf []FullValue) ([]FullValue, error) {
 	for i := int64(0); i < size; i++ {
 		value, err := cv.Decode(r)
 		if err != nil {
@@ -276,7 +413,7 @@ func (n *DataSource) Down(ctx context.Context) error {
 }
 
 func (n *DataSource) String() string {
-	return fmt.Sprintf("DataSource[%v, %v] Coder:%v Out:%v", n.SID, n.Name, n.Coder, n.Out.ID())
+	return fmt.Sprintf("DataSource[%v, %v] Out:%v Coder:%v ", n.SID, n.Name, n.Out.ID(), n.Coder)
 }
 
 // incrementIndexAndCheckSplit increments DataSource.index by one and checks if
@@ -299,7 +436,8 @@ type ProgressReportSnapshot struct {
 	ID, Name string
 	Count    int64
 
-	pcol PCollectionSnapshot
+	pcol                  PCollectionSnapshot
+	ConsumingReceivedData bool
 }
 
 // Progress returns a snapshot of the source's progress.
@@ -312,13 +450,15 @@ func (n *DataSource) Progress() ProgressReportSnapshot {
 	// The count is the number of "completely processed elements"
 	// which matches the index of the currently processing element.
 	c := n.index
+	// Retrieve the signal from the Data source.
+	consumingReceivedData := n.consumingReceivedData.Load()
 	n.mu.Unlock()
 	// Do not sent negative progress reports, index is initialized to 0.
 	if c < 0 {
 		c = 0
 	}
 	pcol.ElementCount = c
-	return ProgressReportSnapshot{ID: n.SID.PtransformID, Name: n.Name, Count: c, pcol: pcol}
+	return ProgressReportSnapshot{ID: n.SID.PtransformID, Name: n.Name, Count: c, pcol: pcol, ConsumingReceivedData: consumingReceivedData}
 }
 
 // getProcessContinuation retrieves a ProcessContinuation that may be returned by
@@ -348,18 +488,22 @@ func (n *DataSource) makeEncodeElms() func([]*FullValue) ([][]byte, error) {
 	return encodeElms
 }
 
+type Checkpoint struct {
+	SR      SplitResult
+	Reapply time.Duration
+}
+
 // Checkpoint attempts to split an SDF that has self-checkpointed (e.g. returned a
 // ProcessContinuation) and needs to be resumed later. If the underlying DoFn is not
 // splittable or has not returned a resuming continuation, the function returns an empty
 // SplitResult, a negative resumption time, and a false boolean to indicate that no split
 // occurred.
-func (n *DataSource) Checkpoint() (SplitResult, time.Duration, bool, error) {
+func (n *DataSource) checkpointThis(ctx context.Context, pc sdf.ProcessContinuation) (*Checkpoint, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	pc := n.getProcessContinuation()
 	if pc == nil || !pc.ShouldResume() {
-		return SplitResult{}, -1 * time.Minute, false, nil
+		return nil, nil
 	}
 
 	su := SplittableUnit(n.Out.(*ProcessSizedElementsAndRestrictions))
@@ -367,19 +511,19 @@ func (n *DataSource) Checkpoint() (SplitResult, time.Duration, bool, error) {
 	ow := su.GetOutputWatermark()
 
 	// Checkpointing is functionally a split at fraction 0.0
-	rs, err := su.Checkpoint()
+	rs, err := su.Checkpoint(ctx)
 	if err != nil {
-		return SplitResult{}, -1 * time.Minute, false, err
+		return nil, err
 	}
 	if len(rs) == 0 {
-		return SplitResult{}, -1 * time.Minute, false, nil
+		return nil, nil
 	}
 
 	encodeElms := n.makeEncodeElms()
 
 	rsEnc, err := encodeElms(rs)
 	if err != nil {
-		return SplitResult{}, -1 * time.Minute, false, err
+		return nil, err
 	}
 
 	res := SplitResult{
@@ -388,7 +532,7 @@ func (n *DataSource) Checkpoint() (SplitResult, time.Duration, bool, error) {
 		InId: su.GetInputId(),
 		OW:   ow,
 	}
-	return res, pc.ResumeDelay(), true, nil
+	return &Checkpoint{SR: res, Reapply: pc.ResumeDelay()}, nil
 }
 
 // Split takes a sorted set of potential split indices and a fraction of the
@@ -404,8 +548,8 @@ func (n *DataSource) Checkpoint() (SplitResult, time.Duration, bool, error) {
 // The bufSize param specifies the estimated number of elements that will be
 // sent to this DataSource, and is used to be able to perform accurate splits
 // even if the DataSource has not yet received all its elements. A bufSize of
-// 0 or less indicates that its unknown, and so uses the current known size.
-func (n *DataSource) Split(splits []int64, frac float64, bufSize int64) (SplitResult, error) {
+// 0 or less indicates that it's unknown, and so uses the current known size.
+func (n *DataSource) Split(ctx context.Context, splits []int64, frac float64, bufSize int64) (SplitResult, error) {
 	if n == nil {
 		return SplitResult{}, fmt.Errorf("failed to split at requested splits: {%v}, DataSource not initialized", splits)
 	}
@@ -450,7 +594,8 @@ func (n *DataSource) Split(splits []int64, frac float64, bufSize int64) (SplitRe
 	}
 	s, fr, err := splitHelper(n.index, bufSize, currProg, splits, frac, su != nil)
 	if err != nil {
-		return SplitResult{}, err
+		log.Infof(ctx, "Unsuccessful split: %v", err)
+		return SplitResult{Unsuccessful: true}, nil
 	}
 
 	// No fraction returned, perform channel split.
@@ -461,7 +606,7 @@ func (n *DataSource) Split(splits []int64, frac float64, bufSize int64) (SplitRe
 	// Get the output watermark before splitting to avoid accidentally overestimating
 	ow := su.GetOutputWatermark()
 	// Otherwise, perform a sub-element split.
-	ps, rs, err := su.Split(fr)
+	ps, rs, err := su.Split(ctx, fr)
 	if err != nil {
 		return SplitResult{}, err
 	}

@@ -29,7 +29,7 @@ import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PInput;
 import org.apache.beam.sdk.values.Row;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 @AutoService(ExternalTransformRegistrar.class)
@@ -43,13 +43,14 @@ public class ExternalSqlTransformRegistrar implements ExternalTransformRegistrar
 
   @Override
   public Map<String, Class<? extends ExternalTransformBuilder<?, ?, ?>>> knownBuilders() {
-    return org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap.of(
+    return org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap.of(
         URN, Builder.class);
   }
 
   public static class Configuration {
     String query = "";
     @Nullable String dialect;
+    @Nullable String ddl;
 
     public void setQuery(String query) {
       this.query = query;
@@ -57,6 +58,10 @@ public class ExternalSqlTransformRegistrar implements ExternalTransformRegistrar
 
     public void setDialect(@Nullable String dialect) {
       this.dialect = dialect;
+    }
+
+    public void setDdl(@Nullable String ddl) {
+      this.ddl = ddl;
     }
   }
 
@@ -75,6 +80,10 @@ public class ExternalSqlTransformRegistrar implements ExternalTransformRegistrar
                   configuration.dialect, DIALECTS.keySet()));
         }
         transform = transform.withQueryPlannerClass(queryPlanner);
+      }
+      // Add any DDL string
+      if (configuration.ddl != null) {
+        transform = transform.withDdlString(configuration.ddl);
       }
       return transform;
     }

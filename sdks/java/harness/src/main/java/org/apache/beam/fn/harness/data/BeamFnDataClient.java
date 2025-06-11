@@ -33,12 +33,7 @@ import org.apache.beam.sdk.fn.data.FnDataReceiver;
  */
 public interface BeamFnDataClient {
   /**
-   * Registers the following inbound receiver for the provided instruction id.
-   *
-   * <p>The provided coder is used to decode inbound elements. The decoded elements are passed to
-   * the provided receiver. Any failure during decoding or processing of the element will complete
-   * the returned future exceptionally. On successful termination of the stream, the returned future
-   * is completed successfully.
+   * Registers a receiver for the provided instruction id.
    *
    * <p>The receiver is not required to be thread safe.
    *
@@ -60,16 +55,25 @@ public interface BeamFnDataClient {
    * successfully.
    *
    * <p>It is expected that if a bundle fails during processing then the failure will become visible
-   * to the {@link BeamFnDataClient} during a future {@link FnDataReceiver#accept} invocation.
+   * to the {@link BeamFnDataClient} during a future {@link FnDataReceiver#accept} invocation or via
+   * a call to {@link #poisonInstructionId}.
    */
   void unregisterReceiver(String instructionId, List<ApiServiceDescriptor> apiServiceDescriptors);
+
+  /**
+   * Poisons the instruction id, indicating that future data arriving for it should be discarded.
+   * Unregisters the receiver if was registered.
+   *
+   * @param instructionId
+   */
+  void poisonInstructionId(String instructionId);
 
   /**
    * Creates a {@link BeamFnDataOutboundAggregator} for buffering and sending outbound data and
    * timers over the data plane. It is important that {@link
    * BeamFnDataOutboundAggregator#sendOrCollectBufferedDataAndFinishOutboundStreams()} is called on
    * the returned BeamFnDataOutboundAggregator at the end of each bundle. If
-   * collectElementsIfNoFlushes is set to true, {@link *
+   * collectElementsIfNoFlushes is set to true, {@link
    * BeamFnDataOutboundAggregator#sendOrCollectBufferedDataAndFinishOutboundStreams()} returns the
    * buffered elements instead of sending it through the outbound StreamObserver if there's no
    * previous flush.

@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.ChangeStreamMetrics;
+import org.apache.beam.sdk.io.gcp.spanner.changestreams.cache.WatermarkCache;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.dao.PartitionMetadataDao;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.mapper.PartitionMetadataMapper;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.model.PartitionMetadata;
@@ -50,6 +51,7 @@ public class DetectNewPartitionsAction {
 
   private final PartitionMetadataDao dao;
   private final PartitionMetadataMapper mapper;
+  private final WatermarkCache cache;
   private final ChangeStreamMetrics metrics;
   private final Duration resumeDuration;
 
@@ -57,10 +59,12 @@ public class DetectNewPartitionsAction {
   public DetectNewPartitionsAction(
       PartitionMetadataDao dao,
       PartitionMetadataMapper mapper,
+      WatermarkCache cache,
       ChangeStreamMetrics metrics,
       Duration resumeDuration) {
     this.dao = dao;
     this.mapper = mapper;
+    this.cache = cache;
     this.metrics = metrics;
     this.resumeDuration = resumeDuration;
   }
@@ -98,7 +102,7 @@ public class DetectNewPartitionsAction {
 
     final Timestamp readTimestamp = tracker.currentRestriction().getFrom();
     // Updates the current watermark as the min of the watermarks from all existing partitions
-    final Timestamp minWatermark = dao.getUnfinishedMinWatermark();
+    final Timestamp minWatermark = cache.getUnfinishedMinWatermark();
 
     if (minWatermark != null) {
       return processPartitions(tracker, receiver, watermarkEstimator, minWatermark, readTimestamp);
@@ -129,8 +133,7 @@ public class DetectNewPartitionsAction {
         partitions.add(partition);
       }
     }
-    LOG.info(
-        "Found " + partitions.size() + " to be scheduled (readTimestamp = " + readTimestamp + ")");
+    LOG.info("Found {} to be scheduled (readTimestamp = {})", partitions.size(), readTimestamp);
     return partitions;
   }
 
@@ -147,15 +150,22 @@ public class DetectNewPartitionsAction {
       OutputReceiver<PartitionMetadata> receiver,
       Timestamp minWatermark,
       TreeMap<Timestamp, List<PartitionMetadata>> batches) {
+    List<PartitionMetadata> batchPartitionsDifferentCreatedAt = new ArrayList<>();
+    int numTimestampsHandledSofar = 0;
     for (Map.Entry<Timestamp, List<PartitionMetadata>> batch : batches.entrySet()) {
+      numTimestampsHandledSofar++;
       final Timestamp batchCreatedAt = batch.getKey();
-      final List<PartitionMetadata> batchPartitions = batch.getValue();
-
-      final Timestamp scheduledAt = updateBatchToScheduled(batchPartitions);
-      if (!tracker.tryClaim(batchCreatedAt)) {
-        return ProcessContinuation.stop();
+      final List<PartitionMetadata> batchPartitionsSameCreatedAt = batch.getValue();
+      batchPartitionsDifferentCreatedAt.addAll(batchPartitionsSameCreatedAt);
+      if (batchPartitionsDifferentCreatedAt.size() >= 200
+          || numTimestampsHandledSofar == batches.size()) {
+        final Timestamp scheduledAt = updateBatchToScheduled(batchPartitionsDifferentCreatedAt);
+        if (!tracker.tryClaim(batchCreatedAt)) {
+          return ProcessContinuation.stop();
+        }
+        outputBatch(receiver, minWatermark, batchPartitionsDifferentCreatedAt, scheduledAt);
+        batchPartitionsDifferentCreatedAt = new ArrayList<>();
       }
-      outputBatch(receiver, minWatermark, batchPartitions, scheduledAt);
     }
 
     return ProcessContinuation.resume().withResumeDelay(resumeDuration);
@@ -180,14 +190,11 @@ public class DetectNewPartitionsAction {
           partition.toBuilder().setScheduledAt(scheduledAt).build();
 
       LOG.info(
-          "["
-              + updatedPartition.getPartitionToken()
-              + "] Scheduled partition at "
-              + updatedPartition.getScheduledAt()
-              + " with start time "
-              + updatedPartition.getStartTimestamp()
-              + " and end time "
-              + updatedPartition.getEndTimestamp());
+          "[{}] Outputting partition at {} with start time {} and end time {}",
+          updatedPartition.getPartitionToken(),
+          updatedPartition.getScheduledAt(),
+          updatedPartition.getStartTimestamp(),
+          updatedPartition.getEndTimestamp());
 
       receiver.outputWithTimestamp(partition, new Instant(minWatermark.toSqlTimestamp()));
 

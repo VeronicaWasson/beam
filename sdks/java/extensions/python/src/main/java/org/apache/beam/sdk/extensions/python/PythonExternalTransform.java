@@ -17,8 +17,16 @@
  */
 package org.apache.beam.sdk.extensions.python;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.io.Writer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.SortedMap;
@@ -26,10 +34,10 @@ import java.util.TreeMap;
 import java.util.UUID;
 import org.apache.beam.model.pipeline.v1.ExternalTransforms;
 import org.apache.beam.repackaged.core.org.apache.commons.lang3.ClassUtils;
-import org.apache.beam.runners.core.construction.External;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.CoderException;
 import org.apache.beam.sdk.coders.RowCoder;
+import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.schemas.JavaFieldSchema;
 import org.apache.beam.sdk.schemas.NoSuchSchemaException;
 import org.apache.beam.sdk.schemas.Schema;
@@ -39,23 +47,30 @@ import org.apache.beam.sdk.schemas.logicaltypes.PythonCallable;
 import org.apache.beam.sdk.schemas.utils.StaticSchemaInference;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.SerializableFunction;
+import org.apache.beam.sdk.transformservice.launcher.TransformServiceLauncher;
 import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.util.PythonCallableSource;
+import org.apache.beam.sdk.util.ReleaseInfo;
+import org.apache.beam.sdk.util.construction.External;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionRowTuple;
 import org.apache.beam.sdk.values.PCollectionTuple;
 import org.apache.beam.sdk.values.PInput;
 import org.apache.beam.sdk.values.POutput;
 import org.apache.beam.sdk.values.Row;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TypeDescriptor;
-import org.apache.beam.vendor.grpc.v1p43p2.com.google.protobuf.ByteString;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Splitter;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Strings;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.ByteString;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Strings;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Wrapper for invoking external Python transforms. */
 public class PythonExternalTransform<InputT extends PInput, OutputT extends POutput>
@@ -65,6 +80,7 @@ public class PythonExternalTransform<InputT extends PInput, OutputT extends POut
   private String fullyQualifiedName;
 
   private String expansionService;
+  private List<String> extraPackages;
 
   // We preseve the order here since Schema's care about order of fields but the order will not
   // matter when applying kwargs at the Python side.
@@ -76,9 +92,12 @@ public class PythonExternalTransform<InputT extends PInput, OutputT extends POut
 
   Map<String, Coder<?>> outputCoders;
 
+  private static final Logger LOG = LoggerFactory.getLogger(PythonExternalTransform.class);
+
   private PythonExternalTransform(String fullyQualifiedName, String expansionService) {
     this.fullyQualifiedName = fullyQualifiedName;
     this.expansionService = expansionService;
+    this.extraPackages = new ArrayList<>();
     this.kwargsMap = new TreeMap<>();
     this.typeHints = new HashMap<>();
     // TODO(https://github.com/apache/beam/issues/21567): remove a default type hint for
@@ -127,14 +146,14 @@ public class PythonExternalTransform<InputT extends PInput, OutputT extends POut
    *         ...valuesForMyPTransformConstructorIfAny);
    * </pre>
    *
-   * @param tranformName fully qualified transform name.
+   * @param transformName fully qualified transform name.
    * @param <InputT> Input {@link PCollection} type
    * @param <OutputT> Output {@link PCollection} type
    * @return A {@link PythonExternalTransform} for the given transform name.
    */
   public static <InputT extends PInput, OutputT extends POutput>
-      PythonExternalTransform<InputT, OutputT> from(String tranformName) {
-    return new PythonExternalTransform<>(tranformName, "");
+      PythonExternalTransform<InputT, OutputT> from(String transformName) {
+    return new PythonExternalTransform<>(transformName, "");
   }
 
   /**
@@ -142,15 +161,15 @@ public class PythonExternalTransform<InputT extends PInput, OutputT extends POut
    *
    * <p>See {@link PythonExternalTransform#from(String)} for the meaning of transformName.
    *
-   * @param tranformName fully qualified transform name.
+   * @param transformName fully qualified transform name.
    * @param expansionService address and port number for externally launched expansion service
    * @param <InputT> Input {@link PCollection} type
    * @param <OutputT> Output {@link PCollection} type
    * @return A {@link PythonExternalTransform} for the given transform name.
    */
   public static <InputT extends PInput, OutputT extends POutput>
-      PythonExternalTransform<InputT, OutputT> from(String tranformName, String expansionService) {
-    return new PythonExternalTransform<>(tranformName, expansionService);
+      PythonExternalTransform<InputT, OutputT> from(String transformName, String expansionService) {
+    return new PythonExternalTransform<>(transformName, expansionService);
   }
 
   /**
@@ -266,6 +285,25 @@ public class PythonExternalTransform<InputT extends PInput, OutputT extends POut
     return this;
   }
 
+  /**
+   * Specifies that the given Python packages are required for this transform, which will cause them
+   * to be installed in both the construction-time and execution time environment.
+   *
+   * @param extraPackages a list of pip-installable package specifications, such as would be found
+   *     in a requirements file.
+   * @return updated wrapper for the cross-language transform.
+   */
+  public PythonExternalTransform<InputT, OutputT> withExtraPackages(List<String> extraPackages) {
+    if (extraPackages.isEmpty()) {
+      return this;
+    }
+    Preconditions.checkState(
+        Strings.isNullOrEmpty(expansionService),
+        "Extra packages only apply to auto-started expansion service.");
+    this.extraPackages = extraPackages;
+    return this;
+  }
+
   @VisibleForTesting
   Row buildOrGetKwargsRow() {
     if (providedKwargsRow != null) {
@@ -274,7 +312,6 @@ public class PythonExternalTransform<InputT extends PInput, OutputT extends POut
       Schema schema =
           generateSchemaFromFieldValues(
               kwargsMap.values().toArray(), kwargsMap.keySet().toArray(new String[] {}));
-      schema.setUUID(UUID.randomUUID());
       return Row.withSchema(schema)
           .addValues(convertComplexTypesToRows(kwargsMap.values().toArray()))
           .build();
@@ -330,7 +367,6 @@ public class PythonExternalTransform<InputT extends PInput, OutputT extends POut
   @VisibleForTesting
   Row buildOrGetArgsRow() {
     Schema schema = generateSchemaFromFieldValues(argsArray, null);
-    schema.setUUID(UUID.randomUUID());
     Object[] convertedValues = convertComplexTypesToRows(argsArray);
     return Row.withSchema(schema).addValues(convertedValues).build();
   }
@@ -384,7 +420,6 @@ public class PythonExternalTransform<InputT extends PInput, OutputT extends POut
       schemaBuilder.addRowField("kwargs", kwargsRow.getSchema());
     }
     Schema payloadSchema = schemaBuilder.build();
-    payloadSchema.setUUID(UUID.randomUUID());
     Row.Builder payloadRowBuilder = Row.withSchema(payloadSchema);
     payloadRowBuilder.addValue(fullyQualifiedName);
     if (argsRow.getValues().size() > 0) {
@@ -406,30 +441,131 @@ public class PythonExternalTransform<InputT extends PInput, OutputT extends POut
     }
   }
 
+  private boolean isPythonAvailable() {
+    for (String executable : ImmutableList.of("python3", "python")) {
+      try {
+        new ProcessBuilder(executable, "--version").start().waitFor();
+        return true;
+      } catch (IOException | InterruptedException exn) {
+        // Ignore.
+      }
+    }
+    return false;
+  }
+
+  private boolean isDockerAvailable() {
+    String executable = "docker";
+    try {
+      new ProcessBuilder(executable, "--version").start().waitFor();
+      return true;
+    } catch (IOException | InterruptedException exn) {
+      // Ignore.
+    }
+    return false;
+  }
+
   @Override
   public OutputT expand(InputT input) {
     try {
       ExternalTransforms.ExternalConfigurationPayload payload = generatePayload();
       if (!Strings.isNullOrEmpty(expansionService)) {
+        int portIndex = expansionService.lastIndexOf(':');
+        if (portIndex <= 0) {
+          throw new IllegalArgumentException(
+              "Unexpected expansion service address. Expected to be in the "
+                  + "format \"<host>:<port>\"");
+        }
         PythonService.waitForPort(
-            Iterables.get(Splitter.on(':').split(expansionService), 0),
-            Integer.parseInt(Iterables.get(Splitter.on(':').split(expansionService), 1)),
+            expansionService.substring(0, portIndex),
+            Integer.parseInt(expansionService.substring(portIndex + 1, expansionService.length())),
             15000);
         return apply(input, expansionService, payload);
       } else {
+        OutputT output = null;
         int port = PythonService.findAvailablePort();
-        PythonService service =
-            new PythonService(
-                "apache_beam.runners.portability.expansion_service_main",
-                "--port",
-                "" + port,
-                "--fully_qualified_name_glob",
-                "*");
-        try (AutoCloseable p = service.start()) {
-          PythonService.waitForPort("localhost", port, 15000);
-          return apply(input, String.format("localhost:%s", port), payload);
+        PipelineOptionsFactory.register(PythonExternalTransformOptions.class);
+        PythonExternalTransformOptions options =
+            input.getPipeline().getOptions().as(PythonExternalTransformOptions.class);
+        boolean useTransformService = options.getUseTransformService();
+        @Nullable String customBeamRequirement = options.getCustomBeamRequirement();
+        boolean pythonAvailable = isPythonAvailable();
+        boolean dockerAvailable = isDockerAvailable();
+
+        File requirementsFile = null;
+        if (!extraPackages.isEmpty()) {
+          requirementsFile = File.createTempFile("requirements", ".txt");
+          requirementsFile.deleteOnExit();
+          try (Writer fout =
+              new OutputStreamWriter(
+                  new FileOutputStream(requirementsFile.getAbsolutePath()),
+                  StandardCharsets.UTF_8)) {
+            for (String pkg : extraPackages) {
+              fout.write(pkg);
+              fout.write('\n');
+            }
+          }
+        }
+
+        // We use the transform service if either of the following is true.
+        // * It was explicitly requested.
+        // * Python executable is not available in the system but Docker is available.
+        if (useTransformService || (!pythonAvailable && dockerAvailable)) {
+          // A unique project name ensures that this expansion gets a dedicated instance of the
+          // transform service.
+          String projectName = UUID.randomUUID().toString();
+
+          String messageAppend =
+              useTransformService
+                  ? "it was explicitly requested"
+                  : "a Python executable is not available in the system";
+          LOG.info(
+              "Using the Docker Compose based transform service since {}. Service will have the "
+                  + "project name {} and will be made available at the port {}",
+              messageAppend,
+              projectName,
+              port);
+
+          String pythonRequirementsFile =
+              requirementsFile != null ? requirementsFile.getAbsolutePath() : null;
+          TransformServiceLauncher service =
+              TransformServiceLauncher.forProject(projectName, port, pythonRequirementsFile);
+          service.setBeamVersion(ReleaseInfo.getReleaseInfo().getSdkVersion());
+          try {
+            // Starting the transform service.
+            service.start();
+            // Waiting the service to be ready.
+            service.waitTillUp(-1);
+            // Expanding the transform.
+            output = apply(input, String.format("localhost:%s", port), payload);
+          } finally {
+            // Shutting down the transform service.
+            service.shutdown();
+          }
+          return output;
+        } else {
+
+          ImmutableList.Builder<String> args = ImmutableList.builder();
+          args.add(
+              "--port=" + port, "--fully_qualified_name_glob=*", "--pickle_library=cloudpickle");
+          if (requirementsFile != null) {
+            args.add("--requirements_file=" + requirementsFile.getAbsolutePath());
+          }
+          PythonService service =
+              new PythonService(
+                      "apache_beam.runners.portability.expansion_service_main", args.build())
+                  .withExtraPackages(extraPackages);
+          if (!Strings.isNullOrEmpty(customBeamRequirement)) {
+            service = service.withCustomBeamRequirement(customBeamRequirement);
+          }
+          try (AutoCloseable p = service.start()) {
+            // allow more time waiting for the port ready for transient expansion service setup.
+            PythonService.waitForPort("localhost", port, 60000);
+            return apply(input, String.format("localhost:%s", port), payload);
+          }
         }
       }
+    } catch (RuntimeException exn) {
+      throw exn;
     } catch (Exception exn) {
       throw new RuntimeException(exn);
     }
@@ -451,6 +587,8 @@ public class PythonExternalTransform<InputT extends PInput, OutputT extends POut
       outputs = ((PCollection<?>) input).apply(transform);
     } else if (input instanceof PCollectionTuple) {
       outputs = ((PCollectionTuple) input).apply(transform);
+    } else if (input instanceof PCollectionRowTuple) {
+      outputs = ((PCollectionRowTuple) input).apply(transform);
     } else if (input instanceof PBegin) {
       outputs = ((PBegin) input).apply(transform);
     } else {

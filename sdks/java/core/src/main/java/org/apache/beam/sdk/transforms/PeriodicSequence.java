@@ -17,18 +17,24 @@
  */
 package org.apache.beam.sdk.transforms;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import java.util.Objects;
+import org.apache.beam.sdk.annotations.Internal;
 import org.apache.beam.sdk.io.range.OffsetRange;
 import org.apache.beam.sdk.schemas.JavaFieldSchema;
 import org.apache.beam.sdk.schemas.annotations.DefaultSchema;
+import org.apache.beam.sdk.transforms.splittabledofn.ManualWatermarkEstimator;
 import org.apache.beam.sdk.transforms.splittabledofn.RestrictionTracker;
 import org.apache.beam.sdk.transforms.splittabledofn.SplitResult;
+import org.apache.beam.sdk.transforms.splittabledofn.WatermarkEstimator;
+import org.apache.beam.sdk.transforms.splittabledofn.WatermarkEstimators;
+import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.values.PCollection;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.MoreObjects;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.MoreObjects;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
@@ -52,6 +58,7 @@ public class PeriodicSequence
     public Instant first;
     public Instant last;
     public Long durationMilliSec;
+    public boolean catchUpToNow;
 
     public SequenceDefinition() {}
 
@@ -59,6 +66,17 @@ public class PeriodicSequence
       this.first = first;
       this.last = last;
       this.durationMilliSec = duration.getMillis();
+      this.catchUpToNow = true;
+    }
+
+    /** <b><i>catchUpToNow is experimental; no backwards-compatibility guarantees.</i></b> */
+    @Internal
+    public SequenceDefinition(
+        Instant first, Instant last, Duration duration, boolean catchUpToNow) {
+      this.first = first;
+      this.last = last;
+      this.durationMilliSec = duration.getMillis();
+      this.catchUpToNow = catchUpToNow;
     }
 
     @Override
@@ -147,7 +165,9 @@ public class PeriodicSequence
 
     @Override
     public IsBounded isBounded() {
-      return IsBounded.BOUNDED;
+      return range.getTo() == BoundedWindow.TIMESTAMP_MAX_VALUE.getMillis()
+          ? IsBounded.UNBOUNDED
+          : IsBounded.BOUNDED;
     }
 
     @Override
@@ -178,9 +198,35 @@ public class PeriodicSequence
       return new OutputRangeTracker(restriction);
     }
 
+    @GetInitialWatermarkEstimatorState
+    public Instant getInitialWatermarkState() {
+      return BoundedWindow.TIMESTAMP_MIN_VALUE;
+    }
+
+    @NewWatermarkEstimator
+    public WatermarkEstimator<Instant> newWatermarkEstimator(
+        @WatermarkEstimatorState Instant state) {
+
+      return new WatermarkEstimators.Manual(state);
+    }
+
+    @TruncateRestriction
+    public RestrictionTracker.TruncateResult<OffsetRange> truncate() {
+      // stop emitting immediately upon drain
+      return null;
+    }
+
+    @GetSize
+    public double getSize(
+        @Element SequenceDefinition sequence, @Restriction OffsetRange offsetRange) {
+      long nowMilliSec = Instant.now().getMillis();
+      return sequenceBacklogBytes(sequence.durationMilliSec, nowMilliSec, offsetRange);
+    }
+
     @ProcessElement
     public ProcessContinuation processElement(
         @Element SequenceDefinition srcElement,
+        ManualWatermarkEstimator<Instant> estimator,
         OutputReceiver<Instant> out,
         RestrictionTracker<OffsetRange, Long> restrictionTracker) {
 
@@ -190,18 +236,27 @@ public class PeriodicSequence
 
       boolean claimSuccess = true;
 
+      estimator.setWatermark(Instant.ofEpochMilli(nextOutput));
+
       while (claimSuccess && Instant.ofEpochMilli(nextOutput).isBeforeNow()) {
         claimSuccess = restrictionTracker.tryClaim(nextOutput);
         if (claimSuccess) {
           Instant output = Instant.ofEpochMilli(nextOutput);
           out.outputWithTimestamp(output, output);
+          estimator.setWatermark(output);
           nextOutput = nextOutput + interval;
+        }
+        if (!srcElement.catchUpToNow) {
+          break;
         }
       }
 
       ProcessContinuation continuation = ProcessContinuation.stop();
       if (claimSuccess) {
-        Duration offset = new Duration(Instant.now(), Instant.ofEpochMilli(nextOutput));
+        Duration offset =
+            srcElement.catchUpToNow
+                ? new Duration(Instant.now(), Instant.ofEpochMilli(nextOutput))
+                : new Duration(interval);
         continuation = ProcessContinuation.resume().withResumeDelay(offset);
       }
       return continuation;
@@ -211,5 +266,27 @@ public class PeriodicSequence
   @Override
   public PCollection<Instant> expand(PCollection<SequenceDefinition> input) {
     return input.apply(ParDo.of(new PeriodicSequenceFn()));
+  }
+
+  private static final int ENCODED_INSTANT_BYTES = 8;
+
+  private static long ceilDiv(long a, long b) {
+    long result = Math.floorDiv(a, b);
+    if (a % b != 0) {
+      ++result;
+    }
+    return result;
+  }
+
+  @VisibleForTesting
+  static long sequenceBacklogBytes(
+      long durationMilliSec, long nowMilliSec, OffsetRange offsetRange) {
+    // Find the # of outputs expected for overlap of offsetRange and [-inf, now)
+    long start = ceilDiv(offsetRange.getFrom(), durationMilliSec);
+    long end = ceilDiv(Math.min(nowMilliSec, offsetRange.getTo() - 1), durationMilliSec);
+    if (start >= end) {
+      return 0;
+    }
+    return ENCODED_INSTANT_BYTES * (end - start);
   }
 }

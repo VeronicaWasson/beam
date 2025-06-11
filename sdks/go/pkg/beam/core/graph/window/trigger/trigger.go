@@ -13,8 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package trigger helps construct aggregation triggers. It defines the trigger API
-// for Go SDK. It is experimental and subject to change.
+// Package trigger helps construct aggregation triggers with beam.WindowInto.
 package trigger
 
 import (
@@ -353,7 +352,7 @@ func (t *NeverTrigger) String() string {
 func (t NeverTrigger) trigger() {}
 
 // Never creates a Never Trigger that is never ready to fire.
-// There will only be an ON_TIME output and a final output at window expiration.
+// There will only be a single ON_TIME final output at window expiration + allowed lateness.
 func Never() *NeverTrigger {
 	return &NeverTrigger{}
 }

@@ -33,12 +33,13 @@ import org.apache.beam.sdk.schemas.Schema.FieldType;
 import org.apache.beam.sdk.schemas.annotations.DefaultSchema;
 import org.apache.beam.sdk.schemas.annotations.SchemaCaseFormat;
 import org.apache.beam.sdk.schemas.annotations.SchemaCreate;
+import org.apache.beam.sdk.schemas.annotations.SchemaFieldDescription;
 import org.apache.beam.sdk.schemas.annotations.SchemaFieldName;
 import org.apache.beam.sdk.schemas.annotations.SchemaFieldNumber;
 import org.apache.beam.sdk.schemas.utils.SchemaTestUtils;
 import org.apache.beam.sdk.util.SerializableUtils;
 import org.apache.beam.sdk.values.Row;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.CaseFormat;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.CaseFormat;
 import org.joda.time.DateTime;
 import org.joda.time.Instant;
 import org.junit.Test;
@@ -853,5 +854,36 @@ public class AutoValueSchemaTest {
     assertThat(output, equivalentTo(row));
     assertEquals(
         registry.getFromRowFunction(SimpleAutoValueWithRenamedFields.class).apply(row), autoValue);
+  }
+
+  @AutoValue
+  @DefaultSchema(AutoValueSchema.class)
+  abstract static class SchemaFieldDescriptionSimpleClass {
+    @SchemaFieldDescription("This field is a string in the row. It's very coo.")
+    abstract String getStr();
+
+    @SchemaFieldDescription(
+        "This field is a long in the row. Interestingly enough, longs are e"
+            + "ncoded as int64 by Beam, while ints are encoded as int32. "
+            + "Sign semantics are another thing")
+    abstract Long getLng();
+  }
+
+  private static final Schema FIELD_DESCRIPTION_SCHEMA =
+      Schema.of(
+          Field.of("str", FieldType.STRING)
+              .withDescription("This field is a string in the row. It's very coo."),
+          Field.of("lng", FieldType.INT64)
+              .withDescription(
+                  "This field is a long in the row. Interestingly enough, longs are e"
+                      + "ncoded as int64 by Beam, while ints are encoded as int32. "
+                      + "Sign semantics are another thing"));
+
+  @Test
+  public void testSchema_SchemaFieldDescription() throws NoSuchSchemaException {
+    SchemaRegistry registry = SchemaRegistry.createDefault();
+    Schema schema = registry.getSchema(SchemaFieldDescriptionSimpleClass.class);
+    assertEquals(FIELD_DESCRIPTION_SCHEMA.getField("lng"), schema.getField("lng"));
+    assertEquals(FIELD_DESCRIPTION_SCHEMA.getField("str"), schema.getField("str"));
   }
 }

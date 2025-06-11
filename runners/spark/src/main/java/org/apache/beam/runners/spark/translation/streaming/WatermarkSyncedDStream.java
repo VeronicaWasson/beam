@@ -17,14 +17,14 @@
  */
 package org.apache.beam.runners.spark.translation.streaming;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import java.util.Queue;
 import java.util.concurrent.TimeUnit;
 import org.apache.beam.runners.spark.util.GlobalWatermarkHolder;
-import org.apache.beam.sdk.util.WindowedValue;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Stopwatch;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.util.concurrent.Uninterruptibles;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Stopwatch;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.util.concurrent.Uninterruptibles;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext$;
 import org.apache.spark.rdd.RDD;
@@ -114,8 +114,7 @@ class WatermarkSyncedDStream<T> extends InputDStream<WindowedValue<T>> {
     final long batchTime = validTime.milliseconds();
 
     LOG.trace(
-        "BEFORE waiting for watermark sync, "
-            + "LastWatermarkedBatchTime: {}, current batch time: {}",
+        "BEFORE waiting for watermark sync, LastWatermarkedBatchTime: {}, current batch time: {}",
         GlobalWatermarkHolder.getLastWatermarkedBatchTime(),
         batchTime);
 
@@ -133,8 +132,7 @@ class WatermarkSyncedDStream<T> extends InputDStream<WindowedValue<T>> {
     LOG.info("Watermarks are now: {}", GlobalWatermarkHolder.get(batchDuration));
 
     LOG.trace(
-        "AFTER waiting for watermark sync, "
-            + "LastWatermarkedBatchTime: {}, current batch time: {}",
+        "AFTER waiting for watermark sync, LastWatermarkedBatchTime: {}, current batch time: {}",
         GlobalWatermarkHolder.getLastWatermarkedBatchTime(),
         batchTime);
 

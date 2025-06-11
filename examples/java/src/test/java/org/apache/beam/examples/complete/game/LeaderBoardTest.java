@@ -24,7 +24,7 @@ import java.io.Serializable;
 import org.apache.beam.examples.complete.game.LeaderBoard.CalculateTeamScores;
 import org.apache.beam.examples.complete.game.LeaderBoard.CalculateUserScores;
 import org.apache.beam.examples.complete.game.UserScore.GameActionInfo;
-import org.apache.beam.sdk.coders.AvroCoder;
+import org.apache.beam.sdk.extensions.avro.coders.AvroCoder;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
@@ -36,7 +36,7 @@ import org.apache.beam.sdk.transforms.windowing.IntervalWindow;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.TimestampedValue;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
 import org.junit.Rule;
@@ -99,7 +99,7 @@ public class LeaderBoardTest implements Serializable {
             .addElements(
                 event(TestUser.RED_ONE, 1, Duration.standardMinutes(4)),
                 event(TestUser.BLUE_ONE, 2, Duration.standardSeconds(270)))
-            // The window should close and emit an ON_TIME pane
+            // The window should close and emit an ON_TIME paneInfo
             .advanceWatermarkToInfinity();
 
     PCollection<KV<String, Integer>> teamScores =
@@ -137,7 +137,8 @@ public class LeaderBoardTest implements Serializable {
             // Some additional time passes and we get a speculative pane for the red team
             .advanceProcessingTime(Duration.standardMinutes(12))
             .addElements(event(TestUser.BLUE_TWO, 3, Duration.standardSeconds(22)))
-            // More time passes and a speculative pane containing a refined value for the blue pane
+            // More time passes and a speculative pane containing a refined value for the blue
+            // paneInfo
             // is
             // emitted
             .advanceProcessingTime(Duration.standardMinutes(10))
@@ -155,7 +156,7 @@ public class LeaderBoardTest implements Serializable {
     String blueTeam = TestUser.BLUE_ONE.getTeam();
     String redTeam = TestUser.RED_ONE.getTeam();
     IntervalWindow window = new IntervalWindow(baseTime, TEAM_WINDOW_DURATION);
-    // The window contains speculative panes alongside the on-time pane
+    // The window contains speculative panes alongside the on-time paneInfo
     PAssert.that(teamScores)
         .inWindow(window)
         .containsInAnyOrder(
@@ -190,7 +191,7 @@ public class LeaderBoardTest implements Serializable {
             .advanceWatermarkTo(
                 baseTime.plus(TEAM_WINDOW_DURATION).minus(Duration.standardMinutes(1)))
             // These events are late, but the window hasn't closed yet, so the elements are in the
-            // on-time pane
+            // on-time paneInfo
             .addElements(
                 event(TestUser.RED_TWO, 2, Duration.ZERO),
                 event(TestUser.RED_TWO, 5, Duration.standardMinutes(1)),
@@ -235,7 +236,7 @@ public class LeaderBoardTest implements Serializable {
                 event(TestUser.RED_ONE, 4, Duration.standardMinutes(2)),
                 event(TestUser.BLUE_ONE, 3, Duration.standardMinutes(5)))
             .advanceWatermarkTo(firstWindowCloses.minus(Duration.standardMinutes(1)))
-            // These events are late but should still appear in a late pane
+            // These events are late but should still appear in a late paneInfo
             .addElements(
                 event(TestUser.RED_TWO, 2, Duration.ZERO),
                 event(TestUser.RED_TWO, 5, Duration.standardMinutes(1)),
@@ -244,7 +245,7 @@ public class LeaderBoardTest implements Serializable {
             // has
             // not yet closed because the watermark has not advanced
             .advanceProcessingTime(Duration.standardMinutes(12))
-            // These elements should appear in the final pane
+            // These elements should appear in the final paneInfo
             .addElements(
                 event(TestUser.RED_TWO, 9, Duration.standardMinutes(1)),
                 event(TestUser.RED_TWO, 1, Duration.standardMinutes(3)))

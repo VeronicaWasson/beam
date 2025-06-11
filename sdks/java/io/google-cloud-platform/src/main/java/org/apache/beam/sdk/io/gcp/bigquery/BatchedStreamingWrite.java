@@ -56,9 +56,9 @@ import org.apache.beam.sdk.values.PCollectionTuple;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TupleTagList;
 import org.apache.beam.sdk.values.ValueInSingleWindow;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableSet;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableSet;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
 import org.checkerframework.checker.nullness.qual.RequiresNonNull;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
@@ -257,7 +257,7 @@ class BatchedStreamingWrite<ErrorT, ElementT>
         @Element KV<String, TableRowInfo<ElementT>> element,
         @Timestamp Instant timestamp,
         BoundedWindow window,
-        PaneInfo pane) {
+        PaneInfo paneInfo) {
       Map<String, List<FailsafeValueInSingleWindow<TableRow, TableRow>>> tableRows = this.tableRows;
       Map<String, List<String>> uniqueIdsForTableRows = this.uniqueIdsForTableRows;
       String tableSpec = element.getKey();
@@ -265,7 +265,9 @@ class BatchedStreamingWrite<ErrorT, ElementT>
       TableRow failsafeTableRow = toFailsafeTableRow.apply(element.getValue().tableRow);
       tableRows
           .computeIfAbsent(tableSpec, k -> new ArrayList<>())
-          .add(FailsafeValueInSingleWindow.of(tableRow, timestamp, window, pane, failsafeTableRow));
+          .add(
+              FailsafeValueInSingleWindow.of(
+                  tableRow, timestamp, window, paneInfo, failsafeTableRow));
       uniqueIdsForTableRows
           .computeIfAbsent(tableSpec, k -> new ArrayList<>())
           .add(element.getValue().uniqueId);

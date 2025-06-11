@@ -82,14 +82,14 @@ function get_version() {
 #######################################
 function download_files() {
   if [[ $1 = *"wheel"* ]]; then
-    if [[ $2 == "python3.6" ]]; then
-      BEAM_PYTHON_SDK_WHL="apache_beam-$VERSION*-cp36-cp36m-manylinux1_x86_64.whl"
-    elif [[ $2 == "python3.7" ]]; then
-      BEAM_PYTHON_SDK_WHL="apache_beam-$VERSION*-cp37-cp37m-manylinux1_x86_64.whl"
+    if [[ $2 == "python3.7" ]]; then
+      BEAM_PYTHON_SDK_WHL="apache_beam-$VERSION*-cp37-cp37m-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
     elif [[ $2 == "python3.8" ]]; then
-      BEAM_PYTHON_SDK_WHL="apache_beam-$VERSION*-cp38-cp38-manylinux1_x86_64.whl"
+      BEAM_PYTHON_SDK_WHL="apache_beam-$VERSION*-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
     elif [[ $2 == "python3.9" ]]; then
-      BEAM_PYTHON_SDK_WHL="apache_beam-$VERSION*-cp39-cp39-manylinux1_x86_64.whl"
+      BEAM_PYTHON_SDK_WHL="apache_beam-$VERSION*-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+    elif [[ $2 == "python3.10" ]]; then
+      BEAM_PYTHON_SDK_WHL="apache_beam-$VERSION*-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
     else
       echo "Unable to determine a Beam wheel for interpreter version $2."
       exit 1
@@ -97,7 +97,7 @@ function download_files() {
 
     wget -r -l2 --no-parent -nd -A "$BEAM_PYTHON_SDK_WHL*" $RC_STAGING_URL
   else
-    BEAM_PYTHON_SDK_ZIP="apache-beam-$VERSION.zip"
+    BEAM_PYTHON_SDK_ZIP="apache-beam-$VERSION.tar.gz"
     wget -r -l2 --no-parent -nd -A "$BEAM_PYTHON_SDK_ZIP*" $RC_STAGING_URL
   fi
 }
@@ -128,7 +128,7 @@ function get_sha512_name() {
   if [[ $1 = *"wheel"* ]]; then
     echo $(ls | grep "/*.whl.sha512$")
   else
-    echo $(ls | grep "/*.zip.sha512$")
+    echo $(ls | grep "/*.tar.gz.sha512$")
   fi
 }
 
@@ -142,7 +142,7 @@ function get_asc_name() {
   if [[ $1 = *"wheel"* ]]; then
     echo $(ls | grep "/*.whl.asc$")
   else
-    echo $(ls | grep "/*.zip.asc$")
+    echo $(ls | grep "/*.tar.gz.asc$")
   fi
 }
 

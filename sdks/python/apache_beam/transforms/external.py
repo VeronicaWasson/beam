@@ -15,10 +15,7 @@
 # limitations under the License.
 #
 
-"""Defines Transform whose expansion is implemented elsewhere.
-
-No backward compatibility guarantees. Everything in this module is experimental.
-"""
+"""Defines Transform whose expansion is implemented elsewhere."""
 # pytype: skip-file
 
 import contextlib
@@ -26,42 +23,72 @@ import copy
 import functools
 import glob
 import logging
+import re
+import subprocess
 import threading
+import uuid
 from collections import OrderedDict
-from typing import Dict
+from collections import namedtuple
 
 import grpc
+import yaml
 
 from apache_beam import pvalue
 from apache_beam.coders import RowCoder
+from apache_beam.options.pipeline_options import CrossLanguageOptions
 from apache_beam.portability import common_urns
 from apache_beam.portability.api import beam_artifact_api_pb2_grpc
 from apache_beam.portability.api import beam_expansion_api_pb2
 from apache_beam.portability.api import beam_expansion_api_pb2_grpc
 from apache_beam.portability.api import beam_runner_api_pb2
 from apache_beam.portability.api import external_transforms_pb2
+from apache_beam.portability.api import schema_pb2
+from apache_beam.portability.common_urns import ManagedTransforms
 from apache_beam.runners import pipeline_context
 from apache_beam.runners.portability import artifact_service
+from apache_beam.transforms import environments
 from apache_beam.transforms import ptransform
+from apache_beam.transforms.util import is_compat_version_prior_to
 from apache_beam.typehints import WithTypeHints
 from apache_beam.typehints import native_type_compatibility
 from apache_beam.typehints import row_type
 from apache_beam.typehints.schemas import named_fields_to_schema
 from apache_beam.typehints.schemas import named_tuple_from_schema
 from apache_beam.typehints.schemas import named_tuple_to_schema
+from apache_beam.typehints.schemas import typing_from_runner_api
 from apache_beam.typehints.trivial_inference import instance_to_type
 from apache_beam.typehints.typehints import Union
 from apache_beam.typehints.typehints import UnionConstraint
 from apache_beam.utils import subprocess_server
+from apache_beam.utils import transform_service_launcher
 
 DEFAULT_EXPANSION_SERVICE = 'localhost:8097'
+
+MANAGED_SCHEMA_TRANSFORM_IDENTIFIER = "beam:transform:managed:v1"
+
+_IO_EXPANSION_SERVICE_JAR_TARGET = "sdks:java:io:expansion-service:shadowJar"
+
+_GCP_EXPANSION_SERVICE_JAR_TARGET = (
+    "sdks:java:io:google-cloud-platform:expansion-service:shadowJar")
+
+# A mapping from supported managed transforms URNs to expansion service jars
+# that include the corresponding transforms.
+MANAGED_TRANSFORM_URN_TO_JAR_TARGET_MAPPING = {
+    ManagedTransforms.Urns.ICEBERG_READ.urn: _IO_EXPANSION_SERVICE_JAR_TARGET,
+    ManagedTransforms.Urns.ICEBERG_WRITE.urn: _IO_EXPANSION_SERVICE_JAR_TARGET,
+    ManagedTransforms.Urns.ICEBERG_CDC_READ.urn: _IO_EXPANSION_SERVICE_JAR_TARGET,  # pylint: disable=line-too-long
+    ManagedTransforms.Urns.KAFKA_READ.urn: _IO_EXPANSION_SERVICE_JAR_TARGET,
+    ManagedTransforms.Urns.KAFKA_WRITE.urn: _IO_EXPANSION_SERVICE_JAR_TARGET,
+    ManagedTransforms.Urns.BIGQUERY_READ.urn: _GCP_EXPANSION_SERVICE_JAR_TARGET,
+    ManagedTransforms.Urns.BIGQUERY_WRITE.urn: _GCP_EXPANSION_SERVICE_JAR_TARGET
+}
 
 
 def convert_to_typing_type(type_):
   if isinstance(type_, row_type.RowTypeConstraint):
     return named_tuple_from_schema(named_fields_to_schema(type_._fields))
   else:
-    return native_type_compatibility.convert_to_typing_type(type_)
+    return native_type_compatibility.convert_to_python_type(type_)
 
 
 def _is_optional_or_none(typehint):
@@ -104,6 +131,28 @@ class PayloadBuilder(object):
     """
     return self.build().SerializeToString()
 
+  def _get_schema_proto_and_payload(self, **kwargs):
+    named_fields = []
+    fields_to_values = OrderedDict()
+
+    for key, value in kwargs.items():
+      if not key:
+        raise ValueError('Parameter name cannot be empty')
+      if value is None:
+        raise ValueError(
+            'Received value None for key %s. None values are currently not '
+            'supported' % key)
+      named_fields.append(
+          (key, convert_to_typing_type(instance_to_type(value))))
+      fields_to_values[key] = value
+
+    schema_proto = named_fields_to_schema(named_fields)
+    row = named_tuple_from_schema(schema_proto)(**fields_to_values)
+    schema = named_tuple_to_schema(type(row))
+
+    payload = RowCoder(schema).encode(row)
+    return (schema_proto, payload)
+
 
 class SchemaBasedPayloadBuilder(PayloadBuilder):
   """
@@ -135,8 +184,8 @@ class ImplicitSchemaPayloadBuilder(SchemaBasedPayloadBuilder):
     }
 
     schema = named_fields_to_schema([
-        (key, convert_to_typing_type(instance_to_type(value))) for key,
-        value in values.items()
+        (key, convert_to_typing_type(instance_to_type(value)))
+        for key, value in values.items()
     ])
     return named_tuple_from_schema(schema)(**values)
 
@@ -154,6 +203,78 @@ class NamedTupleBasedPayloadBuilder(SchemaBasedPayloadBuilder):
 
   def _get_named_tuple_instance(self):
     return self._tuple_instance
+
+
+class SchemaTransformPayloadBuilder(PayloadBuilder):
+  def __init__(self, identifier, **kwargs):
+    self._identifier = identifier
+    self._kwargs = kwargs
+
+  def identifier(self):
+    """
+    The URN referencing this SchemaTransform
+
+    :return: str
+    """
+    return self._identifier
+
+  def build(self):
+    schema_proto, payload = self._get_schema_proto_and_payload(**self._kwargs)
+    payload = external_transforms_pb2.SchemaTransformPayload(
+        identifier=self._identifier,
+        configuration_schema=schema_proto,
+        configuration_row=payload)
+    return payload
+
+
+class ExplicitSchemaTransformPayloadBuilder(SchemaTransformPayloadBuilder):
+  def __init__(self, identifier, schema_proto, **kwargs):
+    self._identifier = identifier
+    self._schema_proto = schema_proto
+    self._kwargs = kwargs
+
+  def build(self):
+    def dict_to_row_recursive(field_type, py_value):
+      if py_value is None:
+        return None
+      type_info = field_type.WhichOneof('type_info')
+      if type_info == 'row_type':
+        return dict_to_row(field_type.row_type.schema, py_value)
+      elif type_info == 'array_type':
+        return [
+            dict_to_row_recursive(field_type.array_type.element_type, value)
+            for value in py_value
+        ]
+      elif type_info == 'map_type':
+        return {
+            key: dict_to_row_recursive(field_type.map_type.value_type, value)
+            for key, value in py_value.items()
+        }
+      else:
+        return py_value
+
+    def dict_to_row(schema_proto, py_value):
+      row_type = named_tuple_from_schema(schema_proto)
+      if isinstance(py_value, dict):
+        extra = set(py_value.keys()) - set(row_type._fields)
+        if extra:
+          raise ValueError(
+              f"Transform '{self.identifier()}' was configured with unknown "
+              f"fields: {extra}. Valid fields: {set(row_type._fields)}")
+        return row_type(
+            *[
+                dict_to_row_recursive(
+                    field.type, py_value.get(field.name, None))
+                for field in schema_proto.fields
+            ])
+      else:
+        return row_type(py_value)
+
+    return external_transforms_pb2.SchemaTransformPayload(
+        identifier=self._identifier,
+        configuration_schema=self._schema_proto,
+        configuration_row=RowCoder(self._schema_proto).encode(
+            dict_to_row(self._schema_proto, self._kwargs)))
 
 
 class JavaClassLookupPayloadBuilder(PayloadBuilder):
@@ -177,45 +298,26 @@ class JavaClassLookupPayloadBuilder(PayloadBuilder):
     self._constructor_param_kwargs = None
     self._builder_methods_and_params = OrderedDict()
 
-  def _get_schema_proto_and_payload(self, *args, **kwargs):
-    named_fields = []
-    fields_to_values = OrderedDict()
+  def _args_to_named_fields(self, args):
     next_field_id = 0
+    named_fields = OrderedDict()
     for value in args:
       if value is None:
         raise ValueError(
             'Received value None. None values are currently not supported')
-      named_fields.append(
-          ((JavaClassLookupPayloadBuilder.IGNORED_ARG_FORMAT % next_field_id),
-           convert_to_typing_type(instance_to_type(value))))
-      fields_to_values[(
+      named_fields[(
           JavaClassLookupPayloadBuilder.IGNORED_ARG_FORMAT %
           next_field_id)] = value
       next_field_id += 1
-    for key, value in kwargs.items():
-      if not key:
-        raise ValueError('Parameter name cannot be empty')
-      if value is None:
-        raise ValueError(
-            'Received value None for key %s. None values are currently not '
-            'supported' % key)
-      named_fields.append(
-          (key, convert_to_typing_type(instance_to_type(value))))
-      fields_to_values[key] = value
-
-    schema_proto = named_fields_to_schema(named_fields)
-    row = named_tuple_from_schema(schema_proto)(**fields_to_values)
-    schema = named_tuple_to_schema(type(row))
-
-    payload = RowCoder(schema).encode(row)
-    return (schema_proto, payload)
+    return named_fields
 
   def build(self):
-    constructor_param_args = self._constructor_param_args or []
-    constructor_param_kwargs = self._constructor_param_kwargs or {}
+    all_constructor_param_kwargs = self._args_to_named_fields(
+        self._constructor_param_args)
+    if self._constructor_param_kwargs:
+      all_constructor_param_kwargs.update(self._constructor_param_kwargs)
     constructor_schema, constructor_payload = (
-        self._get_schema_proto_and_payload(
-            *constructor_param_args, **constructor_param_kwargs))
+      self._get_schema_proto_and_payload(**all_constructor_param_kwargs))
     payload = external_transforms_pb2.JavaClassLookupPayload(
         class_name=self._class_name,
         constructor_schema=constructor_schema,
@@ -225,9 +327,12 @@ class JavaClassLookupPayloadBuilder(PayloadBuilder):
 
     for builder_method_name, params in self._builder_methods_and_params.items():
       builder_method_args, builder_method_kwargs = params
+      all_builder_method_kwargs = self._args_to_named_fields(
+          builder_method_args)
+      if builder_method_kwargs:
+        all_builder_method_kwargs.update(builder_method_kwargs)
       builder_method_schema, builder_method_payload = (
-          self._get_schema_proto_and_payload(
-              *builder_method_args, **builder_method_kwargs))
+        self._get_schema_proto_and_payload(**all_builder_method_kwargs))
       builder_method = external_transforms_pb2.BuilderMethod(
           name=builder_method_name,
           schema=builder_method_schema,
@@ -287,6 +392,199 @@ class JavaClassLookupPayloadBuilder(PayloadBuilder):
     return (
         self._constructor_method or self._constructor_param_args or
         self._constructor_param_kwargs)
+
+
+# Information regarding a SchemaTransform available in an external SDK.
+SchemaTransformsConfig = namedtuple(
+    'SchemaTransformsConfig',
+    ['identifier', 'configuration_schema', 'inputs', 'outputs', 'description'])
+
+ManagedReplacement = namedtuple(
+    'ManagedReplacement',
+    ['underlying_transform_identifier', 'update_compatibility_version'])
+
+
+class SchemaAwareExternalTransform(ptransform.PTransform):
+  """A proxy transform for SchemaTransforms implemented in external SDKs.
+
+  This allows Python pipelines to directly use existing SchemaTransforms
+  available to the expansion service without adding additional code in external
+  SDKs.
+
+  :param identifier: unique identifier of the SchemaTransform.
+  :param expansion_service: an expansion service to use. This should already be
+      available and the Schema-aware transforms to be used must already be
+      deployed.
+  :param rearrange_based_on_discovery: if this flag is set, the input kwargs
+      will be rearranged to match the order of fields in the external
+      SchemaTransform configuration. A discovery call will be made to fetch
+      the configuration.
+  :param classpath: (Optional) A list paths to additional jars to place on the
+      expansion service classpath.
+  :param managed_replacement: (Optional) a 'ManagedReplacement' namedtuple that
+      defines information needed to replace the transform with an equivalent
+      managed transform during the expansion. If an
+      'updateCompatibilityBeamVersion' pipeline option is provided, we will
+      only replace if the managed transform is update compatible with the
+      provided version.
+  :kwargs: field name to value mapping for configuring the schema transform.
+      keys map to the field names of the schema of the SchemaTransform
+      (in-order).
+  """
+  def __init__(
+      self,
+      identifier,
+      expansion_service,
+      rearrange_based_on_discovery=False,
+      classpath=None,
+      managed_replacement=None,
+      **kwargs):
+    self._expansion_service = expansion_service
+    self._kwargs = kwargs
+    self._classpath = classpath
+    if managed_replacement:
+      assert isinstance(managed_replacement, ManagedReplacement)
+    self._managed_replacement = managed_replacement
+
+    _kwargs = kwargs
+    if rearrange_based_on_discovery:
+      config = SchemaAwareExternalTransform.discover_config(
+          self._expansion_service, identifier)
+      self._payload_builder = ExplicitSchemaTransformPayloadBuilder(
+          identifier,
+          named_tuple_to_schema(config.configuration_schema),
+          **_kwargs)
+
+      if self._managed_replacement:
+        # We have to do the replacement at the expansion instead of at
+        # construction
+        # since we don't have access to the PipelineOptions object at the
+        # construction.
+        underlying_transform_id = (
+            self._managed_replacement.underlying_transform_identifier)
+        if not (underlying_transform_id
+                in MANAGED_TRANSFORM_URN_TO_JAR_TARGET_MAPPING):
+          raise ValueError(
+              'Could not find an expansion service jar for the managed ' +
+              'transform ' + underlying_transform_id)
+        managed_expansion_service_jar = (
+            MANAGED_TRANSFORM_URN_TO_JAR_TARGET_MAPPING
+        )[underlying_transform_id]
+        self._managed_expansion_service = BeamJarExpansionService(
+            managed_expansion_service_jar)
+        managed_config = SchemaAwareExternalTransform.discover_config(
+            self._managed_expansion_service,
+            MANAGED_SCHEMA_TRANSFORM_IDENTIFIER)
+
+        yaml_config = yaml.dump(kwargs)
+        self._managed_payload_builder = (
+            ExplicitSchemaTransformPayloadBuilder(
+                MANAGED_SCHEMA_TRANSFORM_IDENTIFIER,
+                named_tuple_to_schema(managed_config.configuration_schema),
+                transform_identifier=underlying_transform_id,
+                config=yaml_config))
+    else:
+      self._payload_builder = SchemaTransformPayloadBuilder(
+          identifier, **_kwargs)
+
+  def expand(self, pcolls):
+    # Expand the transform using the expansion service.
+    payload_builder = self._payload_builder
+    expansion_service = self._expansion_service
+
+    if self._managed_replacement:
+      compat_version_prior_to_current = is_compat_version_prior_to(
+          pcolls.pipeline._options,
+          self._managed_replacement.update_compatibility_version)
+      if not compat_version_prior_to_current:
+        payload_builder = self._managed_payload_builder
+        expansion_service = self._managed_expansion_service
+
+    return pcolls | self._payload_builder.identifier() >> ExternalTransform(
+        common_urns.schematransform_based_expand.urn,
+        payload_builder,
+        expansion_service)
+
+  @classmethod
+  @functools.lru_cache
+  def discover(cls, expansion_service, ignore_errors=False):
+    """Discover all SchemaTransforms available to the given expansion service.
+
+    :return: a list of SchemaTransformsConfigs that represent the discovered
+        SchemaTransforms.
+    """
+    return list(cls.discover_iter(expansion_service, ignore_errors))
+
+  @staticmethod
+  def discover_iter(expansion_service, ignore_errors=True):
+    with ExternalTransform.service(expansion_service) as service:
+      discover_response = service.DiscoverSchemaTransform(
+          beam_expansion_api_pb2.DiscoverSchemaTransformRequest())
+
+    for identifier in discover_response.schema_transform_configs:
+      proto_config = discover_response.schema_transform_configs[identifier]
+      try:
+        schema = named_tuple_from_schema(proto_config.config_schema)
+      except Exception as exn:
+        if ignore_errors:
+          truncated_schema = schema_pb2.Schema()
+          truncated_schema.CopyFrom(proto_config.config_schema)
+          for field in truncated_schema.fields:
+            try:
+              typing_from_runner_api(field.type)
+            except Exception:
+              if field.type.nullable:
+                # Set it to an empty placeholder type.
+                field.type.CopyFrom(
+                    schema_pb2.FieldType(
+                        nullable=True,
+                        row_type=schema_pb2.RowType(
+                            schema=schema_pb2.Schema())))
+          try:
+            schema = named_tuple_from_schema(truncated_schema)
+          except Exception as exn:
+            logging.info("Bad schema for %s: %s", identifier, str(exn)[:250])
+            continue
+        else:
+          raise
+
+      yield SchemaTransformsConfig(
+          identifier=identifier,
+          configuration_schema=schema,
+          inputs=proto_config.input_pcollection_names,
+          outputs=proto_config.output_pcollection_names,
+          description=proto_config.description)
+
+  @staticmethod
+  def discover_config(expansion_service, name):
+    """Discover one SchemaTransform by name in the given expansion service.
+
+    :return: one SchemaTransformsConfig that represents the discovered
+        SchemaTransform
+
+    :raises:
+      ValueError: if more than one SchemaTransform is discovered, or if none
+      are discovered
+    """
+
+    schematransforms = SchemaAwareExternalTransform.discover(
+        expansion_service, ignore_errors=True)
+    matched = []
+
+    for st in schematransforms:
+      if name in st.identifier:
+        matched.append(st)
+
+    if not matched:
+      raise ValueError(
+          "Did not discover any SchemaTransforms resembling the name '%s'" %
+          name)
+    elif len(matched) > 1:
+      raise ValueError(
+          "Found multiple SchemaTransforms with the name '%s':\n%s\n" %
+          (name, [st.identifier for st in matched]))
+
+    return matched[0]
 
 
 class JavaExternalTransform(ptransform.PTransform):
@@ -371,8 +669,8 @@ class AnnotationBasedPayloadBuilder(SchemaBasedPayloadBuilder):
 
   def _get_named_tuple_instance(self):
     schema = named_fields_to_schema([
-        (k, convert_to_typing_type(v)) for k,
-        v in self._transform.__init__.__annotations__.items()
+        (k, convert_to_typing_type(v))
+        for k, v in self._transform.__init__.__annotations__.items()
         if k in self._values
     ])
     return named_tuple_from_schema(schema)(**self._values)
@@ -403,8 +701,6 @@ class ExternalTransform(ptransform.PTransform):
   """
     External provides a cross-language transform via expansion services in
     foreign SDKs.
-
-    Experimental; no backwards compatibility guarantees.
   """
   _namespace_counter = 0
 
@@ -431,8 +727,8 @@ class ExternalTransform(ptransform.PTransform):
         payload.payload() if isinstance(payload, PayloadBuilder) else payload)
     self._expansion_service = expansion_service
     self._external_namespace = self._fresh_namespace()
-    self._inputs = {}  # type: Dict[str, pvalue.PCollection]
-    self._outputs = {}  # type: Dict[str, pvalue.PCollection]
+    self._inputs: dict[str, pvalue.PCollection] = {}
+    self._outputs: dict[str, pvalue.PCollection] = {}
 
   def with_output_types(self, *args, **kwargs):
     return WithTypeHints.with_output_types(self, *args, **kwargs)
@@ -462,18 +758,18 @@ class ExternalTransform(ptransform.PTransform):
   @contextlib.contextmanager
   def outer_namespace(cls, namespace):
     prev = cls.get_local_namespace()
-    cls._external_namespace.value = namespace
-    yield
-    cls._external_namespace.value = prev
+    try:
+      cls._external_namespace.value = namespace
+      yield
+    finally:
+      cls._external_namespace.value = prev
 
   @classmethod
-  def _fresh_namespace(cls):
-    # type: () -> str
+  def _fresh_namespace(cls) -> str:
     ExternalTransform._namespace_counter += 1
     return '%s_%d' % (cls.get_local_namespace(), cls._namespace_counter)
 
-  def expand(self, pvalueish):
-    # type: (pvalue.PCollection) -> pvalue.PCollection
+  def expand(self, pvalueish: pvalue.PCollection) -> pvalue.PCollection:
     if isinstance(pvalueish, pvalue.PBegin):
       self._inputs = {}
     elif isinstance(pvalueish, (list, tuple)):
@@ -516,17 +812,22 @@ class ExternalTransform(ptransform.PTransform):
     components = context.to_runner_api()
     request = beam_expansion_api_pb2.ExpansionRequest(
         components=components,
-        namespace=self._external_namespace,  # type: ignore  # mypy thinks self._namespace is threading.local
+        namespace=self._external_namespace,  # type: ignore[arg-type]
         transform=transform_proto,
-        output_coder_requests=output_coders)
+        output_coder_requests=output_coders,
+        pipeline_options=pipeline._options.to_runner_api())
 
-    with self._service() as service:
+    expansion_service = _maybe_use_transform_service(
+        self._expansion_service, pipeline.options)
+
+    with ExternalTransform.service(expansion_service) as service:
       response = service.Expand(request)
       if response.error:
-        raise RuntimeError(response.error)
+        raise RuntimeError(_sanitize_java_traceback(response.error))
       self._expanded_components = response.components
-      if any(env.dependencies
-             for env in self._expanded_components.environments.values()):
+      if any(e.dependencies
+             for env in self._expanded_components.environments.values()
+             for e in environments.expand_anyof_environments(env)):
         self._expanded_components = self._resolve_artifacts(
             self._expanded_components,
             service.artifact_service(),
@@ -543,15 +844,15 @@ class ExternalTransform(ptransform.PTransform):
 
     self._outputs = {
         tag: fix_output(result_context.pcollections.get_by_id(pcoll_id), tag)
-        for tag,
-        pcoll_id in self._expanded_transform.outputs.items()
+        for tag, pcoll_id in self._expanded_transform.outputs.items()
     }
 
     return self._output_to_pvalueish(self._outputs)
 
+  @staticmethod
   @contextlib.contextmanager
-  def _service(self):
-    if isinstance(self._expansion_service, str):
+  def service(expansion_service):
+    if isinstance(expansion_service, str):
       channel_options = [("grpc.max_receive_message_length", -1),
                          ("grpc.max_send_message_length", -1)]
       if hasattr(grpc, 'local_channel_credentials'):
@@ -560,7 +861,7 @@ class ExternalTransform(ptransform.PTransform):
         # TODO: update this to support secure non-local channels.
         channel_factory_fn = functools.partial(
             grpc.secure_channel,
-            self._expansion_service,
+            expansion_service,
             grpc.local_channel_credentials(),
             options=channel_options)
       else:
@@ -568,24 +869,32 @@ class ExternalTransform(ptransform.PTransform):
         # by older versions of grpc which may be pulled in due to other project
         # dependencies.
         channel_factory_fn = functools.partial(
-            grpc.insecure_channel,
-            self._expansion_service,
-            options=channel_options)
+            grpc.insecure_channel, expansion_service, options=channel_options)
       with channel_factory_fn() as channel:
         yield ExpansionAndArtifactRetrievalStub(channel)
-    elif hasattr(self._expansion_service, 'Expand'):
-      yield self._expansion_service
+    elif hasattr(expansion_service, 'Expand'):
+      yield expansion_service
     else:
-      with self._expansion_service as stub:
+      with expansion_service as stub:
         yield stub
 
   def _resolve_artifacts(self, components, service, dest):
-    for env in components.environments.values():
-      if env.dependencies:
+    def _resolve_artifacts_for(env):
+      if env.urn == common_urns.environments.ANYOF.urn:
+        env.CopyFrom(
+            environments.AnyOfEnvironment.create_proto([
+                _resolve_artifacts_for(e)
+                for e in environments.expand_anyof_environments(env)
+            ]))
+      elif env.dependencies:
         resolved = list(
             artifact_service.resolve_artifacts(env.dependencies, service, dest))
         del env.dependencies[:]
         env.dependencies.extend(resolved)
+      return env
+
+    for env in components.environments.values():
+      _resolve_artifacts_for(env)
     return components
 
   def _output_to_pvalueish(self, output_dict):
@@ -656,13 +965,11 @@ class ExternalTransform(ptransform.PTransform):
           subtransforms=proto.subtransforms,
           inputs={
               tag: pcoll_renames.get(pcoll, pcoll)
-              for tag,
-              pcoll in proto.inputs.items()
+              for tag, pcoll in proto.inputs.items()
           },
           outputs={
               tag: pcoll_renames.get(pcoll, pcoll)
-              for tag,
-              pcoll in proto.outputs.items()
+              for tag, pcoll in proto.outputs.items()
           },
           display_data=proto.display_data,
           environment_id=proto.environment_id)
@@ -677,14 +984,13 @@ class ExternalTransform(ptransform.PTransform):
         subtransforms=self._expanded_transform.subtransforms,
         inputs={
             tag: pcoll_renames.get(pcoll, pcoll)
-            for tag,
-            pcoll in self._expanded_transform.inputs.items()
+            for tag, pcoll in self._expanded_transform.inputs.items()
         },
         outputs={
             tag: pcoll_renames.get(pcoll, pcoll)
-            for tag,
-            pcoll in self._expanded_transform.outputs.items()
+            for tag, pcoll in self._expanded_transform.outputs.items()
         },
+        annotations=self._expanded_transform.annotations,
         environment_id=self._expanded_transform.environment_id)
 
 
@@ -698,6 +1004,9 @@ class ExpansionAndArtifactRetrievalStub(
   def artifact_service(self):
     return beam_artifact_api_pb2_grpc.ArtifactRetrievalServiceStub(
         self._channel, **self._kwargs)
+
+  def ready(self, timeout_sec):
+    grpc.channel_ready_future(self._channel).result(timeout=timeout_sec)
 
 
 class JavaJarExpansionService(object):
@@ -722,11 +1031,14 @@ class JavaJarExpansionService(object):
       self, path_to_jar, extra_args=None, classpath=None, append_args=None):
     if extra_args and append_args:
       raise ValueError('Only one of extra_args or append_args may be provided')
-    self._path_to_jar = path_to_jar
+    self.path_to_jar = path_to_jar
     self._extra_args = extra_args
     self._classpath = classpath or []
     self._service_count = 0
     self._append_args = append_args or []
+
+  def is_existing_service(self):
+    return subprocess_server.is_service_endpoint(self.path_to_jar)
 
   @staticmethod
   def _expand_jars(jar):
@@ -754,15 +1066,20 @@ class JavaJarExpansionService(object):
   def _default_args(self):
     """Default arguments to be used by `JavaJarExpansionService`."""
 
-    to_stage = ','.join([self._path_to_jar] + sum((
+    to_stage = ','.join([self.path_to_jar] + sum((
         JavaJarExpansionService._expand_jars(jar)
         for jar in self._classpath or []), []))
-    return ['{{PORT}}', f'--filesToStage={to_stage}']
+    args = ['{{PORT}}', f'--filesToStage={to_stage}']
+    # TODO(robertwb): See if it's possible to scope this per pipeline.
+    # Checks to see if the cache is being used for this server.
+    if subprocess_server.SubprocessServer._cache._live_owners:
+      args.append('--alsoStartLoopbackWorker')
+    return args
 
   def __enter__(self):
     if self._service_count == 0:
-      self._path_to_jar = subprocess_server.JavaJarServer.local_jar(
-          self._path_to_jar)
+      self.path_to_jar = subprocess_server.JavaJarServer.local_jar(
+          self.path_to_jar)
       if self._extra_args is None:
         self._extra_args = self._default_args() + self._append_args
       # Consider memoizing these servers (with some timeout).
@@ -770,7 +1087,7 @@ class JavaJarExpansionService(object):
           'Starting a JAR-based expansion service from JAR %s ' + (
               'and with classpath: %s' %
               self._classpath if self._classpath else ''),
-          self._path_to_jar)
+          self.path_to_jar)
       classpath_urls = [
           subprocess_server.JavaJarServer.local_jar(path)
           for jar in self._classpath
@@ -778,7 +1095,7 @@ class JavaJarExpansionService(object):
       ]
       self._service_provider = subprocess_server.JavaJarServer(
           ExpansionAndArtifactRetrievalStub,
-          self._path_to_jar,
+          self.path_to_jar,
           self._extra_args,
           classpath=classpath_urls)
       self._service = self._service_provider.__enter__()
@@ -819,8 +1136,108 @@ class BeamJarExpansionService(JavaJarExpansionService):
       append_args=None):
     path_to_jar = subprocess_server.JavaJarServer.path_to_beam_jar(
         gradle_target, gradle_appendix)
+    self.gradle_target = gradle_target
     super().__init__(
         path_to_jar, extra_args, classpath=classpath, append_args=append_args)
+
+
+def _maybe_use_transform_service(provided_service=None, options=None):
+  # For anything other than 'JavaJarExpansionService' we just use the
+  # provided service. For example, string address of an already available
+  # service.
+  if not isinstance(provided_service, JavaJarExpansionService):
+    return provided_service
+
+  if provided_service.is_existing_service():
+    # This is an existing service supported through the 'beam_services'
+    # PipelineOption.
+    return provided_service
+
+  def is_java_available():
+    cmd = ['java', '--version']
+
+    try:
+      subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except:  # pylint: disable=bare-except
+      return False
+
+    return True
+
+  def is_docker_available():
+    cmd = ['docker', '--version']
+
+    try:
+      subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except:  # pylint: disable=bare-except
+      return False
+
+    return True
+
+  # We try java and docker based expansion services in that order.
+
+  java_available = is_java_available()
+  docker_available = is_docker_available()
+
+  use_transform_service = options.view_as(
+      CrossLanguageOptions).use_transform_service
+
+  if (java_available and provided_service and not use_transform_service):
+    return provided_service
+  elif docker_available:
+    if use_transform_service:
+      error_append = 'it was explicitly requested'
+    elif not java_available:
+      error_append = 'the Java executable is not available in the system'
+    else:
+      error_append = 'a Java expansion service was not provided.'
+
+    project_name = str(uuid.uuid4())
+    port = subprocess_server.pick_port(None)[0]
+
+    logging.info(
+        'Trying to expand the external transform using the Docker Compose '
+        'based transform service since %s. Transform service will be under '
+        'Docker Compose project name %s and will be made available at port %r.'
+        % (error_append, project_name, str(port)))
+
+    from apache_beam import version as beam_version
+    beam_version = beam_version.__version__
+
+    return transform_service_launcher.TransformServiceLauncher(
+        project_name, port, beam_version)
+  else:
+    raise ValueError(
+        'Cannot start an expansion service since neither Java nor '
+        'Docker executables are available in the system.')
+
+
+def _sanitize_java_traceback(s):
+  """Attempts to highlight the root cause in the error string.
+
+  Java tracebacks read bottom to top, while Python tracebacks read top to
+  bottom, resulting in the actual error message getting sandwiched between two
+  walls of text.  This may result in the error being duplicated (as we don't
+  want to remove relevant information) but should be clearer in most cases.
+
+  Best-effort but non-destructive.
+  """
+  # We delete non-java-traceback lines.
+  traceback_lines = [
+      r'\tat \S+\(\S+\.java:\d+\)',
+      r'\t\.\.\. \d+ more',
+      # A bit more restrictive to avoid accidentally capturing non-java lines.
+      r'Caused by: [a-z]+(\.\S+)?\.[A-Z][A-Za-z0-9_$]+(Error|Exception):[^\n]*'
+  ]
+  without_java_traceback = s + '\n'
+  for p in traceback_lines:
+    without_java_traceback = re.sub(
+        fr'\n{p}$', '', without_java_traceback, flags=re.M)
+  # If what's left is substantially smaller, duplicate it at the end for better
+  # visibility.
+  if len(without_java_traceback) < len(s) / 2:
+    return s + '\n\n' + without_java_traceback.strip()
+  else:
+    return s
 
 
 def memoize(func):

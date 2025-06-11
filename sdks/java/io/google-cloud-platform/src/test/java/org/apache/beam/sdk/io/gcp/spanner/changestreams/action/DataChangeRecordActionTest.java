@@ -19,6 +19,7 @@ package org.apache.beam.sdk.io.gcp.spanner.changestreams.action;
 
 import static org.junit.Assert.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -26,8 +27,10 @@ import static org.mockito.Mockito.when;
 
 import com.google.cloud.Timestamp;
 import java.util.Optional;
+import org.apache.beam.sdk.io.gcp.spanner.changestreams.estimator.BytesThroughputEstimator;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.model.DataChangeRecord;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.model.PartitionMetadata;
+import org.apache.beam.sdk.io.gcp.spanner.changestreams.restriction.RestrictionInterrupter;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.restriction.TimestampRange;
 import org.apache.beam.sdk.transforms.DoFn.OutputReceiver;
 import org.apache.beam.sdk.transforms.DoFn.ProcessContinuation;
@@ -42,14 +45,18 @@ public class DataChangeRecordActionTest {
   private DataChangeRecordAction action;
   private PartitionMetadata partition;
   private RestrictionTracker<TimestampRange, Timestamp> tracker;
+  private RestrictionInterrupter<Timestamp> interrupter;
   private OutputReceiver<DataChangeRecord> outputReceiver;
   private ManualWatermarkEstimator<Instant> watermarkEstimator;
+  private BytesThroughputEstimator<DataChangeRecord> throughputEstimator;
 
   @Before
   public void setUp() {
-    action = new DataChangeRecordAction();
+    throughputEstimator = mock(BytesThroughputEstimator.class);
+    action = new DataChangeRecordAction(throughputEstimator);
     partition = mock(PartitionMetadata.class);
     tracker = mock(RestrictionTracker.class);
+    interrupter = mock(RestrictionInterrupter.class);
     outputReceiver = mock(OutputReceiver.class);
     watermarkEstimator = mock(ManualWatermarkEstimator.class);
   }
@@ -65,11 +72,12 @@ public class DataChangeRecordActionTest {
     when(partition.getPartitionToken()).thenReturn(partitionToken);
 
     final Optional<ProcessContinuation> maybeContinuation =
-        action.run(partition, record, tracker, outputReceiver, watermarkEstimator);
+        action.run(partition, record, tracker, interrupter, outputReceiver, watermarkEstimator);
 
     assertEquals(Optional.empty(), maybeContinuation);
     verify(outputReceiver).outputWithTimestamp(record, instant);
     verify(watermarkEstimator).setWatermark(instant);
+    verify(throughputEstimator).update(any(), eq(record));
   }
 
   @Test
@@ -82,10 +90,30 @@ public class DataChangeRecordActionTest {
     when(partition.getPartitionToken()).thenReturn(partitionToken);
 
     final Optional<ProcessContinuation> maybeContinuation =
-        action.run(partition, record, tracker, outputReceiver, watermarkEstimator);
+        action.run(partition, record, tracker, interrupter, outputReceiver, watermarkEstimator);
 
     assertEquals(Optional.of(ProcessContinuation.stop()), maybeContinuation);
     verify(outputReceiver, never()).outputWithTimestamp(any(), any());
     verify(watermarkEstimator, never()).setWatermark(any());
+    verify(throughputEstimator, never()).update(any(), any());
+  }
+
+  @Test
+  public void testSoftDeadlineReached() {
+    final String partitionToken = "partitionToken";
+    final Timestamp timestamp = Timestamp.ofTimeMicroseconds(10L);
+    final DataChangeRecord record = mock(DataChangeRecord.class);
+    when(record.getCommitTimestamp()).thenReturn(timestamp);
+    when(interrupter.tryInterrupt(timestamp)).thenReturn(true);
+    when(tracker.tryClaim(timestamp)).thenReturn(true);
+    when(partition.getPartitionToken()).thenReturn(partitionToken);
+
+    final Optional<ProcessContinuation> maybeContinuation =
+        action.run(partition, record, tracker, interrupter, outputReceiver, watermarkEstimator);
+
+    assertEquals(Optional.of(ProcessContinuation.resume()), maybeContinuation);
+    verify(outputReceiver, never()).outputWithTimestamp(any(), any());
+    verify(watermarkEstimator, never()).setWatermark(any());
+    verify(throughputEstimator, never()).update(any(), any());
   }
 }

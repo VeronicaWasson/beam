@@ -17,7 +17,7 @@
  */
 package org.apache.beam.sdk.io.neo4j;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import com.google.auto.value.AutoValue;
 import java.io.Serializable;
@@ -30,7 +30,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.beam.repackaged.core.org.apache.commons.lang3.StringUtils;
-import org.apache.beam.sdk.annotations.Experimental;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.harness.JvmInitializer;
 import org.apache.beam.sdk.options.ValueProvider;
@@ -46,7 +45,7 @@ import org.apache.beam.sdk.transforms.display.HasDisplayData;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PDone;
 import org.apache.beam.sdk.values.TypeDescriptor;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions;
 import org.checkerframework.checker.initialization.qual.Initialized;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
@@ -180,7 +179,6 @@ import org.slf4j.LoggerFactory;
  *    );
  * }</pre>
  */
-@Experimental(Experimental.Kind.SOURCE_SINK)
 public class Neo4jIO {
 
   private static final Logger LOG = LoggerFactory.getLogger(Neo4jIO.class);
@@ -296,9 +294,8 @@ public class Neo4jIO {
     }
 
     public DriverConfiguration withUrl(ValueProvider<String> url) {
-      Preconditions.checkArgument(
-          url != null, "a neo4j connection URL can not be empty or null", url);
-      Preconditions.checkArgument(
+      checkArgument(url != null, "a neo4j connection URL can not be empty or null", url);
+      checkArgument(
           StringUtils.isNotEmpty(url.get()),
           "a neo4j connection URL can not be empty or null",
           url);
@@ -310,8 +307,7 @@ public class Neo4jIO {
     }
 
     public DriverConfiguration withUrls(ValueProvider<List<String>> urls) {
-      Preconditions.checkArgument(
-          urls != null, "a list of neo4j connection URLs can not be empty or null", urls);
+      checkArgument(urls != null, "a list of neo4j connection URLs can not be empty or null", urls);
       Preconditions.checkArgument(
           urls.get() != null && !urls.get().isEmpty(),
           "a neo4j connection URL can not be empty or null",
@@ -328,9 +324,8 @@ public class Neo4jIO {
     }
 
     public DriverConfiguration withUsername(ValueProvider<String> username) {
-      Preconditions.checkArgument(username != null, "neo4j username can not be null", username);
-      Preconditions.checkArgument(
-          username.get() != null, "neo4j username can not be null", username);
+      checkArgument(username != null, "neo4j username can not be null", username);
+      checkArgument(username.get() != null, "neo4j username can not be null", username);
       return builder().setUsername(username).build();
     }
 
@@ -339,9 +334,8 @@ public class Neo4jIO {
     }
 
     public DriverConfiguration withPassword(ValueProvider<String> password) {
-      Preconditions.checkArgument(password != null, "neo4j password can not be null", password);
-      Preconditions.checkArgument(
-          password.get() != null, "neo4j password can not be null", password);
+      checkArgument(password != null, "neo4j password can not be null", password);
+      checkArgument(password.get() != null, "neo4j password can not be null", password);
       return builder().setPassword(password).build();
     }
 
@@ -350,9 +344,9 @@ public class Neo4jIO {
     }
 
     public DriverConfiguration withDefaultConfig(ValueProvider<Boolean> useDefault) {
-      Preconditions.checkArgument(
+      checkArgument(
           useDefault != null, "withDefaultConfig parameter useDefault can not be null", useDefault);
-      Preconditions.checkArgument(
+      checkArgument(
           useDefault.get() != null,
           "withDefaultConfig parameter useDefault can not be null",
           useDefault);
@@ -500,8 +494,7 @@ public class Neo4jIO {
     }
 
     public ReadAll<ParameterT, OutputT> withCypher(String cypher) {
-      checkArgument(
-          cypher != null, "Neo4jIO.readAll().withCypher(query) called with null cypher query");
+      checkArgument(cypher != null, "Neo4jIO.readAll().withCypher(cypher) called with null cypher");
       return withCypher(ValueProvider.StaticValueProvider.of(cypher));
     }
 
@@ -733,8 +726,8 @@ public class Neo4jIO {
       cleanUpDriverSession();
     }
 
-    @Override
-    protected void finalize() {
+    @Teardown
+    public void tearDown() {
       cleanUpDriverSession();
     }
 
@@ -821,23 +814,19 @@ public class Neo4jIO {
       // We could actually read and write here depending on the type of transaction
       // we picked.  As long as the Cypher statement returns values it's fine.
       //
-      TransactionWork<Void> transactionWork =
+      TransactionWork<Long> transactionWork =
           transaction -> {
+            long count = 0L;
             Result result = transaction.run(cypher, parametersMap);
             while (result.hasNext()) {
-              Record record = result.next();
               try {
-                OutputT outputT = rowMapper.mapRow(record);
-                processContext.output(outputT);
+                processContext.output(rowMapper.mapRow(result.next()));
               } catch (Exception e) {
-                throw new RuntimeException("error mapping Neo4j record to row", e);
+                throw new RuntimeException("Error mapping Neo4J result", e);
               }
+              count++;
             }
-
-            // We deliver no specific Neo4j transaction output beyond what goes to the context
-            // output
-            //
-            return null;
+            return count;
           };
 
       if (logCypher) {
@@ -859,11 +848,13 @@ public class Neo4jIO {
       if (driverSession.session == null) {
         throw new RuntimeException("neo4j session was not initialized correctly");
       } else {
+        final Long count;
         if (writeTransaction) {
-          driverSession.session.writeTransaction(transactionWork, transactionConfig);
+          count = driverSession.session.writeTransaction(transactionWork, transactionConfig);
         } else {
-          driverSession.session.readTransaction(transactionWork, transactionConfig);
+          count = driverSession.session.readTransaction(transactionWork, transactionConfig);
         }
+        LOG.debug("Retrieved " + count + " elements from Neo4J");
       }
     }
   }
@@ -929,7 +920,7 @@ public class Neo4jIO {
 
     public WriteUnwind<ParameterT> withCypher(String cypher) {
       checkArgument(
-          cypher != null, "Neo4jIO.writeUnwind().withCypher(query) called with null cypher query");
+          cypher != null, "Neo4jIO.writeUnwind().withCypher(cypher) called with null cypher");
       return withCypher(ValueProvider.StaticValueProvider.of(cypher));
     }
 
@@ -942,21 +933,21 @@ public class Neo4jIO {
     public WriteUnwind<ParameterT> withUnwindMapName(String mapName) {
       checkArgument(
           mapName != null,
-          "Neo4jIO.writeUnwind().withUnwindMapName(query) called with null mapName");
+          "Neo4jIO.writeUnwind().withUnwindMapName(mapName) called with null mapName");
       return withUnwindMapName(ValueProvider.StaticValueProvider.of(mapName));
     }
 
     public WriteUnwind<ParameterT> withUnwindMapName(ValueProvider<String> mapName) {
       checkArgument(
           mapName != null,
-          "Neo4jIO.writeUnwind().withUnwindMapName(cypher) called with null mapName");
+          "Neo4jIO.writeUnwind().withUnwindMapName(mapName) called with null mapName");
       return toBuilder().setUnwindMapName(mapName).build();
     }
 
     public WriteUnwind<ParameterT> withTransactionConfig(TransactionConfig transactionConfig) {
       checkArgument(
           transactionConfig != null,
-          "Neo4jIO.writeUnwind().withTransactionConfig(config) called with null transactionConfig");
+          "Neo4jIO.writeUnwind().withTransactionConfig(transactionConfig) called with null transactionConfig");
       return withTransactionConfig(ValueProvider.StaticValueProvider.of(transactionConfig));
     }
 
@@ -964,7 +955,7 @@ public class Neo4jIO {
         ValueProvider<TransactionConfig> transactionConfig) {
       checkArgument(
           transactionConfig != null,
-          "Neo4jIO.writeUnwind().withTransactionConfig(config) called with null transactionConfig");
+          "Neo4jIO.writeUnwind().withTransactionConfig(transactionConfig) called with null transactionConfig");
       return toBuilder().setTransactionConfig(transactionConfig).build();
     }
 
@@ -985,14 +976,14 @@ public class Neo4jIO {
     // Batch size
     public WriteUnwind<ParameterT> withBatchSize(long batchSize) {
       checkArgument(
-          batchSize > 0, "Neo4jIO.writeUnwind().withFetchSize(query) called with batchSize<=0");
+          batchSize > 0, "Neo4jIO.writeUnwind().withBatchSize(batchSize) called with batchSize<=0");
       return withBatchSize(ValueProvider.StaticValueProvider.of(batchSize));
     }
 
     public WriteUnwind<ParameterT> withBatchSize(ValueProvider<Long> batchSize) {
       checkArgument(
           batchSize != null && batchSize.get() >= 0,
-          "Neo4jIO.readAll().withBatchSize(query) called with batchSize<=0");
+          "Neo4jIO.readAll().withBatchSize(batchSize) called with batchSize<=0");
       return toBuilder().setBatchSize(batchSize).build();
     }
 
@@ -1175,13 +1166,7 @@ public class Neo4jIO {
       //
       TransactionWork<Void> transactionWork =
           transaction -> {
-            Result result = transaction.run(cypher, parametersMap);
-            while (result.hasNext()) {
-              // This just consumes any output but the function basically has no output
-              // To be revisited based on requirements.
-              //
-              result.next();
-            }
+            transaction.run(cypher, parametersMap).consume();
             return null;
           };
 

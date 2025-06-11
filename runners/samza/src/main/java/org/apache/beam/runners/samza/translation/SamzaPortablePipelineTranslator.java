@@ -23,12 +23,12 @@ import java.util.Map;
 import java.util.ServiceLoader;
 import java.util.Set;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
-import org.apache.beam.runners.core.construction.PTransformTranslation;
-import org.apache.beam.runners.core.construction.graph.ExecutableStage;
-import org.apache.beam.runners.core.construction.graph.PipelineNode;
-import org.apache.beam.runners.core.construction.graph.QueryablePipeline;
 import org.apache.beam.runners.samza.SamzaPipelineOptions;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.sdk.util.construction.PTransformTranslation;
+import org.apache.beam.sdk.util.construction.graph.ExecutableStage;
+import org.apache.beam.sdk.util.construction.graph.PipelineNode;
+import org.apache.beam.sdk.util.construction.graph.QueryablePipeline;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -59,9 +59,7 @@ public class SamzaPortablePipelineTranslator {
   private SamzaPortablePipelineTranslator() {}
 
   public static void translate(RunnerApi.Pipeline pipeline, PortableTranslationContext ctx) {
-    QueryablePipeline queryablePipeline =
-        QueryablePipeline.forTransforms(
-            pipeline.getRootTransformIdsList(), pipeline.getComponents());
+    QueryablePipeline queryablePipeline = QueryablePipeline.forPipeline(pipeline);
 
     for (PipelineNode.PTransformNode transform :
         queryablePipeline.getTopologicallyOrderedTransforms()) {
@@ -78,9 +76,7 @@ public class SamzaPortablePipelineTranslator {
 
   public static void createConfig(
       RunnerApi.Pipeline pipeline, ConfigBuilder configBuilder, SamzaPipelineOptions options) {
-    QueryablePipeline queryablePipeline =
-        QueryablePipeline.forTransforms(
-            pipeline.getRootTransformIdsList(), pipeline.getComponents());
+    QueryablePipeline queryablePipeline = QueryablePipeline.forPipeline(pipeline);
     for (PipelineNode.PTransformNode transform :
         queryablePipeline.getTopologicallyOrderedTransforms()) {
       TransformTranslator<?> translator =

@@ -36,12 +36,7 @@ import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.runners.core.DoFnRunner;
 import org.apache.beam.runners.core.DoFnRunners;
 import org.apache.beam.runners.core.StepContext;
-import org.apache.beam.runners.core.construction.Environments;
-import org.apache.beam.runners.core.construction.ParDoTranslation;
-import org.apache.beam.runners.core.construction.RehydratedComponents;
-import org.apache.beam.runners.core.construction.SdkComponents;
 import org.apache.beam.runners.core.construction.SerializablePipelineOptions;
-import org.apache.beam.runners.core.construction.WindowingStrategyTranslation;
 import org.apache.beam.runners.twister2.Twister2TranslationContext;
 import org.apache.beam.runners.twister2.utils.NoOpStepContext;
 import org.apache.beam.runners.twister2.utils.Twister2SideInputReader;
@@ -55,11 +50,17 @@ import org.apache.beam.sdk.transforms.reflect.DoFnInvoker;
 import org.apache.beam.sdk.transforms.reflect.DoFnInvokers;
 import org.apache.beam.sdk.util.DoFnWithExecutionInformation;
 import org.apache.beam.sdk.util.SerializableUtils;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.WindowedValueMultiReceiver;
+import org.apache.beam.sdk.util.construction.Environments;
+import org.apache.beam.sdk.util.construction.ParDoTranslation;
+import org.apache.beam.sdk.util.construction.RehydratedComponents;
+import org.apache.beam.sdk.util.construction.SdkComponents;
+import org.apache.beam.sdk.util.construction.WindowingStrategyTranslation;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TupleTag;
+import org.apache.beam.sdk.values.WindowedValue;
 import org.apache.beam.sdk.values.WindowingStrategy;
-import org.apache.beam.vendor.grpc.v1p43p2.com.google.protobuf.InvalidProtocolBufferException;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.InvalidProtocolBufferException;
 
 /** DoFn function. */
 @SuppressWarnings({
@@ -208,7 +209,7 @@ public class DoFnFunction<OutputT, InputT>
     Optional.ofNullable(doFnInvoker).ifPresent(DoFnInvoker::invokeTeardown);
   }
 
-  private static class DoFnOutputManager implements DoFnRunners.OutputManager, Serializable {
+  private static class DoFnOutputManager implements WindowedValueMultiReceiver, Serializable {
     // todo need to figure out how this class types are handled
     private static final long serialVersionUID = 4967375172737408160L;
     private transient List<RawUnionValue> outputs;

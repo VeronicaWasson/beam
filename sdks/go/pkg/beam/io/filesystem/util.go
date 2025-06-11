@@ -19,7 +19,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"path/filepath"
+	"runtime"
+	"strings"
 )
 
 // Read fully reads the given file from the file system.
@@ -30,7 +32,7 @@ func Read(ctx context.Context, fs Interface, filename string) ([]byte, error) {
 	}
 	defer r.Close()
 
-	return ioutil.ReadAll(r)
+	return io.ReadAll(r)
 }
 
 // Write writes the given content to the file system.
@@ -100,6 +102,15 @@ func Rename(ctx context.Context, fs Interface, oldpath, newpath string) error {
 	}
 
 	return nil
+}
+
+// Match is a platform agnostic version of filepath.Match where \ is treated as / on Windows.
+func Match(pattern, name string) (bool, error) {
+	// Windows accepts / and \ as directory separators. For the sake of consistency with other schemes such as memfs:// we'll convert \ to /.
+	if runtime.GOOS == "windows" {
+		return filepath.Match(strings.ReplaceAll(pattern, "/", "//"), strings.ReplaceAll(name, "/", "//"))
+	}
+	return filepath.Match(pattern, name)
 }
 
 type unimplementedError struct {

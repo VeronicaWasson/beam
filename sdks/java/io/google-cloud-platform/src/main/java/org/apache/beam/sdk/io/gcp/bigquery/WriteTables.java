@@ -17,7 +17,7 @@
  */
 package org.apache.beam.sdk.io.gcp.bigquery;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import com.google.api.services.bigquery.model.Clustering;
 import com.google.api.services.bigquery.model.EncryptionConfiguration;
@@ -49,6 +49,7 @@ import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.SchemaUpdateOption;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.WriteDisposition;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices.DatasetService;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices.JobService;
+import org.apache.beam.sdk.metrics.Lineage;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.transforms.DoFn;
@@ -71,14 +72,12 @@ import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.ShardedKey;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TupleTagList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Strings;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Maps;
-import org.checkerframework.checker.initialization.qual.Initialized;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Strings;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Maps;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
-import org.checkerframework.checker.nullness.qual.UnknownKeyFor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -97,7 +96,7 @@ import org.slf4j.LoggerFactory;
 class WriteTables<DestinationT extends @NonNull Object>
     extends PTransform<
         PCollection<KV<ShardedKey<DestinationT>, WritePartition.Result>>,
-        PCollection<KV<TableDestination, WriteTables.Result>>> {
+        PCollection<KV<DestinationT, WriteTables.Result>>> {
   @AutoValue
   abstract static class Result {
     abstract String getTableName();
@@ -109,17 +108,13 @@ class WriteTables<DestinationT extends @NonNull Object>
     static final ResultCoder INSTANCE = new ResultCoder();
 
     @Override
-    public void encode(Result value, @UnknownKeyFor @NonNull @Initialized OutputStream outStream)
-        throws @UnknownKeyFor @NonNull @Initialized CoderException, @UnknownKeyFor @NonNull
-            @Initialized IOException {
+    public void encode(Result value, OutputStream outStream) throws CoderException, IOException {
       StringUtf8Coder.of().encode(value.getTableName(), outStream);
       BooleanCoder.of().encode(value.isFirstPane(), outStream);
     }
 
     @Override
-    public Result decode(@UnknownKeyFor @NonNull @Initialized InputStream inStream)
-        throws @UnknownKeyFor @NonNull @Initialized CoderException, @UnknownKeyFor @NonNull
-            @Initialized IOException {
+    public Result decode(InputStream inStream) throws CoderException, IOException {
       return new AutoValue_WriteTables_Result(
           StringUtf8Coder.of().decode(inStream), BooleanCoder.of().decode(inStream));
     }
@@ -135,7 +130,7 @@ class WriteTables<DestinationT extends @NonNull Object>
   private final Set<SchemaUpdateOption> schemaUpdateOptions;
   private final DynamicDestinations<?, DestinationT> dynamicDestinations;
   private final List<PCollectionView<?>> sideInputs;
-  private final TupleTag<KV<TableDestination, WriteTables.Result>> mainOutputTag;
+  private final TupleTag<KV<DestinationT, WriteTables.Result>> mainOutputTag;
   private final TupleTag<String> temporaryFilesTag;
   private final @Nullable ValueProvider<String> loadJobProjectId;
   private final int maxRetryJobs;
@@ -148,8 +143,7 @@ class WriteTables<DestinationT extends @NonNull Object>
   private final @Nullable String tempDataset;
 
   private class WriteTablesDoFn
-      extends DoFn<
-          KV<ShardedKey<DestinationT>, WritePartition.Result>, KV<TableDestination, Result>> {
+      extends DoFn<KV<ShardedKey<DestinationT>, WritePartition.Result>, KV<DestinationT, Result>> {
 
     private Map<DestinationT, String> jsonSchemas = Maps.newHashMap();
 
@@ -160,6 +154,7 @@ class WriteTables<DestinationT extends @NonNull Object>
       final List<String> partitionFiles;
       final TableDestination tableDestination;
       final TableReference tableReference;
+      final DestinationT destinationT;
       final boolean isFirstPane;
 
       public PendingJobData(
@@ -168,12 +163,14 @@ class WriteTables<DestinationT extends @NonNull Object>
           List<String> partitionFiles,
           TableDestination tableDestination,
           TableReference tableReference,
+          DestinationT destinationT,
           boolean isFirstPane) {
         this.window = window;
         this.retryJob = retryJob;
         this.partitionFiles = partitionFiles;
         this.tableDestination = tableDestination;
         this.tableReference = tableReference;
+        this.destinationT = destinationT;
         this.isFirstPane = isFirstPane;
       }
     }
@@ -200,6 +197,7 @@ class WriteTables<DestinationT extends @NonNull Object>
       if (firstPaneCreateDisposition == CreateDisposition.CREATE_NEVER) {
         tableSchema = null;
       } else if (jsonSchemas.containsKey(destination)) {
+        // tableSchema for the destination stored in cache (jsonSchemas)
         tableSchema =
             BigQueryHelpers.fromJsonString(jsonSchemas.get(destination), TableSchema.class);
       } else {
@@ -213,6 +211,7 @@ class WriteTables<DestinationT extends @NonNull Object>
             firstPaneCreateDisposition,
             dynamicDestinations,
             destination);
+        LOG.debug("Fetched TableSchema for table {}:\n\t{}", destination, tableSchema);
         jsonSchemas.put(destination, BigQueryHelpers.toJsonString(tableSchema));
       }
 
@@ -255,6 +254,12 @@ class WriteTables<DestinationT extends @NonNull Object>
         }
         // This is a temp table. Create a new one for each partition and each pane.
         tableReference.setTableId(jobIdPrefix);
+      } else {
+        Lineage.getSinks()
+            .add(
+                "bigquery",
+                BigQueryHelpers.dataCatalogSegments(
+                    tableReference, c.getPipelineOptions().as(BigQueryOptions.class)));
       }
 
       WriteDisposition writeDisposition = firstPaneWriteDisposition;
@@ -292,6 +297,7 @@ class WriteTables<DestinationT extends @NonNull Object>
               partitionFiles,
               tableDestination,
               tableReference,
+              destination,
               element.getValue().isFirstPane()));
     }
 
@@ -359,7 +365,7 @@ class WriteTables<DestinationT extends @NonNull Object>
                             pendingJob.isFirstPane);
                     c.output(
                         mainOutputTag,
-                        KV.of(pendingJob.tableDestination, result),
+                        KV.of(pendingJob.destinationT, result),
                         pendingJob.window.maxTimestamp(),
                         pendingJob.window);
                     for (String file : pendingJob.partitionFiles) {
@@ -423,7 +429,7 @@ class WriteTables<DestinationT extends @NonNull Object>
   }
 
   @Override
-  public PCollection<KV<TableDestination, Result>> expand(
+  public PCollection<KV<DestinationT, Result>> expand(
       PCollection<KV<ShardedKey<DestinationT>, WritePartition.Result>> input) {
     PCollectionTuple writeTablesOutputs =
         input.apply(

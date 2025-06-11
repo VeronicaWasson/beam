@@ -17,7 +17,7 @@
  */
 package org.apache.beam.runners.direct;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -33,10 +33,11 @@ import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.runners.AppliedPTransform;
 import org.apache.beam.sdk.transforms.PTransform;
-import org.apache.beam.sdk.util.WindowedValue;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 
 /**
  * The {@link DirectRunner} {@link TransformEvaluatorFactory} for the {@link GroupByKeyOnly} {@link
@@ -136,7 +137,7 @@ class GroupByKeyOnlyEvaluatorFactory implements TransformEvaluatorFactory {
                 StructuralKey.of(key, keyCoder),
                 (PCollection<KeyedWorkItem<K, V>>)
                     Iterables.getOnlyElement(application.getOutputs().values()));
-        bundle.add(WindowedValue.valueInGlobalWindow(groupedKv));
+        bundle.add(WindowedValues.valueInGlobalWindow(groupedKv));
         resultBuilder.addOutput(bundle);
       }
       return resultBuilder.build();

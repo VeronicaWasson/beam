@@ -27,7 +27,7 @@ import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.values.PCollection;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.joda.time.Instant;
 import org.junit.Rule;
 import org.junit.Test;
@@ -101,14 +101,6 @@ public class SqlQuery3Test {
 
   @RunWith(JUnit4.class)
   public static class SqlQuery3TestCalcite extends SqlQuery3TestCases {
-    @Override
-    protected SqlQuery3 getQuery(NexmarkConfiguration configuration) {
-      return SqlQuery3.calciteSqlQuery3(configuration);
-    }
-  }
-
-  @RunWith(JUnit4.class)
-  public static class SqlQuery3TestZetaSql extends SqlQuery3TestCases {
     @Override
     protected SqlQuery3 getQuery(NexmarkConfiguration configuration) {
       return SqlQuery3.calciteSqlQuery3(configuration);

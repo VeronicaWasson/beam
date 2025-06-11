@@ -16,7 +16,6 @@
 package expansionx
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,7 +140,7 @@ func TestNewJarGetter(t *testing.T) {
 }
 
 func makeTempDir(t *testing.T) string {
-	d, err := ioutil.TempDir(os.Getenv("TEST_TMPDIR"), "expansionx-*")
+	d, err := os.MkdirTemp(os.Getenv("TEST_TMPDIR"), "expansionx-*")
 	if err != nil {
 		t.Fatalf("failed to make temp directory, got %v", err)
 	}
@@ -152,7 +151,7 @@ func makeTempDir(t *testing.T) string {
 func TestJarExists(t *testing.T) {
 	d := makeTempDir(t)
 
-	tmpFile, err := ioutil.TempFile(d, "expansion-*.jar")
+	tmpFile, err := os.CreateTemp(d, "expansion-*.jar")
 	if err != nil {
 		t.Fatalf("failed to make temp file, got %v", err)
 	}
@@ -173,7 +172,7 @@ func TestJarExists_bad(t *testing.T) {
 }
 
 func getGeneratedNumberInFile(fileName, jarPrefix string) string {
-	tmpFileNameSplit := strings.Split(fileName, "/")
+	tmpFileNameSplit := strings.Split(fileName, string(filepath.Separator))
 	tmpFileName := tmpFileNameSplit[len(tmpFileNameSplit)-1]
 	numSuffix := strings.TrimPrefix(tmpFileName, jarPrefix)
 	return strings.TrimSuffix(numSuffix, ".jar")
@@ -189,7 +188,7 @@ func TestGetJar_present(t *testing.T) {
 
 	jarName := "beam-sdks-java-fake-"
 
-	tmpFile, err := ioutil.TempFile(d, jarName+"*.jar")
+	tmpFile, err := os.CreateTemp(d, jarName+"*.jar")
 	if err != nil {
 		t.Fatalf("failed to create temp JAR file, got %v", err)
 	}
@@ -216,5 +215,37 @@ func TestGetJar_dev(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), gradleTarget) {
 		t.Errorf("error message does not contain gradle command %v for user, got message: %v", gradleTarget, err)
+	}
+}
+
+func TestGetPythonVersion(t *testing.T) {
+	tests := []struct {
+		name        string
+		PYTHON_PATH string
+	}{
+		{
+			name:        "PYTHON_PATH set",
+			PYTHON_PATH: "/bin/python",
+		},
+		{
+			name:        "PYTHON_PATH not set",
+			PYTHON_PATH: "",
+		},
+	}
+
+	for _, test := range tests {
+		if test.PYTHON_PATH != "" {
+			os.Setenv("PYTHON_PATH", test.PYTHON_PATH)
+		}
+		pythonVersion, err := GetPythonVersion()
+		if err != nil {
+			t.Errorf("python installation not found: %v, when PYTHON_PATH=%v", err, test.PYTHON_PATH)
+		}
+		if test.PYTHON_PATH != "" && pythonVersion != test.PYTHON_PATH {
+			t.Errorf("incorrect PYTHON_PATH, want: %v, got: %v", test.PYTHON_PATH, pythonVersion)
+		}
+		if test.PYTHON_PATH != "" {
+			os.Unsetenv(test.PYTHON_PATH)
+		}
 	}
 }

@@ -24,6 +24,7 @@ This module is experimental. No backwards-compatibility guarantees.
 
 import sys
 import unittest
+import unittest.mock
 from typing import NamedTuple
 
 import pandas as pd
@@ -138,7 +139,7 @@ class InteractiveRunnerTest(unittest.TestCase):
         0: [e[0] for e in actual],
         1: [e[1] for e in actual],
         'event_time': [end_of_window for _ in actual],
-        'windows': [[GlobalWindow()] for _ in actual],
+        'windows': [(GlobalWindow(), ) for _ in actual],
         'pane_info': [
             PaneInfo(True, True, PaneInfoTiming.ON_TIME, 0, 0) for _ in actual
         ]
@@ -153,7 +154,7 @@ class InteractiveRunnerTest(unittest.TestCase):
     expected_reified = [
         WindowedValue(
             e,
-            Timestamp(micros=end_of_window), [GlobalWindow()],
+            Timestamp(micros=end_of_window), (GlobalWindow(), ),
             PaneInfo(True, True, PaneInfoTiming.ON_TIME, 0, 0)) for e in actual
     ]
     self.assertEqual(actual_reified, expected_reified)
@@ -321,7 +322,7 @@ class InteractiveRunnerTest(unittest.TestCase):
         Record('c', 18, 150)
     ]
 
-    aggregate = lambda df: df.groupby('height').mean()
+    aggregate = lambda df: df.groupby('height').mean(numeric_only=True)
 
     deferred_df = aggregate(to_dataframe(p | beam.Create(data)))
     df_expected = aggregate(pd.DataFrame(data))
@@ -351,7 +352,9 @@ class InteractiveRunnerTest(unittest.TestCase):
     aggregate = lambda df: df.groupby(['name', 'height']).mean()
 
     deferred_df = aggregate(to_dataframe(p | beam.Create(data)))
-    df_expected = aggregate(pd.DataFrame(data))
+    df_input = pd.DataFrame(data)
+    df_input.name = df_input.name.astype(pd.StringDtype())
+    df_expected = aggregate(df_input)
 
     # Watch the local scope for Interactive Beam so that values will be cached.
     ib.watch(locals())
@@ -378,7 +381,9 @@ class InteractiveRunnerTest(unittest.TestCase):
     aggregate = lambda df: df.groupby(['name', 'height']).mean()['age']
 
     deferred_df = aggregate(to_dataframe(p | beam.Create(data)))
-    df_expected = aggregate(pd.DataFrame(data))
+    df_input = pd.DataFrame(data)
+    df_input.name = df_input.name.astype(pd.StringDtype())
+    df_expected = aggregate(df_input)
 
     # Watch the local scope for Interactive Beam so that values will be cached.
     ib.watch(locals())
@@ -486,12 +491,59 @@ class InteractiveRunnerTest(unittest.TestCase):
       self.assertEqual(producer, prev_producer, trace_string)
       prev_producer = consumer
 
+  @staticmethod
+  def only_none_shall_pass(value):
+    if value is None:
+      return b'\0'
+    else:
+      raise RuntimeError("Should be using a more efficient coder.")
+
+  @unittest.mock.patch.object(
+      beam.coders.coders.FastPrimitivesCoder, 'encode', only_none_shall_pass)
+  def test_defaults_to_efficient_cache(self):
+    p = beam.Pipeline(
+        runner=interactive_runner.InteractiveRunner(
+            direct_runner.DirectRunner()))
+
+    inputs = [1, 10, 100, 1000, 10000]
+    big = (
+        p
+        | beam.Create(inputs)
+        | 'Explode' >> beam.FlatMap(lambda n: ("v_%s" % ix for ix in range(n))))
+
+    # Watch the local scope for Interactive Beam so that counts will be cached.
+    ib.watch(locals())
+
+    # This is normally done in the interactive_utils when a transform is
+    # applied but needs an IPython environment. So we manually run this here.
+    ie.current_env().track_user_pipelines()
+
+    result = p.run()
+    result.wait_until_finish()
+
+    self.assertEqual(len(result.get(big)), sum(inputs))
+    self.assertEqual(
+        len(result.get(big, include_window_info=True)), sum(inputs))
+
+    cache_manager = ie.current_env().get_cache_manager(
+        result._pipeline_instrument.user_pipeline)
+    key = result._pipeline_instrument.cache_key(big)
+    size = cache_manager.size('full', key)
+    # Despite (highly redundant) windowing information, the cache is small.
+    self.assertLess(size, sum(inputs))
+
 
 @unittest.skipIf(
     not ie.current_env().is_interactive_ready,
     '[interactive] dependency is not installed.')
 @isolated_env
 class ConfigForFlinkTest(unittest.TestCase):
+  def setUp(self):
+    self.current_env.options.cache_root = 'gs://fake'
+
+  def tearDown(self):
+    self.current_env.options.cache_root = None
+
   def test_create_a_new_cluster_for_a_new_pipeline(self):
     clusters = self.current_env.clusters
     runner = interactive_runner.InteractiveRunner(
@@ -630,6 +682,27 @@ class ConfigForFlinkTest(unittest.TestCase):
     # currently only 1: Cloud Dataproc.
     self.assertEqual(
         flink_options.flink_version, clusters.DATAPROC_FLINK_VERSION)
+
+  def test_strip_http_protocol_from_flink_master(self):
+    runner = interactive_runner.InteractiveRunner(
+        underlying_runner=FlinkRunner())
+    stripped = runner._strip_protocol_if_any('https://flink-master')
+
+    self.assertEqual('flink-master', stripped)
+
+  def test_no_strip_from_flink_master(self):
+    runner = interactive_runner.InteractiveRunner(
+        underlying_runner=FlinkRunner())
+    stripped = runner._strip_protocol_if_any('flink-master')
+
+    self.assertEqual('flink-master', stripped)
+
+  def test_no_strip_from_non_flink_master(self):
+    runner = interactive_runner.InteractiveRunner(
+        underlying_runner=FlinkRunner())
+    stripped = runner._strip_protocol_if_any(None)
+
+    self.assertIsNone(stripped)
 
 
 if __name__ == '__main__':

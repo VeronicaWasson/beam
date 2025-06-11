@@ -17,7 +17,7 @@
  */
 package org.apache.beam.runners.spark.stateful;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import java.util.Collection;
 import java.util.Collections;
@@ -31,8 +31,8 @@ import org.apache.beam.runners.spark.coders.CoderHelpers;
 import org.apache.beam.runners.spark.util.GlobalWatermarkHolder.SparkWatermarks;
 import org.apache.beam.sdk.state.TimeDomain;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Sets;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Sets;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Instant;
 
@@ -107,7 +107,7 @@ public class SparkTimerInternals implements TimerInternals {
     return timers;
   }
 
-  void addTimers(Iterator<TimerData> timers) {
+  public void addTimers(Iterator<TimerData> timers) {
     while (timers.hasNext()) {
       TimerData timer = timers.next();
       this.timers.add(timer);
@@ -163,7 +163,8 @@ public class SparkTimerInternals implements TimerInternals {
       Instant target,
       Instant outputTimestamp,
       TimeDomain timeDomain) {
-    throw new UnsupportedOperationException("Setting a timer by ID not yet supported.");
+    this.setTimer(
+        TimerData.of(timerId, timerFamilyId, namespace, target, outputTimestamp, timeDomain));
   }
 
   @Override

@@ -29,25 +29,33 @@ import unittest
 import mock
 
 import apache_beam as beam
+from apache_beam import ManagedReplacement
 from apache_beam import Pipeline
 from apache_beam.coders import RowCoder
 from apache_beam.options.pipeline_options import PipelineOptions
+from apache_beam.portability.api import beam_expansion_api_pb2
 from apache_beam.portability.api import external_transforms_pb2
+from apache_beam.portability.api import schema_pb2
+from apache_beam.portability.common_urns import ManagedTransforms
 from apache_beam.runners import pipeline_context
 from apache_beam.runners.portability import expansion_service
 from apache_beam.runners.portability.expansion_service_test import FibTransform
 from apache_beam.testing.util import assert_that
 from apache_beam.testing.util import equal_to
+from apache_beam.transforms import external
+from apache_beam.transforms.external import MANAGED_SCHEMA_TRANSFORM_IDENTIFIER
 from apache_beam.transforms.external import AnnotationBasedPayloadBuilder
 from apache_beam.transforms.external import ImplicitSchemaPayloadBuilder
 from apache_beam.transforms.external import JavaClassLookupPayloadBuilder
 from apache_beam.transforms.external import JavaExternalTransform
 from apache_beam.transforms.external import JavaJarExpansionService
 from apache_beam.transforms.external import NamedTupleBasedPayloadBuilder
+from apache_beam.transforms.external import SchemaTransformPayloadBuilder
 from apache_beam.typehints import typehints
 from apache_beam.typehints.native_type_compatibility import convert_to_beam_type
 from apache_beam.utils import proto_utils
 from apache_beam.utils.subprocess_server import JavaJarServer
+from apache_beam.utils.subprocess_server import SubprocessServer
 
 # Protect against environments where apitools library is not available.
 # pylint: disable=wrong-import-order, wrong-import-position
@@ -68,10 +76,10 @@ class PayloadBase(object):
   values = {
       'integer_example': 1,
       'boolean': True,
-      'string_example': u'thing',
-      'list_of_strings': [u'foo', u'bar'],
+      'string_example': 'thing',
+      'list_of_strings': ['foo', 'bar'],
       'mapping': {
-          u'key': 1.1
+          'key': 1.1
       },
       'optional_integer': None,
   }
@@ -179,7 +187,7 @@ class ExternalTransformTest(unittest.TestCase):
         | beam.Create(['a', 'b'])
         | beam.ExternalTransform(
             'beam:transforms:xlang:test:prefix',
-            ImplicitSchemaPayloadBuilder({'data': u'0'}),
+            ImplicitSchemaPayloadBuilder({'data': '0'}),
             expansion_service.ExpansionServiceServicer()))
 
     proto, _ = pipeline.to_runner_api(return_context=True)
@@ -193,22 +201,21 @@ class ExternalTransformTest(unittest.TestCase):
     self.assertNotEqual([],
                         pipeline_from_proto.transforms_stack[0].parts[1].parts)
     self.assertEqual(
-        u'ExternalTransform(beam:transforms:xlang:test:prefix)/TestLabel',
+        'ExternalTransform(beam:transforms:xlang:test:prefix)/TestLabel',
         pipeline_from_proto.transforms_stack[0].parts[1].parts[0].full_label)
 
   @unittest.skipIf(apiclient is None, 'GCP dependencies are not installed')
   def test_pipeline_generation_with_runner_overrides(self):
     pipeline_properties = [
-        '--dataflow_endpoint=ignored',
         '--job_name=test-job',
         '--project=test-project',
-        '--staging_location=ignored',
-        '--temp_location=/dev/null',
+        '--temp_location=gs://beam/tmp',
         '--no_auth',
         '--dry_run=True',
         '--sdk_location=container',
         '--runner=DataflowRunner',
-        '--streaming'
+        '--streaming',
+        '--region=us-central1'
     ]
 
     with beam.Pipeline(options=PipelineOptions(pipeline_properties)) as p:
@@ -219,7 +226,7 @@ class ExternalTransformTest(unittest.TestCase):
               'projects/dummy-project/subscriptions/dummy-subscription')
           | beam.ExternalTransform(
               'beam:transforms:xlang:test:prefix',
-              ImplicitSchemaPayloadBuilder({'data': u'0'}),
+              ImplicitSchemaPayloadBuilder({'data': '0'}),
               expansion_service.ExpansionServiceServicer()))
 
     pipeline_proto, _ = p.to_runner_api(return_context=True)
@@ -291,7 +298,7 @@ class ExternalTransformTest(unittest.TestCase):
     pipeline = beam.Pipeline()
     external_transform = beam.ExternalTransform(
         'beam:transforms:xlang:test:prefix',
-        ImplicitSchemaPayloadBuilder({'data': u'0'}),
+        ImplicitSchemaPayloadBuilder({'data': '0'}),
         expansion_service.ExpansionServiceServicer())
     _ = (pipeline | beam.Create(['a', 'b']) | external_transform)
     pipeline.run().wait_until_finish()
@@ -334,7 +341,7 @@ class ExternalTransformTest(unittest.TestCase):
         | beam.Create(['a', 'b'])
         | beam.ExternalTransform(
             'beam:transforms:xlang:test:prefix',
-            ImplicitSchemaPayloadBuilder({'data': u'0'}),
+            ImplicitSchemaPayloadBuilder({'data': '0'}),
             expansion_service.ExpansionServiceServicer())
         | beam.Map(lambda x: x))
     pipeline.run().wait_until_finish()
@@ -348,11 +355,40 @@ class ExternalTransformTest(unittest.TestCase):
         | beam.Create(['a', 'b'])
         | beam.ExternalTransform(
             'beam:transforms:xlang:test:nooutput',
-            ImplicitSchemaPayloadBuilder({'data': u'0'}),
+            ImplicitSchemaPayloadBuilder({'data': '0'}),
             expansion_service.ExpansionServiceServicer()))
     pipeline.run().wait_until_finish()
 
     self.assertTrue(pipeline.contains_external_transforms)
+
+  def test_sanitize_java_traceback(self):
+    error_string = '''
+java.lang.RuntimeException: ACTUAL \n MULTILINE \n ERROR
+\tat org.apache.beam.sdk.expansion.service.ExpansionService$TransformProviderForBuilder.getTransform(ExpansionService.java:308)
+\tat org.apache.beam.sdk.expansion.service.TransformProvider.apply(TransformProvider.java:121)
+\tat org.apache.beam.sdk.expansion.service.ExpansionService.expand(ExpansionService.java:627)
+\tat org.apache.beam.sdk.expansion.service.ExpansionService.expand(ExpansionService.java:729)
+\tat org.apache.beam.model.expansion.v1.ExpansionServiceGrpc$MethodHandlers.invoke(ExpansionServiceGrpc.java:306)
+\tat org.apache.beam.vendor.grpc.v1p69p0.io.grpc.stub.ServerCalls$UnaryServerCallHandler$UnaryServerCallListener.onHalfClose(ServerCalls.java:182)
+\tat org.apache.beam.vendor.grpc.v1p69p0.io.grpc.internal.ServerCallImpl$ServerStreamListenerImpl.halfClosed(ServerCallImpl.java:351)
+\tat org.apache.beam.vendor.grpc.v1p69p0.io.grpc.internal.ServerImpl$JumpToApplicationThreadServerStreamListener$1HalfClosed.runInContext(ServerImpl.java:861)
+\tat org.apache.beam.vendor.grpc.v1p69p0.io.grpc.internal.ContextRunnable.run(ContextRunnable.java:37)
+\tat org.apache.beam.vendor.grpc.v1p69p0.io.grpc.internal.SerializingExecutor.run(SerializingExecutor.java:133)
+\tat java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+\tat java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+\tat java.lang.Thread.run(Thread.java:748)
+Caused by: java.lang.IllegalArgumentException: Received unknown SQL Dialect 'X'. Known dialects: [zetasql, calcite]
+\tat org.apache.beam.sdk.extensions.sql.expansion.ExternalSqlTransformRegistrar$Builder.buildExternal(ExternalSqlTransformRegistrar.java:73)
+\tat org.apache.beam.sdk.extensions.sql.expansion.ExternalSqlTransformRegistrar$Builder.buildExternal(ExternalSqlTransformRegistrar.java:63)
+\tat org.apache.beam.sdk.expansion.service.ExpansionService$TransformProviderForBuilder.getTransform(ExpansionService.java:303)
+\t... 12 more
+    '''.strip()
+
+    core_msg = 'java.lang.RuntimeException: ACTUAL \n MULTILINE \n ERROR'
+
+    self.assertEqual(
+        f"{error_string}\n\n{core_msg}",
+        external._sanitize_java_traceback(error_string))
 
 
 class ExternalAnnotationPayloadTest(PayloadBase, unittest.TestCase):
@@ -443,6 +479,163 @@ class ExternalDataclassesPayloadTest(PayloadBase, unittest.TestCase):
       expansion_service: dataclasses.InitVar[typehints.Optional[str]] = None
 
     return get_payload(DataclassTransform(**values))
+
+
+class SchemaTransformPayloadBuilderTest(unittest.TestCase):
+  def test_build_payload(self):
+    ComplexType = typing.NamedTuple(
+        "ComplexType", [
+            ("str_sub_field", str),
+            ("int_sub_field", int),
+        ])
+
+    payload_builder = SchemaTransformPayloadBuilder(
+        identifier='dummy_id',
+        str_field='aaa',
+        int_field=123,
+        object_field=ComplexType(str_sub_field="bbb", int_sub_field=456))
+    payload_bytes = payload_builder.payload()
+    payload_from_bytes = proto_utils.parse_Bytes(
+        payload_bytes, external_transforms_pb2.SchemaTransformPayload)
+
+    self.assertEqual('dummy_id', payload_from_bytes.identifier)
+
+    expected_coder = RowCoder(payload_from_bytes.configuration_schema)
+    schema_transform_config = expected_coder.decode(
+        payload_from_bytes.configuration_row)
+
+    self.assertEqual('aaa', schema_transform_config.str_field)
+    self.assertEqual(123, schema_transform_config.int_field)
+    self.assertEqual('bbb', schema_transform_config.object_field.str_sub_field)
+    self.assertEqual(456, schema_transform_config.object_field.int_sub_field)
+
+
+class SchemaAwareExternalTransformTest(unittest.TestCase):
+  class MockDiscoveryService:
+    # define context manager enter and exit functions
+    def __enter__(self):
+      return self
+
+    def __exit__(self, unusued1, unused2, unused3):
+      pass
+
+    def DiscoverSchemaTransform(self, unused_request=None):
+      test_config = beam_expansion_api_pb2.SchemaTransformConfig(
+          config_schema=schema_pb2.Schema(
+              fields=[
+                  schema_pb2.Field(
+                      name="str_field",
+                      type=schema_pb2.FieldType(atomic_type="STRING")),
+                  schema_pb2.Field(
+                      name="int_field",
+                      type=schema_pb2.FieldType(atomic_type="INT64"))
+              ],
+              id="test-id"),
+          input_pcollection_names=["input"],
+          output_pcollection_names=["output"])
+
+      test_managed_config = beam_expansion_api_pb2.SchemaTransformConfig(
+          config_schema=schema_pb2.Schema(
+              fields=[
+                  schema_pb2.Field(
+                      name="transform_identifier",
+                      type=schema_pb2.FieldType(atomic_type="STRING")),
+                  schema_pb2.Field(
+                      name="config_url",
+                      type=schema_pb2.FieldType(atomic_type="STRING")),
+                  schema_pb2.Field(
+                      name="config",
+                      type=schema_pb2.FieldType(atomic_type="STRING"))
+              ],
+              id="test-id1"),
+          input_pcollection_names=["input"],
+          output_pcollection_names=["output"])
+      return beam_expansion_api_pb2.DiscoverSchemaTransformResponse(
+          schema_transform_configs={
+              "test_schematransform": test_config,
+              MANAGED_SCHEMA_TRANSFORM_IDENTIFIER: test_managed_config
+          })
+
+  @mock.patch("apache_beam.transforms.external.ExternalTransform.service")
+  def test_discover_one_config(self, mock_service):
+    _mock = self.MockDiscoveryService()
+    mock_service.return_value = _mock
+    config = beam.SchemaAwareExternalTransform.discover_config(
+        "test_service", name="test_schematransform")
+    self.assertEqual(config.outputs[0], "output")
+    self.assertEqual(config.inputs[0], "input")
+    self.assertEqual(config.identifier, "test_schematransform")
+
+  @mock.patch("apache_beam.transforms.external.ExternalTransform.service")
+  def test_discover_one_config_fails_with_no_configs_found(self, mock_service):
+    mock_service.return_value = self.MockDiscoveryService()
+    with self.assertRaises(ValueError):
+      beam.SchemaAwareExternalTransform.discover_config(
+          "test_service", name="non_existent")
+
+  @mock.patch("apache_beam.transforms.external.ExternalTransform.service")
+  def test_rearrange_kwargs_based_on_discovery(self, mock_service):
+    mock_service.return_value = self.MockDiscoveryService()
+
+    identifier = "test_schematransform"
+    expansion_service = "test_service"
+    kwargs = {"int_field": 0, "str_field": "str"}
+
+    transform = beam.SchemaAwareExternalTransform(
+        identifier=identifier,
+        expansion_service=expansion_service,
+        rearrange_based_on_discovery=True,
+        **kwargs)
+    payload = transform._payload_builder.build()
+    ordered_fields = [f.name for f in payload.configuration_schema.fields]
+
+    schematransform_config = beam.SchemaAwareExternalTransform.discover_config(
+        expansion_service, identifier)
+    external_config_fields = schematransform_config.configuration_schema._fields
+
+    self.assertNotEqual(tuple(kwargs.keys()), external_config_fields)
+    self.assertEqual(tuple(ordered_fields), external_config_fields)
+
+  @mock.patch("apache_beam.transforms.external.ExternalTransform.service")
+  def test_managed_replacement_unknown_id(self, mock_service):
+    mock_service.return_value = self.MockDiscoveryService()
+
+    identifier = "test_schematransform"
+    kwargs = {"int_field": 0, "str_field": "str"}
+
+    managed_replacement = ManagedReplacement(
+        underlying_transform_identifier="unknown_id",
+        update_compatibility_version="2.50.0")
+
+    with self.assertRaises(ValueError):
+      beam.SchemaAwareExternalTransform(
+          identifier=identifier,
+          expansion_service=expansion_service,
+          rearrange_based_on_discovery=True,
+          managed_replacement=managed_replacement,
+          **kwargs)
+
+  @mock.patch("apache_beam.transforms.external.ExternalTransform.service")
+  @mock.patch("apache_beam.transforms.external.BeamJarExpansionService")
+  def test_managed_replacement_known_id(
+      self, mock_service, mock_beam_jar_service):
+    mock_service.return_value = self.MockDiscoveryService()
+    mock_beam_jar_service.return_value = self.MockDiscoveryService()
+
+    identifier = "test_schematransform"
+    kwargs = {"int_field": 0, "str_field": "str"}
+
+    managed_replacement = ManagedReplacement(
+        underlying_transform_identifier=ManagedTransforms.Urns.ICEBERG_READ.urn,
+        update_compatibility_version="2.50.0")
+
+    external_transform = beam.SchemaAwareExternalTransform(
+        identifier=identifier,
+        expansion_service=expansion_service,
+        rearrange_based_on_discovery=True,
+        managed_replacement=managed_replacement,
+        **kwargs)
+    self.assertIsNotNone(external_transform._managed_payload_builder)
 
 
 class JavaClassLookupPayloadBuilderTest(unittest.TestCase):
@@ -590,6 +783,9 @@ class JavaClassLookupPayloadBuilderTest(unittest.TestCase):
 
 
 class JavaJarExpansionServiceTest(unittest.TestCase):
+  def setUp(self):
+    SubprocessServer._cache._live_owners = set()
+
   def test_classpath(self):
     with tempfile.TemporaryDirectory() as temp_dir:
       try:

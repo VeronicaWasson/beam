@@ -20,6 +20,7 @@
 # pytype: skip-file
 
 import unittest
+from typing import NamedTuple
 
 import apache_beam as beam
 from apache_beam import Create
@@ -32,6 +33,7 @@ from apache_beam.testing.util import equal_to
 from apache_beam.testing.util import equal_to_per_window
 from apache_beam.testing.util import is_empty
 from apache_beam.testing.util import is_not_empty
+from apache_beam.testing.util import row_namedtuple_equals_fn
 from apache_beam.transforms import trigger
 from apache_beam.transforms import window
 from apache_beam.transforms.window import FixedWindows
@@ -183,6 +185,19 @@ class UtilTest(unittest.TestCase):
                     equal_to_per_window(expected),
                     reify_windows=True)
 
+  def test_runtimeerror_outside_of_context(self):
+    with beam.Pipeline() as p:
+      outputs = (p | beam.Create([1, 2, 3]) | beam.Map(lambda x: x + 1))
+    with self.assertRaises(RuntimeError):
+      assert_that(outputs, equal_to([2, 3, 4]))
+
+  def test_multiple_assert_that_labels(self):
+    with beam.Pipeline() as p:
+      outputs = (p | beam.Create([1, 2, 3]) | beam.Map(lambda x: x + 1))
+      assert_that(outputs, equal_to([2, 3, 4]))
+      assert_that(outputs, equal_to([2, 3, 4]))
+      assert_that(outputs, equal_to([2, 3, 4]))
+
   def test_equal_to_per_window_fail_unmatched_element(self):
     with self.assertRaises(BeamAssertException):
       start = int(MIN_TIMESTAMP.micros // 1e6) - 5
@@ -240,6 +255,54 @@ class UtilTest(unittest.TestCase):
             | beam.GroupByKey()),
                     equal_to_per_window(expected),
                     reify_windows=True)
+
+  def test_row_namedtuple_equals(self):
+    class RowTuple(NamedTuple):
+      a: str
+      b: int
+
+    self.assertTrue(
+        row_namedtuple_equals_fn(
+            beam.Row(a='123', b=456), beam.Row(a='123', b=456)))
+    self.assertTrue(
+        row_namedtuple_equals_fn(
+            beam.Row(a='123', b=456), RowTuple(a='123', b=456)))
+    self.assertTrue(
+        row_namedtuple_equals_fn(
+            RowTuple(a='123', b=456), RowTuple(a='123', b=456)))
+    self.assertTrue(
+        row_namedtuple_equals_fn(
+            RowTuple(a='123', b=456), beam.Row(a='123', b=456)))
+    self.assertTrue(row_namedtuple_equals_fn('foo', 'foo'))
+    self.assertFalse(
+        row_namedtuple_equals_fn(
+            beam.Row(a='123', b=456), beam.Row(a='123', b=4567)))
+    self.assertFalse(
+        row_namedtuple_equals_fn(
+            beam.Row(a='123', b=456), beam.Row(a='123', b=456, c='a')))
+    self.assertFalse(
+        row_namedtuple_equals_fn(
+            beam.Row(a='123', b=456), RowTuple(a='123', b=4567)))
+    self.assertFalse(
+        row_namedtuple_equals_fn(
+            beam.Row(a='123', b=456, c='foo'), RowTuple(a='123', b=4567)))
+    self.assertFalse(
+        row_namedtuple_equals_fn(beam.Row(a='123'), RowTuple(a='123', b=4567)))
+    self.assertFalse(row_namedtuple_equals_fn(beam.Row(a='123'), '123'))
+    self.assertFalse(row_namedtuple_equals_fn('123', RowTuple(a='123', b=456)))
+
+    class NestedNamedTuple(NamedTuple):
+      a: str
+      b: RowTuple
+
+    self.assertTrue(
+        row_namedtuple_equals_fn(
+            beam.Row(a='foo', b=beam.Row(a='123', b=456)),
+            NestedNamedTuple(a='foo', b=RowTuple(a='123', b=456))))
+    self.assertTrue(
+        row_namedtuple_equals_fn(
+            beam.Row(a='foo', b=beam.Row(a='123', b=456)),
+            beam.Row(a='foo', b=RowTuple(a='123', b=456))))
 
 
 if __name__ == '__main__':

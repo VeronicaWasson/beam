@@ -35,12 +35,17 @@ if [[ $pytest_args =~ "-m" ]] || [[ $posargs =~ "-m" ]]; then
   exit 1
 fi
 
+# strip leading/trailing quotes from posargs because it can get double quoted as its passed through.
+posargs=$(sed -e 's/^"//' -e 's/"$//' -e "s/'$//" -e "s/^'//" <<<$posargs)
+echo "pytest_args: $pytest_args"
+echo "posargs: $posargs"
+
 # Run with pytest-xdist and without.
-pytest -o junit_suite_name=${envname} \
-  --junitxml=pytest_${envname}.xml -m 'not no_xdist' -n 6 ${pytest_args} --pyargs ${posargs}
+pytest -v -rs -o junit_suite_name=${envname} \
+  --junitxml=pytest_${envname}.xml -m 'not no_xdist' -n 6 --import-mode=importlib ${pytest_args} --pyargs ${posargs}
 status1=$?
-pytest -o junit_suite_name=${envname}_no_xdist \
-  --junitxml=pytest_${envname}_no_xdist.xml -m 'no_xdist' ${pytest_args} --pyargs ${posargs}
+pytest -v -rs -o junit_suite_name=${envname}_no_xdist \
+  --junitxml=pytest_${envname}_no_xdist.xml -m 'no_xdist' --import-mode=importlib ${pytest_args} --pyargs ${posargs}
 status2=$?
 
 # Exit with error if no tests were run in either suite (status code 5).

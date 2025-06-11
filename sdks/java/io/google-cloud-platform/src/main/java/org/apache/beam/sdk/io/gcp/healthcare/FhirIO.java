@@ -17,7 +17,7 @@
  */
 package org.apache.beam.sdk.io.gcp.healthcare;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -84,9 +84,9 @@ import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TupleTagList;
 import org.apache.beam.sdk.values.TypeDescriptor;
 import org.apache.beam.sdk.values.TypeDescriptors;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Throwables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Throwables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -99,64 +99,74 @@ import org.slf4j.LoggerFactory;
  * <h3>Reading</h3>
  *
  * <p>FHIR resources can be read with {@link FhirIO.Read}, which supports use cases where you have a
- * ${@link PCollection} of FHIR resource names in the format of projects/{p}/locations/{l}/datasets/{d}/fhirStores/{f}/fhir/{resourceType}/{id}.
- * This is appropriate for reading the Fhir notifications from
- * a Pub/Sub subscription with {@link PubsubIO#readStrings()} or in cases where you have a manually
- * prepared list of resources that you need to process (e.g. in a text file read with {@link
- * org.apache.beam.sdk.io.TextIO}*) .
+ * ${@link PCollection} of FHIR resource names in the format of
+ * projects/{p}/locations/{l}/datasets/{d}/fhirStores/{f}/fhir/{resourceType}/{id}. This is
+ * appropriate for reading the Fhir notifications from a Pub/Sub subscription with {@link
+ * PubsubIO#readStrings()} or in cases where you have a manually prepared list of resources that you
+ * need to process (e.g. in a text file read with {@link org.apache.beam.sdk.io.TextIO}*) .
  *
- * <p>Get Resource contents from the FHIR Store based on the {@link PCollection} of FHIR resource name strings
- * {@link FhirIO.Read.Result} where one can call {@link Read.Result#getResources()} to retrieve a
- * {@link PCollection} containing the successfully fetched json resources as {@link String}s and/or {@link
- * FhirIO.Read.Result#getFailedReads()} to retrieve a {@link PCollection} of {@link HealthcareIOError}
- * containing the resources that could not be fetched and the exception as a
- * {@link HealthcareIOError}, this can be used to write to the dead letter storage system of your
+ * <p>Get Resource contents from the FHIR Store based on the {@link PCollection} of FHIR resource
+ * name strings {@link FhirIO.Read.Result} where one can call {@link Read.Result#getResources()} to
+ * retrieve a {@link PCollection} containing the successfully fetched json resources as {@link
+ * String}s and/or {@link FhirIO.Read.Result#getFailedReads()} to retrieve a {@link PCollection} of
+ * {@link HealthcareIOError} containing the resources that could not be fetched and the exception as
+ * a {@link HealthcareIOError}, this can be used to write to the dead letter storage system of your
  * choosing. This error handling is mainly to transparently surface errors where the upstream {@link
- * PCollection} contains FHIR resources that are not valid or are not reachable due to permissions issues.
+ * PCollection} contains FHIR resources that are not valid or are not reachable due to permissions
+ * issues.
  *
- * Additionally, you can query an entire FHIR Patient resource's compartment (resources that
- * refer to the patient, and are referred to by the patient) by calling {@link FhirIO.getPatientEverything} to
- * execute a FHIR GetPatientEverythingRequest.
+ * <p>Additionally, you can query an entire FHIR Patient resource's compartment (resources that
+ * refer to the patient, and are referred to by the patient) by calling {@link
+ * FhirIO#getPatientEverything} to execute a FHIR GetPatientEverythingRequest.
  *
  * <h3>Writing</h3>
  *
- * <p>Write Resources can be written to FHIR with two different methods: Import or Execute Bundle.
+ * <p>Write Resources can be written to FHIR with a couple of different methods: including Import or
+ * Execute Bundle.
  *
- * <p>Execute Bundle This is best for use cases where you are writing to a non-empty FHIR store
- * with other clients or otherwise need referential integrity (e.g. A Streaming HL7v2 to FHIR ETL
- * pipeline).
+ * <ul>
+ *   <li><a
+ *       href="https://cloud.google.com/healthcare/docs/reference/rest/v1/projects.locations.datasets.fhirStores.fhir/executeBundle">Execute
+ *       Bundle</a>
+ *       <p>This is best for use cases where you are writing to a non-empty FHIR store with other
+ *       clients or otherwise need referential integrity (e.g. A Streaming HL7v2 to FHIR ETL
+ *       pipeline).
+ *   <li><a
+ *       href="https://cloud.google.com/healthcare/docs/reference/rest/v1/projects.locations.datasets.fhirStores/import">Import</a>
+ *       <p>This is best for use cases where you are populating an empty FHIR store with no other
+ *       clients. It is faster than the execute bundles method but does not respect referential
+ *       integrity and the resources are not written transactionally (e.g. a historical backfill on
+ *       a new FHIR store) This requires each resource to contain a client provided ID. It is
+ *       important that when using import you give the appropriate <a
+ *       href="https://cloud.google.com/healthcare/docs/how-tos/permissions-healthcare-api-gcp-products#fhir_store_cloud_storage_permissions">permissions</a>
+ *       to the Google Cloud Healthcare Service Agent.
+ *   <li><a
+ *       href="https://cloud.google.com/healthcare/docs/reference/rest/v1/projects.locations.datasets.fhirStores/export">Export</a>
+ *       <p>This is to export FHIR resources from a FHIR store to Google Cloud Storage or BigQuery.
+ *       The output resources are in ndjson (newline delimited json) of FHIR resources. It is
+ *       important that when using export you give the appropriate <a
+ *       href="https://cloud.google.com/healthcare/docs/how-tos/permissions-healthcare-api-gcp-products#fhir_store_cloud_storage_permissions">permissions</a>
+ *       to the Google Cloud Healthcare Service Agent.
+ *   <li><a
+ *       href="https://cloud.google.com/healthcare/docs/reference/rest/v1/projects.locations.datasets.fhirStores/deidentify">Deidentify</a>
+ *       <p>This is to de-identify FHIR resources from a source FHIR store and write the result to a
+ *       destination FHIR store. It is important that the destination store must already exist.
+ *   <li><a
+ *       href="https://cloud.google.com/healthcare/docs/reference/rest/v1/projects.locations.datasets.fhirStores/search">Search</a>
+ *       <p>This is to search FHIR resources within a given FHIR store. The inputs are individual
+ *       FHIR Search queries, represented by the FhirSearchParameter class. The outputs are results
+ *       of each Search, represented as a Json array of FHIR resources in string form, with
+ *       pagination handled, and an optional input key.
+ * </ul>
  *
- * <p>Import This is best for use cases where you are populating an empty FHIR store with no other
- * clients. It is faster than the execute bundles method but does not respect referential integrity
- * and the resources are not written transactionally (e.g. a historical backfill on a new FHIR
- * store) This requires each resource to contain a client provided ID. It is important that when
- * using import you give the appropriate permissions to the Google Cloud Healthcare Service Agent.
- *
- * <p>Export This is to export FHIR resources from a FHIR store to Google Cloud Storage or BigQuery. The output
- * resources are in ndjson (newline delimited json) of FHIR resources. It is important that when
- * using export you give the appropriate permissions to the Google Cloud Healthcare Service Agent.
- *
- * <p>Deidentify This is to de-identify FHIR resources from a source FHIR store and write the
- * result to a destination FHIR store. It is important that the destination store must already
- * exist.
- *
- * <p>Search This is to search FHIR resources within a given FHIR store. The inputs are individual
- * FHIR Search queries, represented by the FhirSearchParameter class. The outputs are results of
- * each Search, represented as a Json array of FHIR resources in string form, with pagination
- * handled, and an optional input key.
- *
- * @see <a href=>https://cloud.google.com/healthcare/docs/reference/rest/v1/projects.locations.datasets.fhirStores.fhir/executeBundle></a>
- * @see <a href=>https://cloud.google.com/healthcare/docs/how-tos/permissions-healthcare-api-gcp-products#fhir_store_cloud_storage_permissions></a>
- * @see <a href=>https://cloud.google.com/healthcare/docs/reference/rest/v1/projects.locations.datasets.fhirStores/import></a>
- * @see <a href=>https://cloud.google.com/healthcare/docs/reference/rest/v1/projects.locations.datasets.fhirStores/export></a>
- * @see <a href=>https://cloud.google.com/healthcare/docs/reference/rest/v1/projects.locations.datasets.fhirStores/deidentify></a>
- * @see <a href=>https://cloud.google.com/healthcare/docs/reference/rest/v1/projects.locations.datasets.fhirStores/search></a>
- * A {@link PCollection} of {@link String} can be ingested into an Fhir store using {@link
+ * <p>A {@link PCollection} of {@link String} can be ingested into an Fhir store using {@link
  * FhirIO.Write#fhirStoresImport(String, String, String, FhirIO.Import.ContentStructure)} This will
  * return a {@link FhirIO.Write.Result} on which you can call {@link
  * FhirIO.Write.Result#getFailedBodies()} to retrieve a {@link PCollection} of {@link
  * HealthcareIOError} containing the {@link String} that failed to be ingested and the exception.
+ *
  * <p>Example
+ *
  * <pre>{@code
  * Pipeline pipeline = ...
  *
@@ -231,13 +241,13 @@ import org.slf4j.LoggerFactory;
  * PCollection<KV<String, JsonArray>> listResource =
  *      listSearchResult.getKeyedResources(); // KV<"Alice-Bob-Search", JsonArray of results>
  *
- * </pre>
+ * }</pre>
  *
  * <h3>Updates to the I/O connector code</h3>
  *
  * For any significant updates to this I/O connector, please consider involving corresponding code
- * reviewers mentioned
- * <a href="https://github.com/apache/beam/blob/master/sdks/java/io/google-cloud-platform/OWNERS">
+ * reviewers mentioned <a
+ * href="https://github.com/apache/beam/blob/master/sdks/java/io/google-cloud-platform/OWNERS">
  * here</a>.
  */
 @SuppressWarnings({
@@ -574,7 +584,7 @@ public class FhirIO {
         ReadResourceFn() {}
 
         /**
-         * Instantiate healthcare client.
+         * Instantiate healthcare client (version v1).
          *
          * @throws IOException the io exception
          */
@@ -1070,7 +1080,7 @@ public class FhirIO {
     public Write.Result expand(PCollection<String> input) {
       checkState(
           input.isBounded() == IsBounded.BOUNDED,
-          "FhirIO.Import should only be used on bounded PCollections as it is"
+          "FhirIO.Import should only be used on bounded PCollections as it is "
               + "intended for batch use only.");
 
       // fall back on pipeline's temp location.
@@ -1450,7 +1460,7 @@ public class FhirIO {
       }
 
       /**
-       * Initialize healthcare client.
+       * Initialize healthcare client (version v1).
        *
        * @throws IOException If the Healthcare client cannot be created.
        */
@@ -1954,7 +1964,7 @@ public class FhirIO {
       }
 
       /**
-       * Instantiate healthcare client.
+       * Instantiate healthcare client (version v1).
        *
        * @throws IOException the io exception
        */

@@ -27,7 +27,7 @@ import org.apache.beam.sdk.coders.InstantCoder;
 import org.apache.beam.sdk.coders.StructuredCoder;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Instant;
 
@@ -58,7 +58,7 @@ public abstract class ValueInSingleWindow<T> {
   public abstract BoundedWindow getWindow();
 
   /** Returns the pane of this {@code ValueInSingleWindow} in its window. */
-  public abstract PaneInfo getPane();
+  public abstract PaneInfo getPaneInfo();
 
   public static <T> ValueInSingleWindow<T> of(
       T value, Instant timestamp, BoundedWindow window, PaneInfo paneInfo) {
@@ -95,7 +95,7 @@ public abstract class ValueInSingleWindow<T> {
         throws IOException {
       InstantCoder.of().encode(windowedElem.getTimestamp(), outStream);
       windowCoder.encode(windowedElem.getWindow(), outStream);
-      PaneInfo.PaneInfoCoder.INSTANCE.encode(windowedElem.getPane(), outStream);
+      PaneInfo.PaneInfoCoder.INSTANCE.encode(windowedElem.getPaneInfo(), outStream);
       valueCoder.encode(windowedElem.getValue(), outStream, context);
     }
 
@@ -108,9 +108,9 @@ public abstract class ValueInSingleWindow<T> {
     public ValueInSingleWindow<T> decode(InputStream inStream, Context context) throws IOException {
       Instant timestamp = InstantCoder.of().decode(inStream);
       BoundedWindow window = windowCoder.decode(inStream);
-      PaneInfo pane = PaneInfo.PaneInfoCoder.INSTANCE.decode(inStream);
+      PaneInfo paneInfo = PaneInfo.PaneInfoCoder.INSTANCE.decode(inStream);
       T value = valueCoder.decode(inStream, context);
-      return new AutoValue_ValueInSingleWindow<>(value, timestamp, window, pane);
+      return new AutoValue_ValueInSingleWindow<>(value, timestamp, window, paneInfo);
     }
 
     @Override

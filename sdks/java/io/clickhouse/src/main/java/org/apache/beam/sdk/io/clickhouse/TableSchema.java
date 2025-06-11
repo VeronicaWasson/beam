@@ -24,14 +24,12 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
+import java.util.stream.Collectors;
 import org.apache.beam.sdk.schemas.Schema;
 import org.apache.beam.sdk.schemas.logicaltypes.FixedBytes;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /** A descriptor for ClickHouse table schema. */
-@Experimental(Kind.SOURCE_SINK)
 @AutoValue
 @SuppressWarnings({
   "nullness" // TODO(https://github.com/apache/beam/issues/20497)
@@ -112,6 +110,16 @@ public abstract class TableSchema implements Serializable {
       case ENUM8:
       case ENUM16:
         return Schema.FieldType.STRING;
+      case BOOL:
+        return Schema.FieldType.BOOLEAN;
+      case TUPLE:
+        List<Schema.Field> fields =
+            columnType.tupleTypes().entrySet().stream()
+                .map(x -> Schema.Field.of(x.getKey(), Schema.FieldType.DATETIME))
+                .collect(Collectors.toList());
+        Schema.Field[] array = fields.toArray(new Schema.Field[fields.size()]);
+        Schema schema = Schema.of(array);
+        return Schema.FieldType.row(schema);
     }
 
     // not possible, errorprone checks for exhaustive switch
@@ -166,8 +174,12 @@ public abstract class TableSchema implements Serializable {
     UINT16,
     UINT32,
     UINT64,
-    // Composite types
-    ARRAY
+    // Composite type
+    ARRAY,
+    // Primitive type
+    BOOL,
+    // Composite type
+    TUPLE
   }
 
   /**
@@ -206,6 +218,8 @@ public abstract class TableSchema implements Serializable {
     public static final ColumnType UINT16 = ColumnType.of(TypeName.UINT16);
     public static final ColumnType UINT32 = ColumnType.of(TypeName.UINT32);
     public static final ColumnType UINT64 = ColumnType.of(TypeName.UINT64);
+    public static final ColumnType BOOL = ColumnType.of(TypeName.BOOL);
+    public static final ColumnType TUPLE = ColumnType.of(TypeName.TUPLE);
 
     // ClickHouse doesn't allow nested nullables, so boolean flag is enough
     public abstract boolean nullable();
@@ -217,6 +231,8 @@ public abstract class TableSchema implements Serializable {
     public abstract @Nullable Integer fixedStringSize();
 
     public abstract @Nullable ColumnType arrayElementType();
+
+    public abstract @Nullable Map<String, ColumnType> tupleTypes();
 
     public ColumnType withNullable(boolean nullable) {
       return toBuilder().nullable(nullable).build();
@@ -263,6 +279,14 @@ public abstract class TableSchema implements Serializable {
           .build();
     }
 
+    public static ColumnType tuple(Map<String, ColumnType> elements) {
+      return ColumnType.builder()
+          .typeName(TypeName.TUPLE)
+          .nullable(false)
+          .tupleTypes(elements)
+          .build();
+    }
+
     /**
      * Parse string with ClickHouse type to {@link ColumnType}.
      *
@@ -285,43 +309,36 @@ public abstract class TableSchema implements Serializable {
      * <p>E.g., "CREATE TABLE hits(id Int32, count Int32 DEFAULT &lt;str&gt;)"
      *
      * @param columnType type of ClickHouse expression
-     * @param str ClickHouse expression
+     * @param value ClickHouse expression
      * @return value of ClickHouse expression
      */
-    public static Object parseDefaultExpression(ColumnType columnType, String str) {
-      try {
-        String value =
-            new org.apache.beam.sdk.io.clickhouse.impl.parser.ColumnTypeParser(
-                    new StringReader(str))
-                .parseDefaultExpression();
-
-        switch (columnType.typeName()) {
-          case INT8:
-            return Byte.valueOf(value);
-          case INT16:
-            return Short.valueOf(value);
-          case INT32:
-            return Integer.valueOf(value);
-          case INT64:
-            return Long.valueOf(value);
-          case ENUM16:
-          case ENUM8:
-          case FIXEDSTRING:
-          case STRING:
-            return value;
-          case UINT8:
-            return Short.valueOf(value);
-          case UINT16:
-            return Integer.valueOf(value);
-          case UINT32:
-            return Long.valueOf(value);
-          case UINT64:
-            return Long.valueOf(value);
-          default:
-            throw new UnsupportedOperationException("Unsupported type: " + columnType);
-        }
-      } catch (org.apache.beam.sdk.io.clickhouse.impl.parser.ParseException e) {
-        throw new IllegalArgumentException("failed to parse", e);
+    public static Object parseDefaultExpression(ColumnType columnType, String value) {
+      switch (columnType.typeName()) {
+        case INT8:
+          return Byte.valueOf(value);
+        case INT16:
+          return Short.valueOf(value);
+        case INT32:
+          return Integer.valueOf(value);
+        case INT64:
+          return Long.valueOf(value);
+        case ENUM16:
+        case ENUM8:
+        case FIXEDSTRING:
+        case STRING:
+          return value;
+        case UINT8:
+          return Short.valueOf(value);
+        case UINT16:
+          return Integer.valueOf(value);
+        case UINT32:
+          return Long.valueOf(value);
+        case UINT64:
+          return Long.valueOf(value);
+        case BOOL:
+          return Boolean.valueOf(value);
+        default:
+          throw new UnsupportedOperationException("Unsupported type: " + columnType);
       }
     }
 
@@ -343,6 +360,8 @@ public abstract class TableSchema implements Serializable {
       public abstract Builder enumValues(Map<String, Integer> enumValues);
 
       public abstract Builder fixedStringSize(Integer size);
+
+      public abstract Builder tupleTypes(Map<String, ColumnType> tupleElements);
 
       public abstract ColumnType build();
     }

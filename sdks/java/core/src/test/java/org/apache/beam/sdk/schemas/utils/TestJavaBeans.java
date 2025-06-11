@@ -29,10 +29,11 @@ import org.apache.beam.sdk.schemas.Schema.FieldType;
 import org.apache.beam.sdk.schemas.annotations.DefaultSchema;
 import org.apache.beam.sdk.schemas.annotations.SchemaCaseFormat;
 import org.apache.beam.sdk.schemas.annotations.SchemaCreate;
+import org.apache.beam.sdk.schemas.annotations.SchemaFieldDescription;
 import org.apache.beam.sdk.schemas.annotations.SchemaFieldName;
 import org.apache.beam.sdk.schemas.annotations.SchemaFieldNumber;
 import org.apache.beam.sdk.schemas.annotations.SchemaIgnore;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.CaseFormat;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.CaseFormat;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.DateTime;
 import org.joda.time.Instant;
@@ -1361,17 +1362,39 @@ public class TestJavaBeans {
   @DefaultSchema(JavaBeanSchema.class)
   public static class ParameterNullableBean {
 
-    @org.apache.avro.reflect.Nullable private Float value;
+    @Nullable private Float value;
 
-    public @org.apache.avro.reflect.Nullable Float getValue() {
+    public @Nullable Float getValue() {
       return value;
     }
 
-    public void setValue(@org.apache.avro.reflect.Nullable Float value) {
+    public void setValue(@Nullable Float value) {
       this.value = value;
     }
   }
 
   public static final Schema PARAMETER_NULLABLE_BEAN_SCHEMA =
       Schema.builder().addNullableField("value", FieldType.INT64).build();
+
+  @DefaultSchema(JavaBeanSchema.class)
+  public static class FieldWithDescriptionBean {
+
+    @Nullable private Float value;
+
+    @SchemaFieldDescription("This value is the value stored in the object as a float.")
+    public @Nullable Float getValue() {
+      return value;
+    }
+
+    public void setValue(@Nullable Float value) {
+      this.value = value;
+    }
+  }
+
+  public static final Schema FIELD_WITH_DESCRIPTION_BEAN_SCHEMA =
+      Schema.builder()
+          .addField(
+              Schema.Field.nullable("value", FieldType.FLOAT)
+                  .withDescription("This value is the value stored in the object as a float."))
+          .build();
 }

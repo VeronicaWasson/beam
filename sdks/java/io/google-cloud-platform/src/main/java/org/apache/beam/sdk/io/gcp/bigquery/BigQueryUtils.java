@@ -28,17 +28,14 @@ import com.google.api.services.bigquery.model.TableReference;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.api.services.bigquery.model.TableSchema;
 import com.google.auto.value.AutoValue;
-import com.google.protobuf.Descriptors.Descriptor;
-import com.google.protobuf.Descriptors.FieldDescriptor;
-import com.google.protobuf.Descriptors.FieldDescriptor.Type;
 import java.io.Serializable;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -47,7 +44,9 @@ import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 import org.apache.avro.Conversions;
 import org.apache.avro.LogicalTypes;
 import org.apache.avro.generic.GenericData;
@@ -56,24 +55,28 @@ import org.apache.avro.util.Utf8;
 import org.apache.beam.runners.core.metrics.GcpResourceIdentifiers;
 import org.apache.beam.runners.core.metrics.MonitoringInfoConstants;
 import org.apache.beam.runners.core.metrics.ServiceCallMetric;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
+import org.apache.beam.sdk.metrics.Counter;
+import org.apache.beam.sdk.metrics.MetricName;
 import org.apache.beam.sdk.schemas.Schema;
 import org.apache.beam.sdk.schemas.Schema.Field;
 import org.apache.beam.sdk.schemas.Schema.FieldType;
+import org.apache.beam.sdk.schemas.Schema.LogicalType;
 import org.apache.beam.sdk.schemas.Schema.TypeName;
 import org.apache.beam.sdk.schemas.logicaltypes.EnumerationType;
+import org.apache.beam.sdk.schemas.logicaltypes.PassThroughLogicalType;
 import org.apache.beam.sdk.schemas.logicaltypes.SqlTypes;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.transforms.SerializableFunctions;
 import org.apache.beam.sdk.util.Preconditions;
 import org.apache.beam.sdk.values.Row;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableSet;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.hash.Hashing;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.io.BaseEncoding;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Strings;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableSet;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Sets;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.io.BaseEncoding;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
@@ -99,8 +102,15 @@ public class BigQueryUtils {
   // For parsing the format used to refer to tables parameters in BigQueryIO.
   // "{project_id}:{dataset_id}.{table_id}" or
   // "{project_id}.{dataset_id}.{table_id}"
+  // following documentation in
+  // https://cloud.google.com/resource-manager/docs/creating-managing-projects#before_you_begin,
+  // https://cloud.google.com/bigquery/docs/datasets#dataset-naming, and
+  // https://cloud.google.com/bigquery/docs/tables#table_naming
   private static final Pattern SIMPLE_TABLE_PATTERN =
-      Pattern.compile("^(?<PROJECT>[^\\.:]+)[\\.:](?<DATASET>[^\\.:]+)[\\.](?<TABLE>[^\\.:]+)$");
+      Pattern.compile(
+          "^(?<PROJECT>[a-z][a-z0-9.\\-:]{4,28}[a-z0-9])[\\:.]"
+              + "(?<DATASET>[a-zA-Z0-9_]{1,1024})[\\.]"
+              + "(?<TABLE>[\\p{L}\\p{M}\\p{N}\\p{Pc}\\p{Pd}\\p{Zs}$]{1,1024})$");
 
   /** Options for how to convert BigQuery data to Beam data. */
   @AutoValue
@@ -168,7 +178,7 @@ public class BigQueryUtils {
 
   /**
    * Native BigQuery formatter for it's timestamp format, depending on the milliseconds stored in
-   * the column, the milli second part will be 6, 3 or absent. Example {@code 2019-08-16
+   * the column, the milli second part will be 6 to 1 or absent. Example {@code 2019-08-16
    * 00:52:07[.123]|[.123456] UTC}
    */
   private static final DateTimeFormatter BIGQUERY_TIMESTAMP_PARSER;
@@ -195,7 +205,7 @@ public class BigQueryUtils {
             .appendOptional(
                 new DateTimeFormatterBuilder()
                     .appendLiteral('.')
-                    .appendFractionOfSecond(3, 6)
+                    .appendFractionOfSecond(1, 6)
                     .toParser())
             .appendLiteral(" UTC")
             .toFormatter()
@@ -261,8 +271,8 @@ public class BigQueryUtils {
           .put(SqlTypes.DATE.getIdentifier(), StandardSQLTypeName.DATE)
           .put(SqlTypes.TIME.getIdentifier(), StandardSQLTypeName.TIME)
           .put(SqlTypes.DATETIME.getIdentifier(), StandardSQLTypeName.DATETIME)
+          .put(SqlTypes.TIMESTAMP.getIdentifier(), StandardSQLTypeName.TIMESTAMP)
           .put("SqlTimeWithLocalTzType", StandardSQLTypeName.TIME)
-          .put("SqlCharType", StandardSQLTypeName.STRING)
           .put("Enum", StandardSQLTypeName.STRING)
           .build();
 
@@ -280,6 +290,9 @@ public class BigQueryUtils {
           Preconditions.checkArgumentNotNull(fieldType.getLogicalType());
       ret = BEAM_TO_BIGQUERY_LOGICAL_MAPPING.get(logicalType.getIdentifier());
       if (ret == null) {
+        if (logicalType instanceof PassThroughLogicalType) {
+          return toStandardSQLTypeName(logicalType.getBaseType());
+        }
         throw new IllegalArgumentException(
             "Cannot convert Beam logical type: "
                 + logicalType.getIdentifier()
@@ -300,39 +313,45 @@ public class BigQueryUtils {
    *
    * <p>Supports both standard and legacy SQL types.
    *
-   * @param typeName Name of the type
+   * @param typeName Name of the type returned by {@link TableFieldSchema#getType()}
    * @param nestedFields Nested fields for the given type (eg. RECORD type)
    * @return Corresponding Beam {@link FieldType}
    */
-  @Experimental(Kind.SCHEMAS)
   private static FieldType fromTableFieldSchemaType(
       String typeName, List<TableFieldSchema> nestedFields, SchemaConversionOptions options) {
+    // see
+    // https://googleapis.dev/java/google-api-services-bigquery/latest/com/google/api/services/bigquery/model/TableFieldSchema.html#getType--
     switch (typeName) {
       case "STRING":
         return FieldType.STRING;
       case "BYTES":
         return FieldType.BYTES;
-      case "INT64":
       case "INTEGER":
+      case "INT64":
         return FieldType.INT64;
-      case "FLOAT64":
       case "FLOAT":
+      case "FLOAT64":
         return FieldType.DOUBLE;
-      case "BOOL":
       case "BOOLEAN":
+      case "BOOL":
         return FieldType.BOOLEAN;
-      case "NUMERIC":
-        return FieldType.DECIMAL;
       case "TIMESTAMP":
         return FieldType.DATETIME;
-      case "TIME":
-        return FieldType.logicalType(SqlTypes.TIME);
       case "DATE":
         return FieldType.logicalType(SqlTypes.DATE);
+      case "TIME":
+        return FieldType.logicalType(SqlTypes.TIME);
       case "DATETIME":
         return FieldType.logicalType(SqlTypes.DATETIME);
-      case "STRUCT":
+      case "NUMERIC":
+      case "BIGNUMERIC":
+        return FieldType.DECIMAL;
+      case "GEOGRAPHY":
+      case "JSON":
+        // TODO Add metadata for custom sql types ?
+        return FieldType.STRING;
       case "RECORD":
+      case "STRUCT":
         if (options.getInferMaps() && nestedFields.size() == 2) {
           TableFieldSchema key = nestedFields.get(0);
           TableFieldSchema value = nestedFields.get(1);
@@ -343,9 +362,9 @@ public class BigQueryUtils {
                 fromTableFieldSchemaType(value.getType(), value.getFields(), options));
           }
         }
-
         Schema rowSchema = fromTableFieldSchema(nestedFields, options);
         return FieldType.row(rowSchema);
+      case "RANGE": // TODO add support for range type
       default:
         throw new UnsupportedOperationException(
             "Converting BigQuery type " + typeName + " to Beam type is unsupported");
@@ -423,28 +442,52 @@ public class BigQueryUtils {
   }
 
   /** Convert a Beam {@link Schema} to a BigQuery {@link TableSchema}. */
-  @Experimental(Kind.SCHEMAS)
   public static TableSchema toTableSchema(Schema schema) {
     return new TableSchema().setFields(toTableFieldSchema(schema));
   }
 
   /** Convert a BigQuery {@link TableSchema} to a Beam {@link Schema}. */
-  @Experimental(Kind.SCHEMAS)
   public static Schema fromTableSchema(TableSchema tableSchema) {
     return fromTableSchema(tableSchema, SchemaConversionOptions.builder().build());
   }
 
   /** Convert a BigQuery {@link TableSchema} to a Beam {@link Schema}. */
-  @Experimental(Kind.SCHEMAS)
   public static Schema fromTableSchema(TableSchema tableSchema, SchemaConversionOptions options) {
     return fromTableFieldSchema(tableSchema.getFields(), options);
   }
 
+  /** Convert a BigQuery {@link TableSchema} to Avro {@link org.apache.avro.Schema}. */
+  public static org.apache.avro.Schema toGenericAvroSchema(TableSchema tableSchema) {
+    return toGenericAvroSchema(tableSchema, false);
+  }
+
+  /** Convert an Avro {@link org.apache.avro.Schema} to a BigQuery {@link TableSchema}. */
+  public static TableSchema fromGenericAvroSchema(org.apache.avro.Schema schema) {
+    return fromGenericAvroSchema(schema, false);
+  }
+
+  /** Convert an Avro {@link org.apache.avro.Schema} to a BigQuery {@link TableSchema}. */
+  public static TableSchema fromGenericAvroSchema(
+      org.apache.avro.Schema schema, Boolean useAvroLogicalTypes) {
+    return BigQueryAvroUtils.fromGenericAvroSchema(schema, useAvroLogicalTypes);
+  }
+
+  /** Convert a BigQuery {@link TableSchema} to Avro {@link org.apache.avro.Schema}. */
+  public static org.apache.avro.Schema toGenericAvroSchema(
+      TableSchema tableSchema, Boolean useAvroLogicalTypes) {
+    return toGenericAvroSchema("root", tableSchema.getFields(), useAvroLogicalTypes);
+  }
+
   /** Convert a list of BigQuery {@link TableFieldSchema} to Avro {@link org.apache.avro.Schema}. */
-  @Experimental(Kind.SCHEMAS)
   public static org.apache.avro.Schema toGenericAvroSchema(
       String schemaName, List<TableFieldSchema> fieldSchemas) {
-    return BigQueryAvroUtils.toGenericAvroSchema(schemaName, fieldSchemas);
+    return toGenericAvroSchema(schemaName, fieldSchemas, false);
+  }
+
+  /** Convert a list of BigQuery {@link TableFieldSchema} to Avro {@link org.apache.avro.Schema}. */
+  public static org.apache.avro.Schema toGenericAvroSchema(
+      String schemaName, List<TableFieldSchema> fieldSchemas, Boolean useAvroLogicalTypes) {
+    return BigQueryAvroUtils.toGenericAvroSchema(schemaName, fieldSchemas, useAvroLogicalTypes);
   }
 
   private static final BigQueryIO.TypedRead.ToBeamRowFunction<TableRow>
@@ -489,14 +532,16 @@ public class BigQueryUtils {
     }
   }
 
-  @Experimental(Kind.SCHEMAS)
   public static Row toBeamRow(GenericRecord record, Schema schema, ConversionOptions options) {
     List<Object> valuesInOrder =
         schema.getFields().stream()
             .map(
                 field -> {
                   try {
-                    return convertAvroFormat(field.getType(), record.get(field.getName()), options);
+                    org.apache.avro.Schema.Field avroField =
+                        record.getSchema().getField(field.getName());
+                    Object value = avroField != null ? record.get(avroField.pos()) : null;
+                    return convertAvroFormat(field.getType(), value, options);
                   } catch (Exception cause) {
                     throw new IllegalArgumentException(
                         "Error converting field " + field + ": " + cause.getMessage(), cause);
@@ -507,12 +552,23 @@ public class BigQueryUtils {
     return Row.withSchema(schema).addValues(valuesInOrder).build();
   }
 
+  /**
+   * Convert generic record to Bq TableRow.
+   *
+   * @deprecated use {@link #convertGenericRecordToTableRow(GenericRecord)}
+   */
+  @Deprecated
   public static TableRow convertGenericRecordToTableRow(
       GenericRecord record, TableSchema tableSchema) {
-    return BigQueryAvroUtils.convertGenericRecordToTableRow(record, tableSchema);
+    return convertGenericRecordToTableRow(record);
   }
 
-  /** Convert a BigQuery TableRow to a Beam Row. */
+  /** Convert generic record to Bq TableRow. */
+  public static TableRow convertGenericRecordToTableRow(GenericRecord record) {
+    return BigQueryAvroUtils.convertGenericRecordToTableRow(record);
+  }
+
+  /** Convert a Beam Row to a BigQuery TableRow. */
   public static TableRow toTableRow(Row row) {
     TableRow output = new TableRow();
     for (int i = 0; i < row.getFieldCount(); i++) {
@@ -567,12 +623,18 @@ public class BigQueryUtils {
 
       case INT16:
       case INT32:
-      case INT64:
       case FLOAT:
-      case DOUBLE:
-      case STRING:
       case BOOLEAN:
+      case DOUBLE:
+        // The above types have native representations in JSON for all their
+        // possible values.
+        return fieldValue.toString();
+
+      case STRING:
+      case INT64:
       case DECIMAL:
+        // The above types must be cast to string to be safely encoded in
+        // JSON (due to JSON's float-based representation of all numbers).
         return fieldValue.toString();
 
       case BYTES:
@@ -620,7 +682,6 @@ public class BigQueryUtils {
    *
    * <p>Only supports basic types and arrays. Doesn't support date types or structs.
    */
-  @Experimental(Kind.SCHEMAS)
   public static Row toBeamRow(Schema rowSchema, TableRow jsonBqRow) {
     // TODO deprecate toBeamRow(Schema, TableSchema, TableRow) function in favour of this function.
     // This function attempts to convert TableRows without  having access to the
@@ -629,21 +690,8 @@ public class BigQueryUtils {
     // 2. TableSchema objects are not serializable and are therefore harder to propagate through a
     // pipeline.
     return rowSchema.getFields().stream()
-        .map(field -> toBeamRowFieldValue(field, jsonBqRow.get(field.getName())))
+        .map(field -> toBeamValue(field, jsonBqRow.get(field.getName())))
         .collect(toRow(rowSchema));
-  }
-
-  private static Object toBeamRowFieldValue(Field field, Object bqValue) {
-    if (bqValue == null) {
-      if (field.getType().getNullable()) {
-        return null;
-      } else {
-        throw new IllegalArgumentException(
-            "Received null value for non-nullable field " + field.getName());
-      }
-    }
-
-    return toBeamValue(field.getType(), bqValue);
   }
 
   /**
@@ -651,7 +699,6 @@ public class BigQueryUtils {
    *
    * <p>Only supports basic types and arrays. Doesn't support date types.
    */
-  @Experimental(Kind.SCHEMAS)
   public static Row toBeamRow(Schema rowSchema, TableSchema bqSchema, TableRow jsonBqRow) {
     List<TableFieldSchema> bqFields = bqSchema.getFields();
 
@@ -668,11 +715,25 @@ public class BigQueryUtils {
 
     return IntStream.range(0, rowSchema.getFieldCount())
         .boxed()
-        .map(index -> toBeamValue(rowSchema.getField(index).getType(), rawJsonValues.get(index)))
+        .map(index -> toBeamValue(rowSchema.getField(index), rawJsonValues.get(index)))
         .collect(toRow(rowSchema));
   }
 
-  private static @Nullable Object toBeamValue(FieldType fieldType, Object jsonBQValue) {
+  private static @Nullable Object toBeamValue(Field field, Object jsonBQValue) {
+    FieldType fieldType = field.getType();
+
+    if (jsonBQValue == null) {
+      if (fieldType.getNullable()) {
+        return null;
+      } else {
+        if (fieldType.getTypeName().isCollectionType()) {
+          return Collections.emptyList();
+        }
+        throw new IllegalArgumentException(
+            "Received null value for non-nullable field \"" + field.getName() + "\"");
+      }
+    }
+
     if (jsonBQValue instanceof String
         || jsonBQValue instanceof Number
         || jsonBQValue instanceof Boolean) {
@@ -680,19 +741,59 @@ public class BigQueryUtils {
       if (JSON_VALUE_PARSERS.containsKey(fieldType.getTypeName())) {
         return JSON_VALUE_PARSERS.get(fieldType.getTypeName()).apply(jsonBQString);
       } else if (fieldType.isLogicalType(SqlTypes.DATETIME.getIdentifier())) {
-        return LocalDateTime.parse(jsonBQString, BIGQUERY_DATETIME_FORMATTER);
+        try {
+          // Handle if datetime value is in micros ie. 123456789
+          Long value = Long.parseLong(jsonBQString);
+          return CivilTimeEncoder.decodePacked64DatetimeMicrosAsJavaTime(value);
+        } catch (NumberFormatException e) {
+          // Handle as a String, ie. "2023-02-16 12:00:00"
+          return LocalDateTime.parse(jsonBQString, BIGQUERY_DATETIME_FORMATTER);
+        }
       } else if (fieldType.isLogicalType(SqlTypes.DATE.getIdentifier())) {
         return LocalDate.parse(jsonBQString);
       } else if (fieldType.isLogicalType(SqlTypes.TIME.getIdentifier())) {
         return LocalTime.parse(jsonBQString);
+      } else if (fieldType.isLogicalType(SqlTypes.TIMESTAMP.getIdentifier())) {
+        try {
+          long micros = Long.parseLong(jsonBQString);
+          long seconds = micros / 1_000_000;
+          long nanos = (micros % 1_000_000) * 1_000;
+          return java.time.Instant.ofEpochSecond(seconds, nanos);
+        } catch (NumberFormatException e) {
+          return java.time.Instant.parse(jsonBQString);
+        }
       }
     }
 
+    if (jsonBQValue instanceof byte[] && fieldType.getTypeName() == TypeName.BYTES) {
+      return jsonBQValue;
+    }
+
     if (jsonBQValue instanceof List) {
+      if (fieldType.getCollectionElementType() == null) {
+        throw new IllegalArgumentException(
+            "Cannot convert BigQuery type '"
+                + jsonBQValue.getClass()
+                + "' to '"
+                + fieldType
+                + "' because the BigQuery type is a List, while the output type is not a"
+                + " collection.");
+      }
+
+      boolean innerTypeIsMap = fieldType.getCollectionElementType().getTypeName().isMapType();
+
       return ((List<Object>) jsonBQValue)
           .stream()
-              .map(v -> ((Map<String, Object>) v).get("v"))
-              .map(v -> toBeamValue(fieldType.getCollectionElementType(), v))
+              // Old BigQuery client returns arrays as lists of maps {"v": <value>}.
+              // If this is the case, unwrap the value first
+              .map(
+                  v ->
+                      (!innerTypeIsMap
+                              && v instanceof Map
+                              && ((Map<String, Object>) v).keySet().equals(Sets.newHashSet("v")))
+                          ? ((Map<String, Object>) v).get("v")
+                          : v)
+              .map(v -> toBeamValue(field.withType(fieldType.getCollectionElementType()), v))
               .collect(toList());
     }
 
@@ -712,7 +813,6 @@ public class BigQueryUtils {
 
   // TODO: BigQuery shouldn't know about SQL internal logical types.
   private static final Set<String> SQL_DATE_TIME_TYPES = ImmutableSet.of("SqlTimeWithLocalTzType");
-  private static final Set<String> SQL_STRING_TYPES = ImmutableSet.of("SqlCharType");
 
   /**
    * Tries to convert an Avro decoded value to a Beam field value based on the target type of the
@@ -760,7 +860,9 @@ public class BigQueryUtils {
       case ARRAY:
         return convertAvroArray(beamFieldType, avroValue, options);
       case LOGICAL_TYPE:
-        String identifier = beamFieldType.getLogicalType().getIdentifier();
+        LogicalType<?, ?> logicalType = beamFieldType.getLogicalType();
+        assert logicalType != null;
+        String identifier = logicalType.getIdentifier();
         if (SqlTypes.DATE.getIdentifier().equals(identifier)) {
           return convertAvroDate(avroValue);
         } else if (SqlTypes.TIME.getIdentifier().equals(identifier)) {
@@ -778,8 +880,8 @@ public class BigQueryUtils {
                   String.format(
                       "Unknown timestamp truncation option: %s", options.getTruncateTimestamps()));
           }
-        } else if (SQL_STRING_TYPES.contains(identifier)) {
-          return convertAvroPrimitiveTypes(TypeName.STRING, avroValue);
+        } else if (logicalType instanceof PassThroughLogicalType) {
+          return convertAvroFormat(logicalType.getBaseType(), avroValue, options);
         } else {
           throw new RuntimeException("Unknown logical type " + identifier);
         }
@@ -979,6 +1081,67 @@ public class BigQueryUtils {
     return null;
   }
 
+  /**
+   * @param tableReference - a BigQueryTableIdentifier that may or may not include the project.
+   * @return a String representation of the table destination in the form:
+   *     `myproject.mydataset.mytable`
+   */
+  public static @Nullable String toTableSpec(TableReference tableReference) {
+    if (tableReference.getDatasetId() == null || tableReference.getTableId() == null) {
+      throw new IllegalArgumentException(
+          String.format(
+              "Table reference [%s] must include at least a dataset and a table.", tableReference));
+    }
+    String tableSpec =
+        String.format("%s.%s", tableReference.getDatasetId(), tableReference.getTableId());
+    if (!Strings.isNullOrEmpty(tableReference.getProjectId())) {
+      tableSpec = String.format("%s.%s", tableReference.getProjectId(), tableSpec);
+    }
+    return tableSpec;
+  }
+
+  static TableSchema trimSchema(TableSchema schema, @Nullable List<String> selectedFields) {
+    if (selectedFields == null || selectedFields.isEmpty()) {
+      return schema;
+    }
+
+    List<TableFieldSchema> trimmedFields =
+        schema.getFields().stream()
+            .flatMap(f -> trimField(f, selectedFields))
+            .collect(Collectors.toList());
+    return new TableSchema().setFields(trimmedFields);
+  }
+
+  private static Stream<TableFieldSchema> trimField(
+      TableFieldSchema field, List<String> selectedFields) {
+    String name = field.getName();
+    if (selectedFields.contains(name)) {
+      return Stream.of(field);
+    }
+
+    if (field.getFields() != null) {
+      // record
+      List<String> selectedChildren =
+          selectedFields.stream()
+              .filter(sf -> sf.startsWith(name + "."))
+              .map(sf -> sf.substring(name.length() + 1))
+              .collect(toList());
+
+      if (!selectedChildren.isEmpty()) {
+        List<TableFieldSchema> trimmedChildren =
+            field.getFields().stream()
+                .flatMap(c -> trimField(c, selectedChildren))
+                .collect(toList());
+
+        if (!trimmedChildren.isEmpty()) {
+          return Stream.of(field.clone().setFields(trimmedChildren));
+        }
+      }
+    }
+
+    return Stream.empty();
+  }
+
   private static @Nullable ServiceCallMetric callMetricForMethod(
       @Nullable TableReference tableReference, String method) {
     if (tableReference != null) {
@@ -1026,26 +1189,50 @@ public class BigQueryUtils {
   }
 
   /**
-   * Hashes a schema descriptor using a deterministic hash function.
-   *
-   * <p>Warning! These hashes are encoded into messages, so changing this function will cause
-   * pipelines to get stuck on update!
+   * A counter holding a list of counters. Increment the counter will increment every sub-counter it
+   * holds.
    */
-  public static long hashSchemaDescriptorDeterministic(Descriptor descriptor) {
-    long hashCode = 0;
-    for (FieldDescriptor fieldDescriptor : descriptor.getFields()) {
-      hashCode +=
-          Hashing.murmur3_32()
-              .hashString(fieldDescriptor.getName(), StandardCharsets.UTF_8)
-              .asInt();
-      hashCode += Hashing.murmur3_32().hashInt(fieldDescriptor.isRepeated() ? 1 : 0).asInt();
-      hashCode += Hashing.murmur3_32().hashInt(fieldDescriptor.isRequired() ? 1 : 0).asInt();
-      Type type = fieldDescriptor.getType();
-      hashCode += Hashing.murmur3_32().hashInt(type.ordinal()).asInt();
-      if (type.equals(Type.MESSAGE)) {
-        hashCode += hashSchemaDescriptorDeterministic(fieldDescriptor.getMessageType());
+  static class NestedCounter implements Counter, Serializable {
+
+    private final MetricName name;
+    private final ImmutableList<Counter> counters;
+
+    public NestedCounter(MetricName name, Counter... counters) {
+      this.name = name;
+      this.counters = ImmutableList.copyOf(counters);
+    }
+
+    @Override
+    public void inc() {
+      for (Counter counter : counters) {
+        counter.inc();
       }
     }
-    return hashCode;
+
+    @Override
+    public void inc(long n) {
+      for (Counter counter : counters) {
+        counter.inc(n);
+      }
+    }
+
+    @Override
+    public void dec() {
+      for (Counter counter : counters) {
+        counter.dec();
+      }
+    }
+
+    @Override
+    public void dec(long n) {
+      for (Counter counter : counters) {
+        counter.dec(n);
+      }
+    }
+
+    @Override
+    public MetricName getName() {
+      return name;
+    }
   }
 }

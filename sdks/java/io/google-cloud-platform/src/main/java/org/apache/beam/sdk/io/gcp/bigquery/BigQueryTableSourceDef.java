@@ -17,22 +17,20 @@
  */
 package org.apache.beam.sdk.io.gcp.bigquery;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import com.google.api.services.bigquery.model.Table;
 import com.google.api.services.bigquery.model.TableReference;
 import com.google.api.services.bigquery.model.TableSchema;
 import java.io.IOException;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.coders.Coder;
+import org.apache.beam.sdk.extensions.avro.io.AvroSource;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices.DatasetService;
 import org.apache.beam.sdk.options.ValueProvider;
-import org.apache.beam.sdk.schemas.Schema;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.util.Preconditions;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Strings;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -95,22 +93,20 @@ class BigQueryTableSourceDef implements BigQuerySourceDef {
   public <T> BigQuerySourceBase<T> toSource(
       String stepUuid,
       Coder<T> coder,
-      SerializableFunction<SchemaAndRecord, T> parseFn,
+      SerializableFunction<TableSchema, AvroSource.DatumReaderFactory<T>> readerFactory,
       boolean useAvroLogicalTypes) {
     return BigQueryTableSource.create(
-        stepUuid, this, bqServices, coder, parseFn, useAvroLogicalTypes);
+        stepUuid, this, bqServices, coder, readerFactory, useAvroLogicalTypes);
   }
 
   /** {@inheritDoc} */
-  @Experimental(Kind.SCHEMAS)
   @Override
-  public Schema getBeamSchema(BigQueryOptions bqOptions) {
+  public TableSchema getTableSchema(BigQueryOptions bqOptions) {
     try {
       try (DatasetService datasetService = bqServices.getDatasetService(bqOptions)) {
         TableReference tableRef = getTableReference(bqOptions);
         Table table = datasetService.getTable(tableRef);
-        TableSchema tableSchema = Preconditions.checkStateNotNull(table).getSchema();
-        return BigQueryUtils.fromTableSchema(tableSchema);
+        return Preconditions.checkStateNotNull(table).getSchema();
       }
     } catch (Exception e) {
       throw new BigQuerySchemaRetrievalException("Exception while trying to retrieve schema", e);

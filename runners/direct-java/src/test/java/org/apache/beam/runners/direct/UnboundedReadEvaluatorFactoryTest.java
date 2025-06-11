@@ -21,7 +21,7 @@ import static java.util.Collections.emptyMap;
 import static java.util.Collections.emptySet;
 import static java.util.Collections.singletonMap;
 import static org.apache.beam.runners.direct.DirectGraphs.getProducer;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.equalTo;
@@ -30,7 +30,7 @@ import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.Assert.assertEquals;
-import static org.mockito.Matchers.any;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -47,7 +47,6 @@ import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.concurrent.Executors;
-import org.apache.beam.runners.core.construction.SplittableParDo;
 import org.apache.beam.runners.direct.UnboundedReadDeduplicator.NeverDeduplicator;
 import org.apache.beam.runners.direct.UnboundedReadEvaluatorFactory.UnboundedSourceShard;
 import org.apache.beam.sdk.Pipeline;
@@ -73,16 +72,18 @@ import org.apache.beam.sdk.transforms.windowing.GlobalWindow;
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
 import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.util.VarInt;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.SplittableParDo;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.TupleTag;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ContiguousSet;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.DiscreteDomain;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.LinkedListMultimap;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Range;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ContiguousSet;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.DiscreteDomain;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.LinkedListMultimap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Range;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.hamcrest.Matchers;
 import org.joda.time.DateTime;
@@ -311,7 +312,7 @@ public class UnboundedReadEvaluatorFactoryTest {
     when(context.createBundle(pcollection)).thenReturn(output);
 
     WindowedValue<UnboundedSourceShard<Long, TestCheckpointMark>> shard =
-        WindowedValue.valueInGlobalWindow(
+        WindowedValues.valueInGlobalWindow(
             UnboundedSourceShard.unstarted(source, NeverDeduplicator.create()));
     CommittedBundle<UnboundedSourceShard<Long, TestCheckpointMark>> inputBundle =
         bundleFactory
@@ -356,7 +357,7 @@ public class UnboundedReadEvaluatorFactoryTest {
     when(context.createBundle(pcollection)).thenReturn(output);
 
     WindowedValue<UnboundedSourceShard<Long, TestCheckpointMark>> shard =
-        WindowedValue.valueInGlobalWindow(
+        WindowedValues.valueInGlobalWindow(
             UnboundedSourceShard.unstarted(source, NeverDeduplicator.create()));
     CommittedBundle<UnboundedSourceShard<Long, TestCheckpointMark>> inputBundle =
         bundleFactory
@@ -402,7 +403,7 @@ public class UnboundedReadEvaluatorFactoryTest {
     when(context.createBundle(pcollection)).thenReturn(output);
 
     WindowedValue<UnboundedSourceShard<Long, TestCheckpointMark>> shard =
-        WindowedValue.valueInGlobalWindow(
+        WindowedValues.valueInGlobalWindow(
             UnboundedSourceShard.unstarted(source, NeverDeduplicator.create()));
     CommittedBundle<UnboundedSourceShard<Long, TestCheckpointMark>> inputBundle =
         bundleFactory
@@ -469,7 +470,7 @@ public class UnboundedReadEvaluatorFactoryTest {
     final UnboundedSourceShard<String, TestCheckpointMark> shard =
         UnboundedSourceShard.of(source, new NeverDeduplicator(), reader, null);
     final WindowedValue<UnboundedSourceShard<String, TestCheckpointMark>> value =
-        WindowedValue.of(
+        WindowedValues.of(
             shard, BoundedWindow.TIMESTAMP_MAX_VALUE, GlobalWindow.INSTANCE, PaneInfo.NO_FIRING);
     TestUnboundedSource.readerClosedCount = 0;
     evaluator.processElement(value);
@@ -480,7 +481,7 @@ public class UnboundedReadEvaluatorFactoryTest {
    * is the epoch offset by the value of the element.
    */
   private static WindowedValue<Long> tgw(Long elem) {
-    return WindowedValue.timestampedValueInGlobalWindow(elem, new Instant(elem));
+    return WindowedValues.timestampedValueInGlobalWindow(elem, new Instant(elem));
   }
 
   private static class LongToInstantFn implements SerializableFunction<Long, Instant> {

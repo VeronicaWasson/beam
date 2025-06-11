@@ -34,6 +34,7 @@ import logging
 import time
 import uuid
 from typing import Any
+from typing import Dict
 from typing import List
 from typing import Mapping
 from typing import Optional
@@ -44,16 +45,20 @@ from requests.auth import HTTPBasicAuth
 
 import apache_beam as beam
 from apache_beam.metrics import Metrics
+from apache_beam.metrics.metric import MetricResults
+from apache_beam.metrics.metric import MetricsFilter
+from apache_beam.runners.dataflow.dataflow_runner import DataflowPipelineResult
+from apache_beam.runners.runner import PipelineResult
 from apache_beam.transforms.window import TimestampedValue
 from apache_beam.utils.timestamp import Timestamp
 
 try:
-  from google.cloud import bigquery  # type: ignore[attr-defined]
+  from google.cloud import bigquery
   from google.cloud.bigquery.schema import SchemaField
   from google.cloud.exceptions import NotFound
 except ImportError:
-  bigquery = None
-  SchemaField = None
+  bigquery = None  # type: ignore
+  SchemaField = None  # type: ignore
   NotFound = None  # type: ignore
 
 RUNTIME_METRIC = 'runtime'
@@ -63,6 +68,7 @@ ID_LABEL = 'test_id'
 SUBMIT_TIMESTAMP_LABEL = 'timestamp'
 METRICS_TYPE_LABEL = 'metric'
 VALUE_LABEL = 'value'
+JOB_ID_LABEL = 'job_id'
 
 SCHEMA = [{
     'name': ID_LABEL, 'field_type': 'STRING', 'mode': 'REQUIRED'
@@ -78,6 +84,8 @@ SCHEMA = [{
               'mode': 'REQUIRED'
           }, {
               'name': VALUE_LABEL, 'field_type': 'FLOAT', 'mode': 'REQUIRED'
+          }, {
+              'name': JOB_ID_LABEL, 'field_type': 'STRING', 'mode': 'NULLABLE'
           }]
 
 _LOGGER = logging.getLogger(__name__)
@@ -151,7 +159,7 @@ def get_all_distributions_by_type(dist, metric_id):
     list of :class:`DistributionMetric` objects
   """
   submit_timestamp = time.time()
-  dist_types = ['count', 'max', 'min', 'sum']
+  dist_types = ['count', 'max', 'min', 'sum', 'mean']
   distribution_dicts = []
   for dist_type in dist_types:
     try:
@@ -185,15 +193,13 @@ class MetricsReader(object):
   A :class:`MetricsReader` retrieves metrics from pipeline result,
   prepares it for publishers and setup publishers.
   """
-  publishers = []  # type: List[Any]
-
   def __init__(
       self,
       project_name=None,
       bq_table=None,
       bq_dataset=None,
       publish_to_bq=False,
-      influxdb_options=None,  # type: Optional[InfluxDBMetricsPublisherOptions]
+      influxdb_options: Optional['InfluxDBMetricsPublisherOptions'] = None,
       namespace=None,
       filters=None):
     """Initializes :class:`MetricsReader` .
@@ -206,14 +212,18 @@ class MetricsReader(object):
       filters: MetricFilter to query only filtered metrics
     """
     self._namespace = namespace
+    self.publishers: List[MetricsPublisher] = []
+    # publish to console output
     self.publishers.append(ConsoleMetricsPublisher())
 
-    check = project_name and bq_table and bq_dataset and publish_to_bq
-    if check:
+    bq_check = project_name and bq_table and bq_dataset and publish_to_bq
+    if bq_check:
+      # publish to BigQuery
       bq_publisher = BigQueryMetricsPublisher(
           project_name, bq_table, bq_dataset)
       self.publishers.append(bq_publisher)
     if influxdb_options and influxdb_options.validate():
+      # publish to InfluxDB
       self.publishers.append(InfluxDBMetricsPublisher(influxdb_options))
     else:
       _LOGGER.info(
@@ -221,7 +231,27 @@ class MetricsReader(object):
           'InfluxDB')
     self.filters = filters
 
-  def publish_metrics(self, result, extra_metrics: Optional[dict] = None):
+  def get_counter_metric(self, result: PipelineResult, name: str) -> int:
+    """
+    Return the current value for a long counter, or -1 if can't be retrieved.
+    Note this uses only attempted metrics because some runners don't support
+    committed metrics.
+    """
+    filters = MetricsFilter().with_namespace(self._namespace).with_name(name)
+    counters = result.metrics().query(filters)[MetricResults.COUNTERS]
+    num_results = len(counters)
+    if num_results > 1:
+      raise ValueError(
+          f"More than one metric result matches name: {name} in namespace "\
+          f"{self._namespace}. Metric results count: {num_results}")
+    elif num_results == 0:
+      return -1
+    else:
+      return counters[0].attempted
+
+  def publish_metrics(
+      self, result: PipelineResult, extra_metrics: Optional[dict] = None):
+    """Publish metrics from pipeline result to registered publishers."""
     metric_id = uuid.uuid4().hex
     metrics = result.metrics().query(self.filters)
 
@@ -230,12 +260,26 @@ class MetricsReader(object):
     # Under each key there is list of objects of each metric type. It is
     # required to prepare metrics for publishing purposes. Expected is to have
     # a list of dictionaries matching the schema.
+
     insert_dicts = self._prepare_all_metrics(metrics, metric_id)
 
     insert_dicts += self._prepare_extra_metrics(metric_id, extra_metrics)
+
+    # Add job id for dataflow jobs for easier debugging.
+    job_id = None
+    if isinstance(result, DataflowPipelineResult):
+      job_id = result.job_id()
+      self._add_job_id_to_metrics(insert_dicts, job_id)
+
     if len(insert_dicts) > 0:
       for publisher in self.publishers:
         publisher.publish(insert_dicts)
+
+  def _add_job_id_to_metrics(self, metrics: List[Dict[str, Any]],
+                             job_id) -> List[Dict[str, Any]]:
+    for metric in metrics:
+      metric[JOB_ID_LABEL] = job_id
+    return metrics
 
   def _prepare_extra_metrics(
       self, metric_id: str, extra_metrics: Optional[dict] = None):
@@ -243,8 +287,8 @@ class MetricsReader(object):
     if not extra_metrics:
       extra_metrics = {}
     return [
-        Metric(ts, metric_id, v, label=k).as_dict() for k,
-        v in extra_metrics.items()
+        Metric(ts, metric_id, v, label=k).as_dict()
+        for k, v in extra_metrics.items()
     ]
 
   def publish_values(self, labeled_values):
@@ -255,8 +299,7 @@ class MetricsReader(object):
     """
     metric_dicts = [
         Metric(time.time(), uuid.uuid4().hex, value, label=label).as_dict()
-        for label,
-        value in labeled_values
+        for label, value in labeled_values
     ]
 
     for publisher in self.publishers:
@@ -385,7 +428,13 @@ class RuntimeMetric(Metric):
     return runtime_in_s
 
 
-class ConsoleMetricsPublisher(object):
+class MetricsPublisher:
+  """Base class for metrics publishers."""
+  def publish(self, results):
+    raise NotImplementedError
+
+
+class ConsoleMetricsPublisher(MetricsPublisher):
   """A :class:`ConsoleMetricsPublisher` publishes collected metrics
   to console output."""
   def publish(self, results):
@@ -401,11 +450,13 @@ class ConsoleMetricsPublisher(object):
       _LOGGER.info("No test results were collected.")
 
 
-class BigQueryMetricsPublisher(object):
+class BigQueryMetricsPublisher(MetricsPublisher):
   """A :class:`BigQueryMetricsPublisher` publishes collected metrics
   to BigQuery output."""
-  def __init__(self, project_name, table, dataset):
-    self.bq = BigQueryClient(project_name, table, dataset)
+  def __init__(self, project_name, table, dataset, bq_schema=None):
+    if not bq_schema:
+      bq_schema = SCHEMA
+    self.bq = BigQueryClient(project_name, table, dataset, bq_schema)
 
   def publish(self, results):
     outputs = self.bq.save(results)
@@ -420,7 +471,8 @@ class BigQueryMetricsPublisher(object):
 class BigQueryClient(object):
   """A :class:`BigQueryClient` publishes collected metrics to
   BigQuery output."""
-  def __init__(self, project_name, table, dataset):
+  def __init__(self, project_name, table, dataset, bq_schema=None):
+    self.schema = bq_schema
     self._namespace = table
     self._client = bigquery.Client(project=project_name)
     self._schema_names = self._get_schema_names()
@@ -428,10 +480,10 @@ class BigQueryClient(object):
     self._get_or_create_table(schema, dataset)
 
   def _get_schema_names(self):
-    return [schema['name'] for schema in SCHEMA]
+    return [schema['name'] for schema in self.schema]
 
   def _prepare_schema(self):
-    return [SchemaField(**row) for row in SCHEMA]
+    return [SchemaField(**row) for row in self.schema]
 
   def _get_or_create_table(self, bq_schemas, dataset):
     if self._namespace == '':
@@ -446,6 +498,12 @@ class BigQueryClient(object):
       table = bigquery.Table(table_ref, schema=bq_schemas)
       self._bq_table = self._client.create_table(table)
 
+  def _update_schema(self):
+    table_schema = self._bq_table.schema
+    if self.schema and len(table_schema) != self.schema:
+      self._bq_table.schema = self._prepare_schema()
+      self._bq_table = self._client.update_table(self._bq_table, ["schema"])
+
   def _get_dataset(self, dataset_name):
     bq_dataset_ref = self._client.dataset(dataset_name)
     try:
@@ -457,43 +515,39 @@ class BigQueryClient(object):
     return bq_dataset
 
   def save(self, results):
+    # update schema if needed
+    self._update_schema()
     return self._client.insert_rows(self._bq_table, results)
 
 
 class InfluxDBMetricsPublisherOptions(object):
   def __init__(
       self,
-      measurement,  # type: str
-      db_name,  # type: str
-      hostname,  # type: str
-      user=None,  # type: Optional[str]
-      password=None  # type: Optional[str]
-    ):
+      measurement: str,
+      db_name: str,
+      hostname: str,
+      user: Optional[str] = None,
+      password: Optional[str] = None):
     self.measurement = measurement
     self.db_name = db_name
     self.hostname = hostname
     self.user = user
     self.password = password
 
-  def validate(self):
-    # type: () -> bool
+  def validate(self) -> bool:
     return bool(self.measurement) and bool(self.db_name)
 
-  def http_auth_enabled(self):
-    # type: () -> bool
+  def http_auth_enabled(self) -> bool:
     return self.user is not None and self.password is not None
 
 
-class InfluxDBMetricsPublisher(object):
+class InfluxDBMetricsPublisher(MetricsPublisher):
   """Publishes collected metrics to InfluxDB database."""
-  def __init__(
-      self,
-      options  # type: InfluxDBMetricsPublisherOptions
-  ):
+  def __init__(self, options: InfluxDBMetricsPublisherOptions):
     self.options = options
 
-  def publish(self, results):
-    # type: (List[Mapping[str, Union[float, str, int]]]) -> None
+  def publish(
+      self, results: List[Mapping[str, Union[float, str, int]]]) -> None:
     url = '{}/write'.format(self.options.hostname)
     payload = self._build_payload(results)
     query_str = {'db': self.options.db_name, 'precision': 's'}
@@ -502,7 +556,8 @@ class InfluxDBMetricsPublisher(object):
       self.options.http_auth_enabled() else None
 
     try:
-      response = requests.post(url, params=query_str, data=payload, auth=auth)
+      response = requests.post(
+          url, params=query_str, data=payload, auth=auth, timeout=60)
     except requests.exceptions.RequestException as e:
       _LOGGER.warning('Failed to publish metrics to InfluxDB: ' + str(e))
     else:
@@ -513,8 +568,8 @@ class InfluxDBMetricsPublisher(object):
             'with an error message: %s' %
             (response.status_code, content['error']))
 
-  def _build_payload(self, results):
-    # type: (List[Mapping[str, Union[float, str, int]]]) -> str
+  def _build_payload(
+      self, results: List[Mapping[str, Union[float, str, int]]]) -> str:
     def build_kv(mapping, key):
       return '{}={}'.format(key, mapping[key])
 

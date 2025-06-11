@@ -25,12 +25,16 @@ import shutil
 import sys
 import tempfile
 import unittest
+from collections.abc import Sequence
+from typing import Any
+from typing import Optional
 
 import joblib
 import numpy
 import pandas
 from sklearn import linear_model
 from sklearn import svm
+from sklearn.base import BaseEstimator
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
@@ -43,6 +47,8 @@ from apache_beam.ml.inference.base import RunInference
 from apache_beam.ml.inference.sklearn_inference import ModelFileType
 from apache_beam.ml.inference.sklearn_inference import SklearnModelHandlerNumpy
 from apache_beam.ml.inference.sklearn_inference import SklearnModelHandlerPandas
+from apache_beam.ml.inference.sklearn_inference import _default_numpy_inference_fn
+from apache_beam.ml.inference.sklearn_inference import _default_pandas_inference_fn
 from apache_beam.testing.test_pipeline import TestPipeline
 from apache_beam.testing.util import assert_that
 from apache_beam.testing.util import equal_to
@@ -50,6 +56,10 @@ from apache_beam.testing.util import equal_to
 
 def _compare_prediction_result(a, b):
   example_equal = numpy.array_equal(a.example, b.example)
+  if isinstance(a.inference, dict):
+    return all(
+        x == y for x, y in zip(a.inference.values(),
+                               b.inference.values())) and example_equal
   return a.inference == b.inference and example_equal
 
 
@@ -63,6 +73,10 @@ def _compare_dataframe_predictions(a_in, b_in):
     a = a_in
     b = b_in
   example_equal = pandas.DataFrame.equals(a.example, b.example)
+  if isinstance(a.inference, dict):
+    return all(
+        math.floor(a) == math.floor(b) for a, b in zip(
+            a.inference.values(), b.inference.values())) and example_equal
   inference_equal = math.floor(a.inference) == math.floor(b.inference)
   return inference_equal and example_equal and keys_equal
 
@@ -74,6 +88,26 @@ class FakeModel:
   def predict(self, input_vector: numpy.ndarray):
     self.total_predict_calls += 1
     return numpy.sum(input_vector, axis=1)
+
+
+class FakeNumpyModelDictOut:
+  def __init__(self):
+    self.total_predict_calls = 0
+
+  def predict(self, input_vector: numpy.ndarray):
+    self.total_predict_calls += 1
+    out = numpy.sum(input_vector, axis=1)
+    return {"out1": out, "out2": out}
+
+
+class FakePandasModelDictOut:
+  def __init__(self):
+    self.total_predict_calls = 0
+
+  def predict(self, df: pandas.DataFrame):
+    self.total_predict_calls += 1
+    out = df.loc[:, 'number_2']
+    return {"out1": out, "out2": out}
 
 
 def build_model():
@@ -122,6 +156,27 @@ def convert_inference_to_floor(prediction_result):
   return math.floor(prediction_result.inference)
 
 
+def alternate_numpy_inference_fn(
+    model: BaseEstimator,
+    batch: Sequence[numpy.ndarray],
+    inference_args: Optional[dict[str, Any]] = None) -> Any:
+  return [0]
+
+
+def alternate_pandas_inference_fn(
+    model: BaseEstimator,
+    batch: Sequence[pandas.DataFrame],
+    inference_args: Optional[dict[str, Any]] = None) -> Any:
+  # vectorize data for better performance
+  vectorized_batch = pandas.concat(batch, axis=0)
+  predictions = model.predict(vectorized_batch)
+  splits = [
+      vectorized_batch.iloc[[i]] for i in range(vectorized_batch.shape[0])
+  ]
+  predictions = predictions - 1
+  return predictions, splits
+
+
 class SkLearnRunInferenceTest(unittest.TestCase):
   def setUp(self):
     self.tmpdir = tempfile.mkdtemp()
@@ -139,6 +194,43 @@ class SkLearnRunInferenceTest(unittest.TestCase):
         PredictionResult(numpy.array([1, 2, 3]), 6),
         PredictionResult(numpy.array([4, 5, 6]), 15),
         PredictionResult(numpy.array([7, 8, 9]), 24)
+    ]
+    inferences = inference_runner.run_inference(batched_examples, fake_model)
+    for actual, expected in zip(inferences, expected_predictions):
+      self.assertTrue(_compare_prediction_result(actual, expected))
+
+  def test_custom_inference_fn(self):
+    fake_model = FakeModel()
+    inference_runner = SklearnModelHandlerNumpy(
+        model_uri='unused', inference_fn=alternate_numpy_inference_fn)
+    batched_examples = [
+        numpy.array([1, 2, 3]), numpy.array([4, 5, 6]), numpy.array([7, 8, 9])
+    ]
+    expected_predictions = [
+        PredictionResult(numpy.array([1, 2, 3]), 0),
+        PredictionResult(numpy.array([4, 5, 6]), 0),
+        PredictionResult(numpy.array([7, 8, 9]), 0)
+    ]
+    inferences = inference_runner.run_inference(batched_examples, fake_model)
+    for actual, expected in zip(inferences, expected_predictions):
+      self.assertTrue(_compare_prediction_result(actual, expected))
+
+  def test_predict_output_dict(self):
+    fake_model = FakeNumpyModelDictOut()
+    inference_runner = SklearnModelHandlerNumpy(model_uri='unused')
+    batched_examples = [
+        numpy.array([1, 2, 3]), numpy.array([4, 5, 6]), numpy.array([7, 8, 9])
+    ]
+    expected_predictions = [
+        PredictionResult(numpy.array([1, 2, 3]), {
+            "out1": 6, "out2": 6
+        }),
+        PredictionResult(numpy.array([4, 5, 6]), {
+            "out1": 15, "out2": 15
+        }),
+        PredictionResult(numpy.array([7, 8, 9]), {
+            "out1": 24, "out2": 24
+        })
     ]
     inferences = inference_runner.run_inference(batched_examples, fake_model)
     for actual, expected in zip(inferences, expected_predictions):
@@ -173,9 +265,6 @@ class SkLearnRunInferenceTest(unittest.TestCase):
         sys.getsizeof(batched_examples_float[0]) * 3,
         inference_runner.get_num_bytes(batched_examples_float))
 
-  @unittest.skipIf(
-      platform.system() == 'Windows',
-      'https://github.com/apache/beam/issues/21449')
   def test_pipeline_pickled(self):
     temp_file_name = self.tmpdir + os.sep + 'pickled_file'
     with open(temp_file_name, 'wb') as file:
@@ -193,9 +282,69 @@ class SkLearnRunInferenceTest(unittest.TestCase):
       assert_that(
           actual, equal_to(expected, equals_fn=_compare_prediction_result))
 
-  @unittest.skipIf(
-      platform.system() == 'Windows',
-      'https://github.com/apache/beam/issues/21449')
+  def test_pipeline_pickled_custom_batching(self):
+    temp_file_name = self.tmpdir + os.sep + 'pickled_file'
+    with open(temp_file_name, 'wb') as file:
+      pickle.dump(build_model(), file)
+
+    def batch_validator_numpy_inference_fn(
+        model: BaseEstimator,
+        batch: Sequence[numpy.ndarray],
+        inference_args: Optional[dict[str, Any]] = None) -> Any:
+      if len(batch) != 2:
+        raise Exception(
+            f'Expected batch of size 2, received batch of size {len(batch)}')
+      return _default_numpy_inference_fn(model, batch, inference_args)
+
+    with TestPipeline() as pipeline:
+      examples = [numpy.array([0, 0]), numpy.array([1, 1])]
+
+      pcoll = pipeline | 'start' >> beam.Create(examples)
+      actual = pcoll | RunInference(
+          SklearnModelHandlerNumpy(
+              model_uri=temp_file_name,
+              inference_fn=batch_validator_numpy_inference_fn,
+              min_batch_size=2,
+              max_batch_size=2))
+      expected = [
+          PredictionResult(numpy.array([0, 0]), 0),
+          PredictionResult(numpy.array([1, 1]), 1)
+      ]
+      assert_that(
+          actual, equal_to(expected, equals_fn=_compare_prediction_result))
+
+  def test_pipeline_pickled_large_model(self):
+    temp_file_name = self.tmpdir + os.sep + 'pickled_file'
+    with open(temp_file_name, 'wb') as file:
+      pickle.dump(build_model(), file)
+
+    def large_model_validator_numpy_inference_fn(
+        model: BaseEstimator,
+        batch: Sequence[numpy.ndarray],
+        inference_args: Optional[dict[str, Any]] = None) -> Any:
+      multi_process_shared_loaded = "multi_process_shared" in str(type(model))
+      if not multi_process_shared_loaded:
+        raise Exception(
+            f'Loaded model of type {type(model)}, was ' +
+            'expecting multi_process_shared_model')
+      return _default_numpy_inference_fn(model, batch, inference_args)
+
+    with TestPipeline() as pipeline:
+      examples = [numpy.array([0, 0]), numpy.array([1, 1])]
+
+      pcoll = pipeline | 'start' >> beam.Create(examples)
+      actual = pcoll | RunInference(
+          SklearnModelHandlerNumpy(
+              model_uri=temp_file_name,
+              inference_fn=large_model_validator_numpy_inference_fn,
+              large_model=True))
+      expected = [
+          PredictionResult(numpy.array([0, 0]), 0),
+          PredictionResult(numpy.array([1, 1]), 1)
+      ]
+      assert_that(
+          actual, equal_to(expected, equals_fn=_compare_prediction_result))
+
   def test_pipeline_joblib(self):
     temp_file_name = self.tmpdir + os.sep + 'joblib_file'
     with open(temp_file_name, 'wb') as file:
@@ -224,20 +373,32 @@ class SkLearnRunInferenceTest(unittest.TestCase):
             SklearnModelHandlerNumpy(model_uri='/var/bad_file_name'))
         pipeline.run()
 
-  @unittest.skipIf(
-      platform.system() == 'Windows',
-      'https://github.com/apache/beam/issues/21449')
   def test_bad_input_type_raises(self):
     with self.assertRaisesRegex(AssertionError,
                                 'Unsupported serialization type'):
-      with tempfile.NamedTemporaryFile() as file:
+      with tempfile.NamedTemporaryFile(delete=False) as file:
         model_handler = SklearnModelHandlerNumpy(
             model_uri=file.name, model_file_type=None)
         model_handler.load_model()
 
-  @unittest.skipIf(
-      platform.system() == 'Windows',
-      'https://github.com/apache/beam/issues/21449')
+  def test_env_vars_set_correctly_numpy(self):
+    temp_file_name = self.tmpdir + os.sep + 'pickled_file'
+    with open(temp_file_name, 'wb') as file:
+      pickle.dump(build_model(), file)
+    handler_with_vars = SklearnModelHandlerNumpy(
+        env_vars={'FOO': 'bar'}, model_uri=temp_file_name)
+    os.environ.pop('FOO', None)
+    self.assertFalse('FOO' in os.environ)
+    examples = [numpy.array([0, 0]), numpy.array([1, 1])]
+    with TestPipeline() as pipeline:
+      _ = (
+          pipeline
+          | 'start' >> beam.Create(examples)
+          | RunInference(handler_with_vars))
+      pipeline.run()
+      self.assertTrue('FOO' in os.environ)
+      self.assertTrue((os.environ['FOO']) == 'bar')
+
   def test_pipeline_pandas(self):
     temp_file_name = self.tmpdir + os.sep + 'pickled_file'
     with open(temp_file_name, 'wb') as file:
@@ -255,6 +416,151 @@ class SkLearnRunInferenceTest(unittest.TestCase):
           PredictionResult(splits[2], 1),
           PredictionResult(splits[3], 1),
           PredictionResult(splits[4], 2),
+      ]
+      assert_that(
+          actual, equal_to(expected, equals_fn=_compare_dataframe_predictions))
+
+  def test_pipeline_pandas_env_vars_set_correctly(self):
+    temp_file_name = self.tmpdir + os.sep + 'pickled_file'
+    with open(temp_file_name, 'wb') as file:
+      pickle.dump(build_pandas_pipeline(), file)
+
+    handler_with_vars = SklearnModelHandlerPandas(
+        env_vars={'FOO': 'bar'}, model_uri=temp_file_name)
+    os.environ.pop('FOO', None)
+    self.assertFalse('FOO' in os.environ)
+    with TestPipeline() as pipeline:
+      dataframe = pandas_dataframe()
+      splits = [dataframe.loc[[i]] for i in dataframe.index]
+      _ = (
+          pipeline
+          | 'start' >> beam.Create(splits)
+          | RunInference(handler_with_vars))
+      pipeline.run()
+      self.assertTrue('FOO' in os.environ)
+      self.assertTrue((os.environ['FOO']) == 'bar')
+
+  def test_pipeline_pandas_custom_batching(self):
+    temp_file_name = self.tmpdir + os.sep + 'pickled_file'
+    with open(temp_file_name, 'wb') as file:
+      pickle.dump(build_pandas_pipeline(), file)
+
+    def batch_validator_pandas_inference_fn(
+        model: BaseEstimator,
+        batch: Sequence[numpy.ndarray],
+        inference_args: Optional[dict[str, Any]] = None) -> Any:
+      if len(batch) != 5:
+        raise Exception(
+            f'Expected batch of size 5, received batch of size {len(batch)}')
+      return _default_pandas_inference_fn(model, batch, inference_args)
+
+    with TestPipeline() as pipeline:
+      dataframe = pandas_dataframe()
+      splits = [dataframe.loc[[i]] for i in dataframe.index]
+      pcoll = pipeline | 'start' >> beam.Create(splits)
+      actual = pcoll | RunInference(
+          SklearnModelHandlerPandas(
+              model_uri=temp_file_name,
+              inference_fn=batch_validator_pandas_inference_fn,
+              min_batch_size=5,
+              max_batch_size=5))
+
+      expected = [
+          PredictionResult(splits[0], 5),
+          PredictionResult(splits[1], 8),
+          PredictionResult(splits[2], 1),
+          PredictionResult(splits[3], 1),
+          PredictionResult(splits[4], 2),
+      ]
+      assert_that(
+          actual, equal_to(expected, equals_fn=_compare_dataframe_predictions))
+
+  def test_pipeline_pandas_large_model(self):
+    temp_file_name = self.tmpdir + os.sep + 'pickled_file'
+    with open(temp_file_name, 'wb') as file:
+      pickle.dump(build_pandas_pipeline(), file)
+
+    def large_model_validator_pandas_inference_fn(
+        model: BaseEstimator,
+        batch: Sequence[numpy.ndarray],
+        inference_args: Optional[dict[str, Any]] = None) -> Any:
+      multi_process_shared_loaded = "multi_process_shared" in str(type(model))
+      if not multi_process_shared_loaded:
+        raise Exception(
+            f'Loaded model of type {type(model)}, was ' +
+            'expecting multi_process_shared_model')
+      return _default_pandas_inference_fn(model, batch, inference_args)
+
+    with TestPipeline() as pipeline:
+      dataframe = pandas_dataframe()
+      splits = [dataframe.loc[[i]] for i in dataframe.index]
+      pcoll = pipeline | 'start' >> beam.Create(splits)
+      actual = pcoll | RunInference(
+          SklearnModelHandlerPandas(
+              model_uri=temp_file_name,
+              inference_fn=large_model_validator_pandas_inference_fn,
+              large_model=True))
+
+      expected = [
+          PredictionResult(splits[0], 5),
+          PredictionResult(splits[1], 8),
+          PredictionResult(splits[2], 1),
+          PredictionResult(splits[3], 1),
+          PredictionResult(splits[4], 2),
+      ]
+      assert_that(
+          actual, equal_to(expected, equals_fn=_compare_dataframe_predictions))
+
+  def test_pipeline_pandas_custom_inference(self):
+    temp_file_name = self.tmpdir + os.sep + 'pickled_file'
+    with open(temp_file_name, 'wb') as file:
+      pickle.dump(build_pandas_pipeline(), file)
+    with TestPipeline() as pipeline:
+      dataframe = pandas_dataframe()
+      splits = [dataframe.loc[[i]] for i in dataframe.index]
+      pcoll = pipeline | 'start' >> beam.Create(splits)
+      actual = pcoll | RunInference(
+          SklearnModelHandlerPandas(
+              model_uri=temp_file_name,
+              inference_fn=alternate_pandas_inference_fn))
+
+      expected = [
+          PredictionResult(splits[0], 4),
+          PredictionResult(splits[1], 7),
+          PredictionResult(splits[2], 0),
+          PredictionResult(splits[3], 0),
+          PredictionResult(splits[4], 1),
+      ]
+      assert_that(
+          actual, equal_to(expected, equals_fn=_compare_dataframe_predictions))
+
+  def test_pipeline_pandas_dict_out(self):
+    temp_file_name = self.tmpdir + os.sep + 'pickled_file'
+    with open(temp_file_name, 'wb') as file:
+      pickle.dump(FakePandasModelDictOut(), file)
+    with TestPipeline() as pipeline:
+      dataframe = pandas_dataframe()
+      splits = [dataframe.loc[[i]] for i in dataframe.index]
+      pcoll = pipeline | 'start' >> beam.Create(splits)
+      actual = pcoll | RunInference(
+          SklearnModelHandlerPandas(model_uri=temp_file_name))
+
+      expected = [
+          PredictionResult(splits[0], {
+              'out1': 5, 'out2': 5
+          }),
+          PredictionResult(splits[1], {
+              'out1': 8, 'out2': 8
+          }),
+          PredictionResult(splits[2], {
+              'out1': 1, 'out2': 1
+          }),
+          PredictionResult(splits[3], {
+              'out1': 1, 'out2': 1
+          }),
+          PredictionResult(splits[4], {
+              'out1': 4, 'out2': 4
+          }),
       ]
       assert_that(
           actual, equal_to(expected, equals_fn=_compare_dataframe_predictions))
@@ -282,9 +588,6 @@ class SkLearnRunInferenceTest(unittest.TestCase):
       assert_that(
           actual, equal_to(expected, equals_fn=_compare_dataframe_predictions))
 
-  @unittest.skipIf(
-      platform.system() == 'Windows',
-      'https://github.com/apache/beam/issues/21449')
   def test_pipeline_pandas_with_keys(self):
     temp_file_name = self.tmpdir + os.sep + 'pickled_file'
     with open(temp_file_name, 'wb') as file:

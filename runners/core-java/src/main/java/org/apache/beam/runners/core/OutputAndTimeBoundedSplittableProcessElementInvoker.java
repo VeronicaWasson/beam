@@ -17,9 +17,10 @@
  */
 package org.apache.beam.runners.core;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
+import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.Future;
@@ -42,14 +43,17 @@ import org.apache.beam.sdk.transforms.splittabledofn.RestrictionTracker;
 import org.apache.beam.sdk.transforms.splittabledofn.SplitResult;
 import org.apache.beam.sdk.transforms.splittabledofn.TimestampObservingWatermarkEstimator;
 import org.apache.beam.sdk.transforms.splittabledofn.WatermarkEstimator;
+import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.WindowedValueMultiReceiver;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.Row;
 import org.apache.beam.sdk.values.TupleTag;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.util.concurrent.Futures;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.util.concurrent.Futures;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
@@ -70,19 +74,20 @@ public class OutputAndTimeBoundedSplittableProcessElementInvoker<
         InputT, OutputT, RestrictionT, PositionT, WatermarkEstimatorStateT> {
   private final DoFn<InputT, OutputT> fn;
   private final PipelineOptions pipelineOptions;
-  private final OutputWindowedValue<OutputT> output;
+  private final WindowedValueMultiReceiver outputReceiver;
   private final SideInputReader sideInputReader;
   private final ScheduledExecutorService executor;
   private final int maxNumOutputs;
   private final Duration maxDuration;
   private final Supplier<BundleFinalizer> bundleFinalizer;
+  private final TupleTag<OutputT> mainOutputTag;
 
   /**
    * Creates a new invoker from components.
    *
    * @param fn The original {@link DoFn}.
    * @param pipelineOptions {@link PipelineOptions} to include in the {@link DoFn.ProcessContext}.
-   * @param output Hook for outputting from the {@link DoFn.ProcessElement} method.
+   * @param outputReceiver Hook for outputting from the {@link DoFn.ProcessElement} method.
    * @param sideInputReader Hook for accessing side inputs.
    * @param executor Executor on which a checkpoint will be scheduled after the given duration.
    * @param maxNumOutputs Maximum number of outputs, in total over all output tags, after which a
@@ -96,7 +101,8 @@ public class OutputAndTimeBoundedSplittableProcessElementInvoker<
   public OutputAndTimeBoundedSplittableProcessElementInvoker(
       DoFn<InputT, OutputT> fn,
       PipelineOptions pipelineOptions,
-      OutputWindowedValue<OutputT> output,
+      WindowedValueMultiReceiver outputReceiver,
+      TupleTag<OutputT> mainOutputTag,
       SideInputReader sideInputReader,
       ScheduledExecutorService executor,
       int maxNumOutputs,
@@ -104,7 +110,8 @@ public class OutputAndTimeBoundedSplittableProcessElementInvoker<
       Supplier<BundleFinalizer> bundleFinalizer) {
     this.fn = fn;
     this.pipelineOptions = pipelineOptions;
-    this.output = output;
+    this.outputReceiver = outputReceiver;
+    this.mainOutputTag = mainOutputTag;
     this.sideInputReader = sideInputReader;
     this.executor = executor;
     this.maxNumOutputs = maxNumOutputs;
@@ -373,7 +380,7 @@ public class OutputAndTimeBoundedSplittableProcessElementInvoker<
 
     @Override
     public PaneInfo pane() {
-      return element.getPane();
+      return element.getPaneInfo();
     }
 
     @Override
@@ -388,11 +395,20 @@ public class OutputAndTimeBoundedSplittableProcessElementInvoker<
 
     @Override
     public void outputWithTimestamp(OutputT value, Instant timestamp) {
+      outputWindowedValue(value, timestamp, element.getWindows(), element.getPaneInfo());
+    }
+
+    @Override
+    public void outputWindowedValue(
+        OutputT value,
+        Instant timestamp,
+        Collection<? extends BoundedWindow> windows,
+        PaneInfo paneInfo) {
       noteOutput();
       if (watermarkEstimator instanceof TimestampObservingWatermarkEstimator) {
         ((TimestampObservingWatermarkEstimator) watermarkEstimator).observeTimestamp(timestamp);
       }
-      output.outputWindowedValue(value, timestamp, element.getWindows(), element.getPane());
+      outputReceiver.output(mainOutputTag, WindowedValues.of(value, timestamp, windows, paneInfo));
     }
 
     @Override
@@ -402,11 +418,22 @@ public class OutputAndTimeBoundedSplittableProcessElementInvoker<
 
     @Override
     public <T> void outputWithTimestamp(TupleTag<T> tag, T value, Instant timestamp) {
+      outputReceiver.output(
+          tag, WindowedValues.of(value, timestamp, element.getWindows(), element.getPaneInfo()));
+    }
+
+    @Override
+    public <T> void outputWindowedValue(
+        TupleTag<T> tag,
+        T value,
+        Instant timestamp,
+        Collection<? extends BoundedWindow> windows,
+        PaneInfo paneInfo) {
       noteOutput();
       if (watermarkEstimator instanceof TimestampObservingWatermarkEstimator) {
         ((TimestampObservingWatermarkEstimator) watermarkEstimator).observeTimestamp(timestamp);
       }
-      output.outputWindowedValue(tag, value, timestamp, element.getWindows(), element.getPane());
+      outputReceiver.output(tag, WindowedValues.of(value, timestamp, windows, paneInfo));
     }
 
     private void noteOutput() {

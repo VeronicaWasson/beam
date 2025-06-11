@@ -15,17 +15,25 @@
 # limitations under the License.
 
 import re
+import sys
 import unittest
 import warnings
 
 import numpy as np
 import pandas as pd
+import pytest
 from parameterized import parameterized
 
 import apache_beam as beam
 from apache_beam.dataframe import expressions
 from apache_beam.dataframe import frame_base
 from apache_beam.dataframe import frames
+from apache_beam.dataframe.convert import to_dataframe
+from apache_beam.dataframe.doctests import teststring
+from apache_beam.runners.interactive import interactive_beam as ib
+from apache_beam.runners.interactive import interactive_environment as ie
+from apache_beam.runners.interactive.interactive_runner import InteractiveRunner
+from apache_beam.runners.interactive.testing.mock_env import isolated_env
 
 # Get major, minor version
 PD_VERSION = tuple(map(int, pd.__version__.split('.')[0:2]))
@@ -38,6 +46,10 @@ GROUPBY_DF = pd.DataFrame({
     'bool': [i % 17 == 0 for i in range(100)],
     'str': [str(i) for i in range(100)],
 })
+
+if PD_VERSION < (2, 0):
+  # All these are things that are fixed in the Pandas 2 transition.
+  pytestmark = pytest.mark.filterwarnings("ignore::FutureWarning")
 
 
 def _get_deferred_args(*args):
@@ -182,6 +194,9 @@ class _AbstractFrameTest(unittest.TestCase):
         if expected.index.is_unique:
           expected = expected.sort_index()
           actual = actual.sort_index()
+        elif isinstance(expected, pd.Series):
+          expected = expected.sort_values()
+          actual = actual.sort_values()
         else:
           expected = expected.sort_values(list(expected.columns))
           actual = actual.sort_values(list(actual.columns))
@@ -349,6 +364,19 @@ class DeferredFrameTest(_AbstractFrameTest):
     })
     self._run_inplace_test(new_column, df)
 
+  def test_tz_with_utc_zone_set_explicitly(self):
+    test = """
+      >>> s = pd.Series(["1/1/2020 10:00:00+00:00", "2/1/2020 11:00:00+03:00"])
+      >>> s = pd.to_datetime(s, utc=True)
+      >>> s
+      0   2020-01-01 10:00:00+00:00
+      1   2020-02-01 08:00:00+00:00
+      dtype: datetime64[ns, UTC]
+      >>> s.dt.tz
+      datetime.timezone.utc
+    """
+    teststring(test)
+
   def test_tz_localize_ambiguous_series(self):
     # This replicates a tz_localize doctest:
     #   s.tz_localize('CET', ambiguous=np.array([True, True, False]))
@@ -362,8 +390,7 @@ class DeferredFrameTest(_AbstractFrameTest):
     ambiguous = pd.Series([True, True, False], index=s.index)
 
     self._run_test(
-        lambda s,
-        ambiguous: s.tz_localize('CET', ambiguous=ambiguous),
+        lambda s, ambiguous: s.tz_localize('CET', ambiguous=ambiguous),
         s,
         ambiguous)
 
@@ -416,8 +443,7 @@ class DeferredFrameTest(_AbstractFrameTest):
     df2 = pd.DataFrame({'A': [1, 1], 'B': [3, 3]})
     take_smaller = lambda s1, s2: s1 if s1.sum() < s2.sum() else s2
     self._run_test(
-        lambda df,
-        df2: df.combine(df2, take_smaller),
+        lambda df, df2: df.combine(df2, take_smaller),
         df,
         df2,
         nonparallel=True)
@@ -427,8 +453,7 @@ class DeferredFrameTest(_AbstractFrameTest):
     df2 = pd.DataFrame({'A': [1, 1], 'B': [3, 3]})
     take_smaller = lambda s1, s2: s1 if s1.sum() < s2.sum() else s2
     self._run_test(
-        lambda df1,
-        df2: df1.combine(df2, take_smaller, fill_value=-5),
+        lambda df1, df2: df1.combine(df2, take_smaller, fill_value=-5),
         df1,
         df2,
         nonparallel=True)
@@ -437,8 +462,7 @@ class DeferredFrameTest(_AbstractFrameTest):
     s1 = pd.Series({'falcon': 330.0, 'eagle': 160.0})
     s2 = pd.Series({'falcon': 345.0, 'eagle': 200.0, 'duck': 30.0})
     self._run_test(
-        lambda s1,
-        s2: s1.combine(s2, max),
+        lambda s1, s2: s1.combine(s2, max),
         s1,
         s2,
         nonparallel=True,
@@ -548,16 +572,14 @@ class DeferredFrameTest(_AbstractFrameTest):
         'rkey': ['foo', 'bar', 'baz', 'foo'], 'value': [5, 6, 7, 8]
     })
     self._run_test(
-        lambda df1,
-        df2: df1.merge(df2, left_on='lkey', right_on='rkey').rename(
+        lambda df1, df2: df1.merge(df2, left_on='lkey', right_on='rkey').rename(
             index=lambda x: '*'),
         df1,
         df2,
         nonparallel=True,
         check_proxy=False)
     self._run_test(
-        lambda df1,
-        df2: df1.merge(
+        lambda df1, df2: df1.merge(
             df2, left_on='lkey', right_on='rkey', suffixes=('_left', '_right')).
         rename(index=lambda x: '*'),
         df1,
@@ -572,8 +594,8 @@ class DeferredFrameTest(_AbstractFrameTest):
     df2 = pd.DataFrame({'a': ['foo', 'baz'], 'c': [3, 4]})
 
     self._run_test(
-        lambda df1,
-        df2: df1.merge(df2, how='left', on='a').rename(index=lambda x: '*'),
+        lambda df1, df2: df1.merge(df2, how='left', on='a').rename(
+            index=lambda x: '*'),
         df1,
         df2,
         nonparallel=True,
@@ -590,8 +612,7 @@ class DeferredFrameTest(_AbstractFrameTest):
     }).set_index('rkey')
 
     self._run_test(
-        lambda df1,
-        df2: df1.merge(df2, left_index=True, right_index=True),
+        lambda df1, df2: df1.merge(df2, left_index=True, right_index=True),
         df1,
         df2,
         check_proxy=False)
@@ -604,16 +625,14 @@ class DeferredFrameTest(_AbstractFrameTest):
         'key': ['foo', 'bar', 'baz', 'foo'], 'value': [5, 6, 7, 8]
     })
     self._run_test(
-        lambda df1,
-        df2: df1.merge(df2, on='key').rename(index=lambda x: '*'),
+        lambda df1, df2: df1.merge(df2, on='key').rename(index=lambda x: '*'),
         df1,
         df2,
         nonparallel=True,
         check_proxy=False)
     self._run_test(
-        lambda df1,
-        df2: df1.merge(df2, on='key', suffixes=('_left', '_right')).rename(
-            index=lambda x: '*'),
+        lambda df1, df2: df1.merge(df2, on='key', suffixes=('_left', '_right')).
+        rename(index=lambda x: '*'),
         df1,
         df2,
         nonparallel=True,
@@ -624,16 +643,15 @@ class DeferredFrameTest(_AbstractFrameTest):
     df2 = pd.DataFrame({'a': ['foo', 'baz'], 'c': [3, 4]})
 
     self._run_test(
-        lambda df1,
-        df2: df1.merge(df2, how='left', on='a').rename(index=lambda x: '*'),
+        lambda df1, df2: df1.merge(df2, how='left', on='a').rename(
+            index=lambda x: '*'),
         df1,
         df2,
         nonparallel=True,
         check_proxy=False)
     # Test without specifying 'on'
     self._run_test(
-        lambda df1,
-        df2: df1.merge(df2, how='left').rename(index=lambda x: '*'),
+        lambda df1, df2: df1.merge(df2, how='left').rename(index=lambda x: '*'),
         df1,
         df2,
         nonparallel=True,
@@ -644,8 +662,7 @@ class DeferredFrameTest(_AbstractFrameTest):
     df2 = pd.DataFrame({'a': ['foo', 'baz'], 'c': [3, 4], 'a_rsuffix': [7, 8]})
 
     self._run_test(
-        lambda df1,
-        df2: df1.merge(
+        lambda df1, df2: df1.merge(
             df2, how='left', on='a', suffixes=('_lsuffix', '_rsuffix')).rename(
                 index=lambda x: '*'),
         df1,
@@ -654,9 +671,9 @@ class DeferredFrameTest(_AbstractFrameTest):
         check_proxy=False)
     # Test without specifying 'on'
     self._run_test(
-        lambda df1,
-        df2: df1.merge(df2, how='left', suffixes=('_lsuffix', '_rsuffix')).
-        rename(index=lambda x: '*'),
+        lambda df1, df2: df1.merge(
+            df2, how='left', suffixes=('_lsuffix', '_rsuffix')).rename(
+                index=lambda x: '*'),
         df1,
         df2,
         nonparallel=True,
@@ -683,6 +700,8 @@ class DeferredFrameTest(_AbstractFrameTest):
 
     self._run_test(lambda df: df.value_counts(), df)
     self._run_test(lambda df: df.value_counts(normalize=True), df)
+    # Ensure we don't drop rows due to nan values in unused columns.
+    self._run_test(lambda df: df.value_counts('num_wings'), df)
 
     if PD_VERSION >= (1, 3):
       # dropna=False is new in pandas 1.3
@@ -701,10 +720,8 @@ class DeferredFrameTest(_AbstractFrameTest):
     for normalize in (True, False):
       for dropna in (True, False):
         self._run_test(
-            lambda df,
-            dropna=dropna,
-            normalize=normalize: df.num_wings.value_counts(
-                dropna=dropna, normalize=normalize),
+            lambda df, dropna=dropna, normalize=normalize: df.num_wings.
+            value_counts(dropna=dropna, normalize=normalize),
             df)
 
   def test_value_counts_does_not_support_sort(self):
@@ -792,6 +809,7 @@ class DeferredFrameTest(_AbstractFrameTest):
     self._run_test(lambda df: df.C.loc[df.A > 10], df)
     self._run_test(lambda df, s: df.loc[s.loc[1:3]], df, pd.Series(dates))
 
+  @unittest.skipIf(PD_VERSION >= (2, 0), 'append removed in Pandas 2.0')
   def test_append_sort(self):
     # yapf: disable
     df1 = pd.DataFrame({'int': [1, 2, 3], 'str': ['a', 'b', 'c']},
@@ -848,12 +866,25 @@ class DeferredFrameTest(_AbstractFrameTest):
     self._run_error_test(lambda df: df.corrwith(df, axis=5), df)
 
   @unittest.skipIf(PD_VERSION < (1, 2), "na_action added in pandas 1.2.0")
+  @pytest.mark.filterwarnings(
+      "ignore:The default of observed=False is deprecated:FutureWarning")
   def test_applymap_na_action(self):
     # Replicates a doctest for na_action which is incompatible with
     # doctest framework
     df = pd.DataFrame([[pd.NA, 2.12], [3.356, 4.567]])
     self._run_test(
         lambda df: df.applymap(lambda x: len(str(x)), na_action='ignore'),
+        df,
+        # TODO: generate proxy using naive type inference on fn
+        check_proxy=False)
+
+  @unittest.skipIf(PD_VERSION < (2, 1), "map added in 2.1.0")
+  def test_map_na_action(self):
+    # Replicates a doctest for na_action which is incompatible with
+    # doctest framework
+    df = pd.DataFrame([[pd.NA, 2.12], [3.356, 4.567]])
+    self._run_test(
+        lambda df: df.map(lambda x: len(str(x)), na_action='ignore'),
         df,
         # TODO: generate proxy using naive type inference on fn
         check_proxy=False)
@@ -918,11 +949,8 @@ class DeferredFrameTest(_AbstractFrameTest):
         df)
     self._run_test(
         lambda df: df.melt(
-            id_vars=['A'],
-            value_vars=['B'],
-            var_name='myVarname',
-            value_name='myValname',
-            ignore_index=False),
+            id_vars=['A'], value_vars=['B'], var_name='myVarname', value_name=
+            'myValname', ignore_index=False),
         df)
     self._run_test(
         lambda df: df.melt(
@@ -980,19 +1008,29 @@ class DeferredFrameTest(_AbstractFrameTest):
 
     self._run_test(lambda df, df2: df.A.fillna(df2.A), df, df2)
 
+  def test_dataframe_column_fillna_constant_as_value(self):
+    from apache_beam.dataframe import convert
+    from apache_beam.testing.util import assert_that
+    from apache_beam.testing.util import equal_to
+    with beam.Pipeline(None) as p:
+      pcoll = (
+          p | beam.Create([1.0, np.nan, -1.0]) | beam.Select(x=lambda x: x))
+      df = convert.to_dataframe(pcoll)
+      df_new = df['x'].fillna(0)
+      assert_that(convert.to_pcollection(df_new), equal_to([1.0, 0.0, -1.0]))
+
+  @unittest.skipIf(PD_VERSION >= (2, 0), 'append removed in Pandas 2.0')
   def test_append_verify_integrity(self):
     df1 = pd.DataFrame({'A': range(10), 'B': range(10)}, index=range(10))
     df2 = pd.DataFrame({'A': range(10), 'B': range(10)}, index=range(9, 19))
 
     self._run_error_test(
-        lambda s1,
-        s2: s1.append(s2, verify_integrity=True),
+        lambda s1, s2: s1.append(s2, verify_integrity=True),
         df1['A'],
         df2['A'],
         construction_time=False)
     self._run_error_test(
-        lambda df1,
-        df2: df1.append(df2, verify_integrity=True),
+        lambda df1, df2: df1.append(df2, verify_integrity=True),
         df1,
         df2,
         construction_time=False)
@@ -1003,8 +1041,40 @@ class DeferredFrameTest(_AbstractFrameTest):
     df = df.set_index('B')
     # TODO(BEAM-11190): These aggregations can be done in index partitions, but
     # it will require a little more complex logic
-    self._run_test(lambda df: df.groupby(level=0).sum(), df, nonparallel=True)
-    self._run_test(lambda df: df.groupby(level=0).mean(), df, nonparallel=True)
+    self._run_test(
+        lambda df: df.groupby(level=0, observed=False).sum(),
+        df,
+        nonparallel=True)
+    self._run_test(
+        lambda df: df.groupby(level=0, observed=False).mean(),
+        df,
+        nonparallel=True)
+
+  def test_astype_categorical(self):
+    df = pd.DataFrame({'A': np.arange(6), 'B': list('aabbca')})
+    categorical_dtype = pd.CategoricalDtype(df.B.unique())
+
+    self._run_test(lambda df: df.B.astype(categorical_dtype), df)
+
+  @unittest.skipIf(
+      PD_VERSION < (1, 2), "DataFrame.unstack not supported in pandas <1.2.x")
+  def test_astype_categorical_with_unstack(self):
+    df = pd.DataFrame({
+        'index1': ['one', 'one', 'two', 'two'],
+        'index2': ['a', 'b', 'a', 'b'],
+        'data': np.arange(1.0, 5.0),
+    })
+
+    def with_categorical_index(df):
+      df.index1 = df.index1.astype(pd.CategoricalDtype(['one', 'two']))
+      df.index2 = df.index2.astype(pd.CategoricalDtype(['a', 'b']))
+      df.set_index(['index1', 'index2'], drop=True)
+      return df
+
+    self._run_test(
+        lambda df: with_categorical_index(df).unstack(level=-1),
+        df,
+        check_proxy=False)
 
   def test_dataframe_sum_nonnumeric_raises(self):
     # Attempting a numeric aggregation with the str column present should
@@ -1056,12 +1126,12 @@ class DeferredFrameTest(_AbstractFrameTest):
       (
           lambda base: base.from_dict({
               'row_1': [3, 2, 1, 0], 'row_2': ['a', 'b', 'c', 'd']
-          },
-                                      orient='index'), ),
+          }, orient='index'), ),
       (
           lambda base: base.from_records(
-              np.array([(3, 'a'), (2, 'b'), (1, 'c'), (0, 'd')],
-                       dtype=[('col_1', 'i4'), ('col_2', 'U1')])), ),
+              np.array([(3, 'a'), (2, 'b'), (1, 'c'),
+                        (0, 'd')], dtype=[('col_1', 'i4'),
+                                          ('col_2', 'U1')])), ),
   ])
   def test_create_methods(self, func):
     expected = func(pd.DataFrame)
@@ -1154,8 +1224,7 @@ class DeferredFrameTest(_AbstractFrameTest):
     ambiguous = pd.Series([True, True, False], index=s.index)
 
     self._run_test(
-        lambda s,
-        ambiguous: s.dt.tz_localize('CET', ambiguous=ambiguous),
+        lambda s, ambiguous: s.dt.tz_localize('CET', ambiguous=ambiguous),
         s,
         ambiguous)
 
@@ -1209,25 +1278,22 @@ class DeferredFrameTest(_AbstractFrameTest):
       self._run_test(lambda df1, df2: df1.compare(df2), df1, df2)
 
     self._run_test(
-        lambda df1,
-        df2: df1.compare(df2, align_axis=0),
+        lambda df1, df2: df1.compare(df2, align_axis=0),
         df1,
         df2,
         check_proxy=False)
     self._run_test(lambda df1, df2: df1.compare(df2, keep_shape=True), df1, df2)
     self._run_test(
-        lambda df1,
-        df2: df1.compare(df2, align_axis=0, keep_shape=True),
+        lambda df1, df2: df1.compare(df2, align_axis=0, keep_shape=True),
         df1,
         df2)
     self._run_test(
-        lambda df1,
-        df2: df1.compare(df2, keep_shape=True, keep_equal=True),
+        lambda df1, df2: df1.compare(df2, keep_shape=True, keep_equal=True),
         df1,
         df2)
     self._run_test(
-        lambda df1,
-        df2: df1.compare(df2, align_axis=0, keep_shape=True, keep_equal=True),
+        lambda df1, df2: df1.compare(
+            df2, align_axis=0, keep_shape=True, keep_equal=True),
         df1,
         df2)
 
@@ -1370,6 +1436,9 @@ class DeferredFrameTest(_AbstractFrameTest):
     s = pd.Series(np.arange(1.0, 5.0), index=index)
     self._run_test(lambda s: s.unstack(level=0), s)
 
+  @unittest.skipIf(
+      sys.version_info >= (3, 12) and PD_VERSION < (2, 3),
+      'https://github.com/pandas-dev/pandas/issues/58604')
   def test_unstack_pandas_example3(self):
     index = self._unstack_get_categorical_index()
     s = pd.Series(np.arange(1.0, 5.0), index=index)
@@ -1601,6 +1670,30 @@ class DeferredFrameTest(_AbstractFrameTest):
 # https://github.com/pandas-dev/pandas/issues/40139
 ALL_GROUPING_AGGREGATIONS = sorted(
     set(frames.ALL_AGGREGATIONS) - set(('kurt', 'kurtosis')))
+AGGREGATIONS_WHERE_NUMERIC_ONLY_DEFAULTS_TO_TRUE_IN_PANDAS_1 = set(
+    frames.ALL_AGGREGATIONS) - set((
+        'nunique',
+        'size',
+        'count',
+        'idxmin',
+        'idxmax',
+        'mode',
+        'rank',
+        'all',
+        'any',
+        'describe'))
+
+
+def numeric_only_kwargs_for_pandas_2(agg_type: str) -> dict[str, bool]:
+  """Get proper arguments for numeric_only.
+
+  Behavior for numeric_only in these methods changed in Pandas 2 to default
+  to False instead of True, so explicitly make it True in Pandas 2."""
+  if PD_VERSION >= (2, 0) and (
+      agg_type in AGGREGATIONS_WHERE_NUMERIC_ONLY_DEFAULTS_TO_TRUE_IN_PANDAS_1):
+    return {'numeric_only': True}
+  else:
+    return {}
 
 
 class GroupByTest(_AbstractFrameTest):
@@ -1617,8 +1710,9 @@ class GroupByTest(_AbstractFrameTest):
       self.skipTest(
           "https://github.com/apache/beam/issues/20967: proxy generation of "
           "DataFrameGroupBy.describe fails in pandas < 1.2")
+    kwargs = numeric_only_kwargs_for_pandas_2(agg_type)
     self._run_test(
-        lambda df: df.groupby('group').agg(agg_type),
+        lambda df: df.groupby('group').agg(agg_type, **kwargs),
         GROUPBY_DF,
         check_proxy=False)
 
@@ -1628,8 +1722,10 @@ class GroupByTest(_AbstractFrameTest):
       self.skipTest(
           "https://github.com/apache/beam/issues/20967: proxy generation of "
           "DataFrameGroupBy.describe fails in pandas < 1.2")
+    kwargs = numeric_only_kwargs_for_pandas_2(agg_type)
     self._run_test(
-        lambda df: getattr(df[df.foo > 30].groupby('group'), agg_type)(),
+        lambda df: getattr(df[df.foo > 30].groupby('group'), agg_type)
+        (**kwargs),
         GROUPBY_DF,
         check_proxy=False)
 
@@ -1640,8 +1736,9 @@ class GroupByTest(_AbstractFrameTest):
           "https://github.com/apache/beam/issues/20967: proxy generation of "
           "DataFrameGroupBy.describe fails in pandas < 1.2")
 
+    kwargs = numeric_only_kwargs_for_pandas_2(agg_type)
     self._run_test(
-        lambda df: getattr(df.groupby('group'), agg_type)(),
+        lambda df: getattr(df.groupby('group'), agg_type)(**kwargs),
         GROUPBY_DF,
         check_proxy=False)
 
@@ -1652,8 +1749,10 @@ class GroupByTest(_AbstractFrameTest):
           "https://github.com/apache/beam/issues/20967: proxy generation of "
           "DataFrameGroupBy.describe fails in pandas < 1.2")
 
+    kwargs = numeric_only_kwargs_for_pandas_2(agg_type)
     self._run_test(
-        lambda df: getattr(df[df.foo > 40].groupby(df.group), agg_type)(),
+        lambda df: getattr(df[df.foo > 40].groupby(df.group), agg_type)
+        (**kwargs),
         GROUPBY_DF,
         check_proxy=False)
 
@@ -1684,12 +1783,15 @@ class GroupByTest(_AbstractFrameTest):
           "https://github.com/apache/beam/issues/20895: "
           "SeriesGroupBy.{corr, cov} do not raise the expected error.")
 
-    self._run_test(lambda df: getattr(df.groupby('group').foo, agg_type)(), df)
-    self._run_test(lambda df: getattr(df.groupby('group').bar, agg_type)(), df)
+    kwargs = numeric_only_kwargs_for_pandas_2(agg_type)
     self._run_test(
-        lambda df: getattr(df.groupby('group')['foo'], agg_type)(), df)
+        lambda df: getattr(df.groupby('group').foo, agg_type)(**kwargs), df)
     self._run_test(
-        lambda df: getattr(df.groupby('group')['bar'], agg_type)(), df)
+        lambda df: getattr(df.groupby('group').bar, agg_type)(**kwargs), df)
+    self._run_test(
+        lambda df: getattr(df.groupby('group')['foo'], agg_type)(**kwargs), df)
+    self._run_test(
+        lambda df: getattr(df.groupby('group')['bar'], agg_type)(**kwargs), df)
 
   @parameterized.expand(ALL_GROUPING_AGGREGATIONS)
   def test_groupby_project_dataframe(self, agg_type):
@@ -1697,8 +1799,10 @@ class GroupByTest(_AbstractFrameTest):
       self.skipTest(
           "https://github.com/apache/beam/issues/20967: proxy generation of "
           "DataFrameGroupBy.describe fails in pandas < 1.2")
+    kwargs = numeric_only_kwargs_for_pandas_2(agg_type)
     self._run_test(
-        lambda df: getattr(df.groupby('group')[['bar', 'baz']], agg_type)(),
+        lambda df: getattr(df.groupby('group')[['bar', 'baz']], agg_type)
+        (**kwargs),
         GROUPBY_DF,
         check_proxy=False)
 
@@ -1727,9 +1831,10 @@ class GroupByTest(_AbstractFrameTest):
 
   def test_groupby_callable(self):
     df = GROUPBY_DF
-
-    self._run_test(lambda df: df.groupby(lambda x: x % 2).foo.sum(), df)
-    self._run_test(lambda df: df.groupby(lambda x: x % 5).median(), df)
+    kwargs = numeric_only_kwargs_for_pandas_2('sum')
+    self._run_test(lambda df: df.groupby(lambda x: x % 2).foo.sum(**kwargs), df)
+    kwargs = numeric_only_kwargs_for_pandas_2('median')
+    self._run_test(lambda df: df.groupby(lambda x: x % 5).median(**kwargs), df)
 
   def test_groupby_apply(self):
     df = GROUPBY_DF
@@ -1757,8 +1862,8 @@ class GroupByTest(_AbstractFrameTest):
     df = GROUPBY_DF
 
     self._run_test(
-        lambda df: df[['foo', 'group', 'bar']].groupby('group').apply(
-            lambda x: x),
+        lambda df: df[['foo', 'group', 'bar']].groupby(
+            'group', group_keys=False).apply(lambda x: x),
         df)
 
   def test_groupby_transform(self):
@@ -1784,8 +1889,9 @@ class GroupByTest(_AbstractFrameTest):
 
   def test_groupby_pipe(self):
     df = GROUPBY_DF
-
-    self._run_test(lambda df: df.groupby('group').pipe(lambda x: x.sum()), df)
+    kwargs = numeric_only_kwargs_for_pandas_2('sum')
+    self._run_test(
+        lambda df: df.groupby('group').pipe(lambda x: x.sum(**kwargs)), df)
     self._run_test(
         lambda df: df.groupby('group')['bool'].pipe(lambda x: x.any()), df)
     self._run_test(
@@ -1828,8 +1934,7 @@ class GroupByTest(_AbstractFrameTest):
       [2, 1],
       ['foo', 0],
       [1, 'str'],
-      [3, 0, 2, 1],
-  ])
+      [3, 0, 2, 1], ])
   def test_groupby_level_agg(self, level):
     df = GROUPBY_DF.set_index(['group', 'foo', 'bar', 'str'], drop=False)
     self._run_test(lambda df: df.groupby(level=level).bar.max(), df)
@@ -1855,6 +1960,8 @@ class GroupByTest(_AbstractFrameTest):
 
     self._run_test(lambda df: df.groupby('group').sum(min_count=2), df)
 
+  @unittest.skipIf(
+      PD_VERSION >= (2, 0), "dtypes on groups is deprecated in Pandas 2.")
   def test_groupby_dtypes(self):
     self._run_test(
         lambda df: df.groupby('group').dtypes, GROUPBY_DF, check_proxy=False)
@@ -1867,14 +1974,14 @@ class GroupByTest(_AbstractFrameTest):
       self.skipTest(
           "https://github.com/apache/beam/issues/20967: proxy generation of "
           "DataFrameGroupBy.describe fails in pandas < 1.2")
+
+    def agg(df, group_by):
+      kwargs = numeric_only_kwargs_for_pandas_2(agg_type)
+      return df[df.foo > 40].groupby(group_by).agg(agg_type, **kwargs)
+
+    self._run_test(lambda df: agg(df, df.group), GROUPBY_DF, check_proxy=False)
     self._run_test(
-        lambda df: df[df.foo > 40].groupby(df.group).agg(agg_type),
-        GROUPBY_DF,
-        check_proxy=False)
-    self._run_test(
-        lambda df: df[df.foo > 40].groupby(df.foo % 3).agg(agg_type),
-        GROUPBY_DF,
-        check_proxy=False)
+        lambda df: agg(df, df.foo % 3), GROUPBY_DF, check_proxy=False)
 
   @parameterized.expand(ALL_GROUPING_AGGREGATIONS)
   def test_series_groupby_series(self, agg_type):
@@ -1915,6 +2022,12 @@ class GroupByTest(_AbstractFrameTest):
           lambda df: df.groupby(['foo', 'bar'], dropna=False).sum(), GROUPBY_DF)
 
 
+NONPARALLEL_METHODS = ['quantile', 'describe', 'median', 'sem']
+# mad was removed in pandas 2
+if PD_VERSION < (2, 0):
+  NONPARALLEL_METHODS.append('mad')
+
+
 class AggregationTest(_AbstractFrameTest):
   """Tests for global aggregation methods on DataFrame/Series."""
 
@@ -1924,7 +2037,7 @@ class AggregationTest(_AbstractFrameTest):
   def test_series_agg(self, agg_method):
     s = pd.Series(list(range(16)))
 
-    nonparallel = agg_method in ('quantile', 'describe', 'median', 'sem', 'mad')
+    nonparallel = agg_method in NONPARALLEL_METHODS
 
     # TODO(https://github.com/apache/beam/issues/20926): max and min produce
     # the wrong proxy
@@ -1943,7 +2056,7 @@ class AggregationTest(_AbstractFrameTest):
   def test_series_agg_method(self, agg_method):
     s = pd.Series(list(range(16)))
 
-    nonparallel = agg_method in ('quantile', 'describe', 'median', 'sem', 'mad')
+    nonparallel = agg_method in NONPARALLEL_METHODS
 
     # TODO(https://github.com/apache/beam/issues/20926): max and min produce
     # the wrong proxy
@@ -1959,7 +2072,7 @@ class AggregationTest(_AbstractFrameTest):
   def test_dataframe_agg(self, agg_method):
     df = pd.DataFrame({'A': [1, 2, 3, 4], 'B': [2, 3, 5, 7]})
 
-    nonparallel = agg_method in ('quantile', 'describe', 'median', 'sem', 'mad')
+    nonparallel = agg_method in NONPARALLEL_METHODS
 
     # TODO(https://github.com/apache/beam/issues/20926): max and min produce
     # the wrong proxy
@@ -1976,7 +2089,7 @@ class AggregationTest(_AbstractFrameTest):
   def test_dataframe_agg_method(self, agg_method):
     df = pd.DataFrame({'A': [1, 2, 3, 4], 'B': [2, 3, 5, 7]})
 
-    nonparallel = agg_method in ('quantile', 'describe', 'median', 'sem', 'mad')
+    nonparallel = agg_method in NONPARALLEL_METHODS
 
     # TODO(https://github.com/apache/beam/issues/20926): max and min produce
     # the wrong proxy
@@ -2005,6 +2118,7 @@ class AggregationTest(_AbstractFrameTest):
     self._run_test(lambda df: df.agg({'A': ['sum', 'mean']}), df)
     self._run_test(lambda df: df.agg({'A': ['sum', 'mean'], 'B': 'min'}), df)
 
+  @unittest.skipIf(PD_VERSION >= (2, 0), "level argument removed in Pandas 2")
   def test_series_agg_level(self):
     self._run_test(
         lambda df: df.set_index(['group', 'foo']).bar.count(level=0),
@@ -2028,6 +2142,7 @@ class AggregationTest(_AbstractFrameTest):
         lambda df: df.set_index(['group', 'foo']).bar.median(level=1),
         GROUPBY_DF)
 
+  @unittest.skipIf(PD_VERSION >= (2, 0), "level argument removed in Pandas 2")
   def test_dataframe_agg_level(self):
     self._run_test(
         lambda df: df.set_index(['group', 'foo']).count(level=0), GROUPBY_DF)
@@ -2070,11 +2185,12 @@ class AggregationTest(_AbstractFrameTest):
             level=1, numeric_only=True),
         GROUPBY_DF)
 
+  @unittest.skipIf(PD_VERSION >= (2, 0), "level argument removed in Pandas 2")
   def test_series_agg_multifunc_level(self):
     # level= is ignored for multiple agg fns
     self._run_test(
-        lambda df: df.set_index(['group', 'foo']).bar.agg(['min', 'max'],
-                                                          level=0),
+        lambda df: df.set_index(['group', 'foo']).bar.agg(['min', 'max'], level=
+                                                          0),
         GROUPBY_DF)
 
   def test_series_mean_skipna(self):
@@ -2092,6 +2208,7 @@ class AggregationTest(_AbstractFrameTest):
     self._run_test(lambda df: df.two.mean(skipna=True), df)
     self._run_test(lambda df: df.three.mean(skipna=True), df)
 
+  @unittest.skipIf(PD_VERSION >= (2, 0), "level argument removed in Pandas 2")
   def test_dataframe_agg_multifunc_level(self):
     # level= is ignored for multiple agg fns
     self._run_test(
@@ -2195,6 +2312,7 @@ class AggregationTest(_AbstractFrameTest):
     self._run_error_test(
         lambda df: df.median(min_count=3, numeric_only=True), GROUPBY_DF)
 
+  @unittest.skipIf(PD_VERSION >= (2, 0), "level argument removed in Pandas 2")
   def test_agg_min_count(self):
     df = pd.DataFrame({
         'good': [1, 2, 3, np.nan],
@@ -2222,6 +2340,15 @@ class AggregationTest(_AbstractFrameTest):
 
     self._run_test(lambda s: s.agg('std'), s)
     self._run_test(lambda s: s.std(), s)
+
+  def test_df_agg_operations_on_columns(self):
+    self._run_test(
+        lambda df: df.groupby('group').agg(
+            mean_foo=('foo', lambda x: np.mean(x)),
+            median_bar=('bar', lambda x: np.median(x)),
+            sum_baz=('baz', 'sum'),
+            count_bool=('bool', 'count'), ),
+        GROUPBY_DF)
 
   def test_std_mostly_na_with_ddof(self):
     df = pd.DataFrame({
@@ -2666,8 +2793,7 @@ class BeamSpecificTest(unittest.TestCase):
     self.assertTrue(target_weight > other_weight * 10, "weights too close")
 
     result = self._evaluate(
-        lambda s,
-        weights: s.sample(n=num_samples, weights=weights).sum(),
+        lambda s, weights: s.sample(n=num_samples, weights=weights).sum(),
         # The first elements are 1, the rest are all 0.  This means that when
         # we sum all the sampled elements (above), the result should be the
         # number of times the first elements (aka targets) were sampled.
@@ -2791,6 +2917,13 @@ class BeamSpecificTest(unittest.TestCase):
     self.assert_frame_data_equivalent(
         result, s.str.split(r"\.jpg", regex=True, expand=False))
 
+  def test_astype_categorical_rejected(self):
+    df = pd.DataFrame({'A': np.arange(6), 'B': list('aabbca')})
+
+    with self.assertRaisesRegex(frame_base.WontImplementError,
+                                r"astype\(dtype='category'\)"):
+      self._evaluate(lambda df: df.B.astype('category'), df)
+
 
 class AllowNonParallelTest(unittest.TestCase):
   def _use_non_parallel_operation(self):
@@ -2892,7 +3025,7 @@ class DocstringTest(unittest.TestCase):
       (frames.DeferredDataFrame, pd.DataFrame),
       (frames.DeferredSeries, pd.Series),
       #(frames._DeferredIndex, pd.Index),
-      (frames._DeferredStringMethods, pd.core.strings.StringMethods),
+      (frames._DeferredStringMethods, pd.Series.str),
       (
           frames._DeferredCategoricalMethods,
           pd.core.arrays.categorical.CategoricalAccessor),
@@ -3033,6 +3166,37 @@ class ReprTest(unittest.TestCase):
     self.assertEqual(
         repr(df),
         "DeferredSeries(name='baz', dtype=float64, indexes=['str', 'group'])")
+
+
+@unittest.skipIf(
+    not ie.current_env().is_interactive_ready,
+    '[interactive] dependency is not installed.')
+@isolated_env
+class InteractiveDataFrameTest(unittest.TestCase):
+  def test_collect_merged_dataframes(self):
+    p = beam.Pipeline(InteractiveRunner())
+    pcoll_1 = (
+        p
+        | 'Create data 1' >> beam.Create([(1, 'a'), (2, 'b'), (3, 'c'),
+                                          (4, 'd')])
+        |
+        'To rows 1' >> beam.Select(col_1=lambda x: x[0], col_2=lambda x: x[1]))
+    df_1 = to_dataframe(pcoll_1)
+    pcoll_2 = (
+        p
+        | 'Create data 2' >> beam.Create([(5, 'e'), (6, 'f'), (7, 'g'),
+                                          (8, 'h')])
+        |
+        'To rows 2' >> beam.Select(col_3=lambda x: x[0], col_4=lambda x: x[1]))
+    df_2 = to_dataframe(pcoll_2)
+
+    df_merged = df_1.merge(df_2, left_index=True, right_index=True)
+    pd_df = ib.collect(df_merged).sort_values(by='col_1')
+    self.assertEqual(pd_df.shape, (4, 4))
+    self.assertEqual(list(pd_df['col_1']), [1, 2, 3, 4])
+    self.assertEqual(list(pd_df['col_2']), ['a', 'b', 'c', 'd'])
+    self.assertEqual(list(pd_df['col_3']), [5, 6, 7, 8])
+    self.assertEqual(list(pd_df['col_4']), ['e', 'f', 'g', 'h'])
 
 
 if __name__ == '__main__':

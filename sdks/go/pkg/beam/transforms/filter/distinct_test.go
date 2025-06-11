@@ -15,15 +15,6 @@
 
 package filter_test
 
-// beam-playground:
-//   name: DistinctTest
-//   description: Unit-test for the Distinct example.
-//   multifile: false
-//   context_line: 35
-//   categories:
-//     - Filtering
-//     - Core Transforms
-
 import (
 	"testing"
 
@@ -39,32 +30,32 @@ type s struct {
 
 func TestDedup(t *testing.T) {
 	tests := []struct {
-		dups []interface{}
-		exp  []interface{}
+		dups []any
+		exp  []any
 	}{
 		{
-			[]interface{}{1, 2, 3},
-			[]interface{}{1, 2, 3},
+			[]any{1, 2, 3},
+			[]any{1, 2, 3},
 		},
 		{
-			[]interface{}{3, 2, 1},
-			[]interface{}{1, 2, 3},
+			[]any{3, 2, 1},
+			[]any{1, 2, 3},
 		},
 		{
-			[]interface{}{1, 1, 1, 2, 3},
-			[]interface{}{1, 2, 3},
+			[]any{1, 1, 1, 2, 3},
+			[]any{1, 2, 3},
 		},
 		{
-			[]interface{}{1, 2, 3, 2, 2, 2, 3, 1, 1, 1, 2, 3, 1},
-			[]interface{}{1, 2, 3},
+			[]any{1, 2, 3, 2, 2, 2, 3, 1, 1, 1, 2, 3, 1},
+			[]any{1, 2, 3},
 		},
 		{
-			[]interface{}{"1", "2", "3", "2", "1"},
-			[]interface{}{"1", "2", "3"},
+			[]any{"1", "2", "3", "2", "1"},
+			[]any{"1", "2", "3"},
 		},
 		{
-			[]interface{}{s{1, "a"}, s{2, "a"}, s{1, "a"}},
-			[]interface{}{s{1, "a"}, s{2, "a"}},
+			[]any{s{1, "a"}, s{2, "a"}, s{1, "a"}},
+			[]any{s{1, "a"}, s{2, "a"}},
 		},
 	}
 

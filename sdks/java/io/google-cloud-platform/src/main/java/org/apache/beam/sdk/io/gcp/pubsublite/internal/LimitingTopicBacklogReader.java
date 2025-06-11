@@ -18,7 +18,7 @@
 package org.apache.beam.sdk.io.gcp.pubsublite.internal;
 
 import static com.google.cloud.pubsublite.internal.ExtractStatus.toCanonical;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.api.gax.rpc.ApiException;
 import com.google.cloud.pubsublite.Offset;
@@ -26,10 +26,10 @@ import com.google.cloud.pubsublite.proto.ComputeMessageStatsResponse;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Ticker;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.cache.CacheBuilder;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.cache.CacheLoader;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.cache.LoadingCache;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Ticker;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.cache.CacheBuilder;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.cache.CacheLoader;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.cache.LoadingCache;
 
 final class LimitingTopicBacklogReader implements TopicBacklogReader {
   private final TopicBacklogReader underlying;
@@ -39,7 +39,7 @@ final class LimitingTopicBacklogReader implements TopicBacklogReader {
   @Nullable
   private Offset currentRequestOffset = null;
 
-  @SuppressWarnings("method.invocation.invalid")
+  @SuppressWarnings("method.invocation")
   LimitingTopicBacklogReader(TopicBacklogReader underlying, Ticker ticker) {
     this.underlying = underlying;
     backlogCache =
@@ -57,7 +57,7 @@ final class LimitingTopicBacklogReader implements TopicBacklogReader {
                 });
   }
 
-  @SuppressWarnings("argument.type.incompatible")
+  @SuppressWarnings("argument")
   private synchronized ComputeMessageStatsResponse loadFromUnderlying() {
     return underlying.computeMessageStats(checkNotNull(currentRequestOffset));
   }
@@ -75,7 +75,7 @@ final class LimitingTopicBacklogReader implements TopicBacklogReader {
   }
 
   @Override
-  public void close() {
+  public void close() throws Exception {
     underlying.close();
   }
 }

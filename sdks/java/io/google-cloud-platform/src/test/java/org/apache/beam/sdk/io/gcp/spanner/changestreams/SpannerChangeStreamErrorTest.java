@@ -35,10 +35,10 @@ import static org.junit.Assert.assertNull;
 import com.google.api.gax.grpc.testing.MockServiceHelper;
 import com.google.api.gax.retrying.RetrySettings;
 import com.google.cloud.Timestamp;
-import com.google.cloud.spanner.ErrorCode;
 import com.google.cloud.spanner.MockSpannerServiceImpl;
 import com.google.cloud.spanner.MockSpannerServiceImpl.SimulatedExecutionTime;
 import com.google.cloud.spanner.MockSpannerServiceImpl.StatementResult;
+import com.google.cloud.spanner.SpannerException;
 import com.google.cloud.spanner.Statement;
 import com.google.protobuf.ListValue;
 import com.google.protobuf.NullValue;
@@ -51,9 +51,10 @@ import com.google.spanner.v1.StructType.Field;
 import com.google.spanner.v1.Type;
 import com.google.spanner.v1.TypeCode;
 import io.grpc.Status;
-import java.io.IOException;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import org.apache.beam.runners.direct.DirectOptions;
 import org.apache.beam.runners.direct.DirectRunner;
 import org.apache.beam.sdk.Pipeline;
@@ -69,10 +70,10 @@ import org.hamcrest.Matchers;
 import org.joda.time.Duration;
 import org.junit.After;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
@@ -85,6 +86,8 @@ public class SpannerChangeStreamErrorTest implements Serializable {
   private static final String TEST_DATABASE = "my-database";
   private static final String TEST_TABLE = "my-metadata-table";
   private static final String TEST_CHANGE_STREAM = "my-change-stream";
+
+  @Rule public transient Timeout globalTimeout = Timeout.seconds(600);
 
   @Rule
   public final transient TestPipeline pipeline =
@@ -112,31 +115,7 @@ public class SpannerChangeStreamErrorTest implements Serializable {
   }
 
   @Test
-  public void testResourceExhaustedDoesNotRetry() {
-    mockSpannerService.setExecuteStreamingSqlExecutionTime(
-        SimulatedExecutionTime.ofStickyException(Status.RESOURCE_EXHAUSTED.asRuntimeException()));
-
-    final Timestamp startTimestamp = Timestamp.ofTimeSecondsAndNanos(0, 1000);
-    final Timestamp endTimestamp =
-        Timestamp.ofTimeSecondsAndNanos(startTimestamp.getSeconds(), startTimestamp.getNanos() + 1);
-    try {
-      pipeline.apply(
-          SpannerIO.readChangeStream()
-              .withSpannerConfig(getSpannerConfig())
-              .withChangeStreamName(TEST_CHANGE_STREAM)
-              .withMetadataDatabase(TEST_DATABASE)
-              .withMetadataTable(TEST_TABLE)
-              .withInclusiveStartAt(startTimestamp)
-              .withInclusiveEndAt(endTimestamp));
-      pipeline.run().waitUntilFinish();
-    } finally {
-      thrown.expect(PipelineExecutionException.class);
-      thrown.expectMessage(ErrorCode.RESOURCE_EXHAUSTED.name());
-    }
-  }
-
-  @Test
-  @Ignore("https://github.com/apache/beam/issues/21533")
+  // Error code UNAVAILABLE is retried repeatedly until the RPC times out.
   public void testUnavailableExceptionRetries() throws InterruptedException {
     DirectOptions options = PipelineOptionsFactory.as(DirectOptions.class);
     options.setBlockOnRun(false);
@@ -164,23 +143,33 @@ public class SpannerChangeStreamErrorTest implements Serializable {
         Thread.sleep(50);
       }
       // The pipeline continues making requests to Spanner to retry the Unavailable errors.
-      assertNull(result.waitUntilFinish(Duration.millis(5)));
+      assertNull(result.waitUntilFinish(Duration.millis(500)));
     } finally {
+      // databaseClient.getDialect does not currently bubble up the correct message.
+      // Instead, the error returned is: "DEADLINE_EXCEEDED: Operation did not complete "
+      // "in the given time"
+      thrown.expectMessage("DEADLINE_EXCEEDED");
       assertThat(
-          mockSpannerService.countRequestsOfType(ExecuteSqlRequest.class), Matchers.greaterThan(1));
+          mockSpannerService.countRequestsOfType(ExecuteSqlRequest.class), Matchers.equalTo(0));
     }
   }
 
   @Test
-  public void testAbortedExceptionRetries() {
+  // Error code ABORTED is retried repeatedly until it times out.
+  public void testAbortedExceptionRetries() throws InterruptedException {
     mockSpannerService.setExecuteStreamingSqlExecutionTime(
         SimulatedExecutionTime.ofStickyException(Status.ABORTED.asRuntimeException()));
+
+    DirectOptions options = PipelineOptionsFactory.as(DirectOptions.class);
+    options.setBlockOnRun(false);
+    options.setRunner(DirectRunner.class);
+    Pipeline nonBlockingPipeline = TestPipeline.create(options);
 
     final Timestamp startTimestamp = Timestamp.ofTimeSecondsAndNanos(0, 1000);
     final Timestamp endTimestamp =
         Timestamp.ofTimeSecondsAndNanos(startTimestamp.getSeconds(), startTimestamp.getNanos() + 1);
     try {
-      pipeline.apply(
+      nonBlockingPipeline.apply(
           SpannerIO.readChangeStream()
               .withSpannerConfig(getSpannerConfig())
               .withChangeStreamName(TEST_CHANGE_STREAM)
@@ -188,63 +177,21 @@ public class SpannerChangeStreamErrorTest implements Serializable {
               .withMetadataTable(TEST_TABLE)
               .withInclusiveStartAt(startTimestamp)
               .withInclusiveEndAt(endTimestamp));
-      pipeline.run().waitUntilFinish();
-    } finally {
-      assertThat(
-          mockSpannerService.countRequestsOfType(ExecuteSqlRequest.class), Matchers.greaterThan(1));
-      thrown.expect(PipelineExecutionException.class);
-      thrown.expectMessage(ErrorCode.ABORTED.name());
-    }
-  }
-
-  @Test
-  public void testAbortedExceptionRetriesWithDefaultsForStreamSqlRetrySettings()
-      throws IOException, InterruptedException {
-    DirectOptions options = PipelineOptionsFactory.as(DirectOptions.class);
-    options.setBlockOnRun(false);
-    options.setRunner(DirectRunner.class);
-    Pipeline nonBlockingPipeline = TestPipeline.create(options);
-
-    mockSpannerService.setExecuteStreamingSqlExecutionTime(
-        SimulatedExecutionTime.ofStickyException(Status.ABORTED.asRuntimeException()));
-    final Timestamp startTimestamp = Timestamp.ofTimeSecondsAndNanos(0, 1000);
-    final Timestamp endTimestamp =
-        Timestamp.ofTimeSecondsAndNanos(startTimestamp.getSeconds(), startTimestamp.getNanos() + 1);
-    final SpannerConfig changeStreamConfig =
-        SpannerConfig.create()
-            .withEmulatorHost(StaticValueProvider.of(SPANNER_HOST))
-            .withIsLocalChannelProvider(StaticValueProvider.of(true))
-            .withCommitRetrySettings(null)
-            .withExecuteStreamingSqlRetrySettings(null)
-            .withProjectId(TEST_PROJECT)
-            .withInstanceId(TEST_INSTANCE)
-            .withDatabaseId(TEST_DATABASE);
-    nonBlockingPipeline.apply(
-        SpannerIO.readChangeStream()
-            .withSpannerConfig(changeStreamConfig)
-            .withChangeStreamName(TEST_CHANGE_STREAM)
-            .withMetadataDatabase(TEST_DATABASE)
-            .withMetadataTable(TEST_TABLE)
-            .withInclusiveStartAt(startTimestamp)
-            .withInclusiveEndAt(endTimestamp));
-    PipelineResult result = nonBlockingPipeline.run();
-    // The pipeline is configured with default retry settings instead of the quick retry settings,
-    // and will run a long time when this unit test is run if it is not cancelled.
-    int totalExecutionTime = 0;
-    // check if the pipeline is in a non-terminal state
-    while (!result.getState().isTerminal()) {
-      Thread.sleep(50);
-      totalExecutionTime += 50;
-      if (totalExecutionTime > 2000) {
-        // quickRetrySettings specify the total timeout as 1 second. So if the total execution
-        // time of the pipeline is > 2 secs, it means that the default retry settings were used,
-        // verifying the test case. We then cancel the pipeline.
-        result.cancel();
+      PipelineResult result = nonBlockingPipeline.run();
+      while (result.getState() != RUNNING) {
+        Thread.sleep(50);
       }
+      // The pipeline continues making requests to Spanner to retry the Aborted errors.
+      assertNull(result.waitUntilFinish(Duration.millis(500)));
+    } finally {
+      thrown.expectMessage("DEADLINE_EXCEEDED");
+      assertThat(
+          mockSpannerService.countRequestsOfType(ExecuteSqlRequest.class), Matchers.equalTo(0));
     }
   }
 
   @Test
+  // Error code UNKNOWN is not retried.
   public void testUnknownExceptionDoesNotRetry() {
     mockSpannerService.setExecuteStreamingSqlExecutionTime(
         SimulatedExecutionTime.ofStickyException(Status.UNKNOWN.asRuntimeException()));
@@ -263,10 +210,73 @@ public class SpannerChangeStreamErrorTest implements Serializable {
               .withInclusiveEndAt(endTimestamp));
       pipeline.run().waitUntilFinish();
     } finally {
+      thrown.expect(SpannerException.class);
+      thrown.expectMessage("UNKNOWN");
       assertThat(
-          mockSpannerService.countRequestsOfType(ExecuteSqlRequest.class), Matchers.equalTo(1));
-      thrown.expect(PipelineExecutionException.class);
-      thrown.expectMessage(ErrorCode.UNKNOWN.name());
+          mockSpannerService.countRequestsOfType(ExecuteSqlRequest.class), Matchers.equalTo(0));
+    }
+  }
+
+  @Test
+  // Error code RESOURCE_EXHAUSTED is retried repeatedly.
+  public void testResourceExhaustedRetry() {
+    mockSpannerService.setExecuteStreamingSqlExecutionTime(
+        SimulatedExecutionTime.ofStickyException(Status.RESOURCE_EXHAUSTED.asRuntimeException()));
+
+    final Timestamp startTimestamp = Timestamp.ofTimeSecondsAndNanos(0, 1000);
+    final Timestamp endTimestamp =
+        Timestamp.ofTimeSecondsAndNanos(startTimestamp.getSeconds(), startTimestamp.getNanos() + 1);
+
+    try {
+      pipeline.apply(
+          SpannerIO.readChangeStream()
+              .withSpannerConfig(getSpannerConfig())
+              .withChangeStreamName(TEST_CHANGE_STREAM)
+              .withMetadataDatabase(TEST_DATABASE)
+              .withMetadataTable(TEST_TABLE)
+              .withInclusiveStartAt(startTimestamp)
+              .withInclusiveEndAt(endTimestamp));
+      pipeline.run().waitUntilFinish();
+    } finally {
+      thrown.expectMessage("DEADLINE_EXCEEDED");
+      assertThat(
+          mockSpannerService.countRequestsOfType(ExecuteSqlRequest.class), Matchers.equalTo(0));
+    }
+  }
+
+  @Test
+  public void testResourceExhaustedRetryWithDefaultSettings() {
+    mockSpannerService.setExecuteStreamingSqlExecutionTime(
+        SimulatedExecutionTime.ofStickyException(Status.RESOURCE_EXHAUSTED.asRuntimeException()));
+
+    final Timestamp startTimestamp = Timestamp.ofTimeSecondsAndNanos(0, 1000);
+    final Timestamp endTimestamp =
+        Timestamp.ofTimeSecondsAndNanos(startTimestamp.getSeconds(), startTimestamp.getNanos() + 1);
+    final SpannerConfig changeStreamConfig =
+        SpannerConfig.create()
+            .withEmulatorHost(StaticValueProvider.of(SPANNER_HOST))
+            .withIsLocalChannelProvider(StaticValueProvider.of(true))
+            .withCommitRetrySettings(null)
+            .withExecuteStreamingSqlRetrySettings(null)
+            .withProjectId(TEST_PROJECT)
+            .withInstanceId(TEST_INSTANCE)
+            .withDatabaseId(TEST_DATABASE);
+
+    try {
+      pipeline.apply(
+          SpannerIO.readChangeStream()
+              .withSpannerConfig(changeStreamConfig)
+              .withChangeStreamName(TEST_CHANGE_STREAM)
+              .withMetadataDatabase(TEST_DATABASE)
+              .withMetadataTable(TEST_TABLE)
+              .withInclusiveStartAt(startTimestamp)
+              .withInclusiveEndAt(endTimestamp));
+      pipeline.run().waitUntilFinish();
+    } finally {
+      thrown.expect(SpannerException.class);
+      thrown.expectMessage("RESOURCE_EXHAUSTED");
+      assertThat(
+          mockSpannerService.countRequestsOfType(ExecuteSqlRequest.class), Matchers.equalTo(0));
     }
   }
 
@@ -276,6 +286,7 @@ public class SpannerChangeStreamErrorTest implements Serializable {
     final Timestamp endTimestamp =
         Timestamp.ofTimeSecondsAndNanos(startTimestamp.getSeconds(), startTimestamp.getNanos() + 1);
 
+    mockGetDialect();
     mockTableExists();
     mockGetWatermark(startTimestamp);
     ResultSet getPartitionResultSet = mockGetParentPartition(startTimestamp, endTimestamp);
@@ -301,8 +312,68 @@ public class SpannerChangeStreamErrorTest implements Serializable {
               .withInclusiveEndAt(endTimestamp));
       pipeline.run().waitUntilFinish();
     } finally {
+      thrown.expect(SpannerException.class);
+      // DatabaseClient.getDialect returns "DEADLINE_EXCEEDED: Operation did not complete in the "
+      // given time" even though we mocked it out.
+      thrown.expectMessage("DEADLINE_EXCEEDED");
+    }
+  }
+
+  @Test
+  public void testInvalidRecordReceivedWithDefaultSettings() {
+    final Timestamp startTimestamp = Timestamp.ofTimeSecondsAndNanos(0, 1000);
+    final Timestamp endTimestamp =
+        Timestamp.ofTimeSecondsAndNanos(startTimestamp.getSeconds(), startTimestamp.getNanos() + 1);
+
+    mockGetDialect();
+    mockTableExists();
+    mockGetWatermark(startTimestamp);
+    ResultSet getPartitionResultSet = mockGetParentPartition(startTimestamp, endTimestamp);
+    mockchangePartitionState(startTimestamp, endTimestamp, "CREATED");
+    mockchangePartitionState(startTimestamp, endTimestamp, "SCHEDULED");
+    mockGetPartitionsAfter(
+        Timestamp.ofTimeSecondsAndNanos(startTimestamp.getSeconds(), startTimestamp.getNanos() - 1),
+        getPartitionResultSet);
+    mockGetPartitionsAfter(
+        Timestamp.ofTimeSecondsAndNanos(startTimestamp.getSeconds(), startTimestamp.getNanos()),
+        ResultSet.newBuilder().setMetadata(PARTITION_METADATA_RESULT_SET_METADATA).build());
+    mockGetPartitionsAfter(
+        Timestamp.ofTimeSecondsAndNanos(startTimestamp.getSeconds(), startTimestamp.getNanos() + 1),
+        ResultSet.newBuilder().setMetadata(PARTITION_METADATA_RESULT_SET_METADATA).build());
+    mockInvalidChangeStreamRecordReceived(startTimestamp, endTimestamp);
+
+    try {
+      RetrySettings quickRetrySettings =
+          RetrySettings.newBuilder()
+              .setInitialRetryDelay(org.threeten.bp.Duration.ofMillis(250))
+              .setMaxRetryDelay(org.threeten.bp.Duration.ofSeconds(1))
+              .setRetryDelayMultiplier(5)
+              .setTotalTimeout(org.threeten.bp.Duration.ofSeconds(1))
+              .build();
+      final SpannerConfig changeStreamConfig =
+          SpannerConfig.create()
+              .withEmulatorHost(StaticValueProvider.of(SPANNER_HOST))
+              .withIsLocalChannelProvider(StaticValueProvider.of(true))
+              .withCommitRetrySettings(quickRetrySettings)
+              .withExecuteStreamingSqlRetrySettings(null)
+              .withProjectId(TEST_PROJECT)
+              .withInstanceId(TEST_INSTANCE)
+              .withDatabaseId(TEST_DATABASE);
+
+      pipeline.apply(
+          SpannerIO.readChangeStream()
+              .withSpannerConfig(changeStreamConfig)
+              .withChangeStreamName(TEST_CHANGE_STREAM)
+              .withMetadataDatabase(TEST_DATABASE)
+              .withMetadataTable(TEST_TABLE)
+              .withInclusiveStartAt(startTimestamp)
+              .withInclusiveEndAt(endTimestamp));
+      pipeline.run().waitUntilFinish();
+    } finally {
       thrown.expect(PipelineExecutionException.class);
       thrown.expectMessage("Field not found");
+      assertThat(
+          mockSpannerService.countRequestsOfType(ExecuteSqlRequest.class), Matchers.greaterThan(0));
     }
   }
 
@@ -472,6 +543,75 @@ public class SpannerChangeStreamErrorTest implements Serializable {
             .build();
     mockSpannerService.putStatementResult(
         StatementResult.query(tableExistsStatement, tableExistsResultSet));
+  }
+
+  private ResultSet mockchangePartitionState(
+      Timestamp startTimestamp, Timestamp after3Seconds, String state) {
+    List<String> tokens = new ArrayList<>();
+    tokens.add("Parent0");
+    Statement getPartitionStatement =
+        Statement.newBuilder(
+                "SELECT * FROM my-metadata-table WHERE PartitionToken IN UNNEST(@partitionTokens) AND State = @state")
+            .bind("partitionTokens")
+            .toStringArray(tokens)
+            .bind("state")
+            .to(state)
+            .build();
+    ResultSet getPartitionResultSet =
+        ResultSet.newBuilder()
+            .addRows(
+                ListValue.newBuilder()
+                    .addValues(Value.newBuilder().setStringValue("Parent0"))
+                    .addValues(Value.newBuilder().setListValue(ListValue.newBuilder().build()))
+                    .addValues(Value.newBuilder().setStringValue(startTimestamp.toString()))
+                    .addValues(Value.newBuilder().setStringValue(after3Seconds.toString()))
+                    .addValues(Value.newBuilder().setStringValue("500"))
+                    .addValues(Value.newBuilder().setStringValue(State.CREATED.name()))
+                    .addValues(Value.newBuilder().setStringValue(startTimestamp.toString()))
+                    .addValues(Value.newBuilder().setStringValue(startTimestamp.toString()))
+                    .addValues(Value.newBuilder().setNullValue(NullValue.NULL_VALUE).build())
+                    .addValues(Value.newBuilder().setNullValue(NullValue.NULL_VALUE).build())
+                    .addValues(Value.newBuilder().setNullValue(NullValue.NULL_VALUE).build())
+                    .build())
+            .setMetadata(PARTITION_METADATA_RESULT_SET_METADATA)
+            .build();
+    mockSpannerService.putStatementResult(
+        StatementResult.query(getPartitionStatement, getPartitionResultSet));
+    return getPartitionResultSet;
+  }
+
+  private void mockGetDialect() {
+    Statement determineDialectStatement =
+        Statement.newBuilder(
+                "SELECT 'POSTGRESQL' AS DIALECT\n"
+                    + "FROM INFORMATION_SCHEMA.SCHEMATA\n"
+                    + "WHERE SCHEMA_NAME='information_schema'\n"
+                    + "UNION ALL\n"
+                    + "SELECT 'GOOGLE_STANDARD_SQL' AS DIALECT\n"
+                    + "FROM INFORMATION_SCHEMA.SCHEMATA\n"
+                    + "WHERE SCHEMA_NAME='INFORMATION_SCHEMA' AND CATALOG_NAME=''")
+            .build();
+    ResultSetMetadata dialectResultSetMetadata =
+        ResultSetMetadata.newBuilder()
+            .setRowType(
+                StructType.newBuilder()
+                    .addFields(
+                        Field.newBuilder()
+                            .setName("dialect")
+                            .setType(Type.newBuilder().setCode(TypeCode.STRING).build())
+                            .build())
+                    .build())
+            .build();
+    ResultSet dialectResultSet =
+        ResultSet.newBuilder()
+            .addRows(
+                ListValue.newBuilder()
+                    .addValues(Value.newBuilder().setStringValue("GOOGLE_STANDARD_SQL").build())
+                    .build())
+            .setMetadata(dialectResultSetMetadata)
+            .build();
+    mockSpannerService.putStatementResult(
+        StatementResult.query(determineDialectStatement, dialectResultSet));
   }
 
   private SpannerConfig getSpannerConfig() {

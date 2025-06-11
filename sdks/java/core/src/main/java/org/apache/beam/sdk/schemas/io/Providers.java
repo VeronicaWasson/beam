@@ -17,19 +17,17 @@
  */
 package org.apache.beam.sdk.schemas.io;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import java.util.HashMap;
 import java.util.Map;
 import java.util.ServiceLoader;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.annotations.Internal;
 
 /** Helpers for implementing the "Provider" pattern. */
 @Internal
-@Experimental(Kind.SCHEMAS)
 public final class Providers {
+
   public interface Identifyable {
     /**
      * Returns an id that uniquely represents this among others implementing its derived interface.
@@ -42,7 +40,7 @@ public final class Providers {
   public static <T extends Identifyable> Map<String, T> loadProviders(Class<T> klass) {
     Map<String, T> providers = new HashMap<>();
     for (T provider : ServiceLoader.load(klass)) {
-      checkArgument(
+      checkState(
           !providers.containsKey(provider.identifier()),
           "Duplicate providers exist with identifier `%s` for class %s.",
           provider.identifier(),

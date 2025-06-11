@@ -19,6 +19,7 @@
 const childProcess = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 import { ChannelCredentials } from "@grpc/grpc-js";
@@ -34,6 +35,7 @@ import { Pipeline } from "../../internal/pipeline";
 import { PipelineResult, Runner } from "../runner";
 import { PipelineOptions } from "../../options/pipeline_options";
 import { JobState_Enum, JobStateEvent } from "../../proto/beam_job_api";
+import { MonitoringInfo } from "../../proto/metrics";
 
 import { ExternalWorkerPool } from "../../worker/external_worker_service";
 import * as environments from "../../internal/environments";
@@ -41,6 +43,7 @@ import * as artifacts from "../artifacts";
 import { Service as JobService } from "../../utils/service";
 
 import * as serialization from "../../serialization";
+import { beamVersion } from "../../utils/packageJson";
 
 const TERMINAL_STATES = [
   JobState_Enum.DONE,
@@ -50,19 +53,23 @@ const TERMINAL_STATES = [
   JobState_Enum.DRAINED,
 ];
 
+const DOCKER_BASE = "docker.io/apache/beam_typescript_sdk";
+
 type completionCallback = (terminalState: JobStateEvent) => Promise<unknown>;
 
-class PortableRunnerPipelineResult implements PipelineResult {
+class PortableRunnerPipelineResult extends PipelineResult {
   jobId: string;
   runner: PortableRunner;
   completionCallbacks: completionCallback[];
   terminalState?: JobStateEvent;
+  finalMetrics?: MonitoringInfo[];
 
   constructor(
     runner: PortableRunner,
     jobId: string,
-    completionCallbacks: completionCallback[]
+    completionCallbacks: completionCallback[],
   ) {
+    super();
     this.runner = runner;
     this.jobId = jobId;
     this.completionCallbacks = completionCallbacks;
@@ -79,6 +86,7 @@ class PortableRunnerPipelineResult implements PipelineResult {
     const state = await this.runner.getJobState(this.jobId);
     if (PortableRunnerPipelineResult.isTerminal(state.state)) {
       this.terminalState = state;
+      this.finalMetrics = await this.rawMetrics();
       for (const callback of this.completionCallbacks) {
         await callback(state);
       }
@@ -117,6 +125,15 @@ class PortableRunnerPipelineResult implements PipelineResult {
     }
     return state;
   }
+
+  async rawMetrics() {
+    if (this.finalMetrics !== undefined) {
+      return this.finalMetrics;
+    } else {
+      const metrics = await this.runner.getJobMetrics(this.jobId);
+      return metrics.metrics!.committed!;
+    }
+  }
 }
 
 export class PortableRunner extends Runner {
@@ -125,7 +142,7 @@ export class PortableRunner extends Runner {
 
   constructor(
     options: string | { jobEndpoint: string; [others: string]: any },
-    private jobService: JobService | undefined = undefined
+    private jobService: JobService | undefined = undefined,
   ) {
     super();
     if (typeof options === "string") {
@@ -144,10 +161,15 @@ export class PortableRunner extends Runner {
         new GrpcTransport({
           host: this.defaultOptions?.jobEndpoint,
           channelCredentials: ChannelCredentials.createInsecure(),
-        })
+        }),
       );
     }
     return this.client;
+  }
+
+  async getJobMetrics(jobId: string) {
+    const call = (await this.getClient()).getJobMetrics({ jobId });
+    return await call.response;
   }
 
   async getJobState(jobId: string) {
@@ -161,20 +183,20 @@ export class PortableRunner extends Runner {
   }
 
   async runPipeline(
-    pipeline: Pipeline,
-    options?: PipelineOptions
+    pipeline: runnerApiProto.Pipeline,
+    options?: PipelineOptions,
   ): Promise<PipelineResult> {
-    return this.runPipelineWithProto(pipeline.getProto(), options);
+    return this.runPipelineWithProto(pipeline, options);
   }
 
   async runPipelineWithProto(
     pipeline: runnerApiProto.Pipeline,
-    options?: PipelineOptions
+    options?: PipelineOptions,
   ) {
     options = { ...this.defaultOptions, ...(options || {}) };
 
     for (const [_, pcoll] of Object.entries(
-      pipeline.components!.pcollections
+      pipeline.components!.pcollections,
     )) {
       if (pcoll.isBounded == runnerApiProto.IsBounded_Enum.UNBOUNDED) {
         (options as any).streaming = true;
@@ -199,7 +221,7 @@ export class PortableRunner extends Runner {
     // Replace the default environment according to the pipeline options.
     pipeline = runnerApiProto.Pipeline.clone(pipeline);
     for (const [envId, env] of Object.entries(
-      pipeline.components!.environments
+      pipeline.components!.environments,
     )) {
       if (env.urn === environments.TYPESCRIPT_DEFAULT_ENVIRONMENT_URN) {
         if (loopbackAddress) {
@@ -211,20 +233,27 @@ export class PortableRunner extends Runner {
             environments.asDockerEnvironment(
               env,
               (options as any)?.sdkContainerImage ||
-                "gcr.io/apache-beam-testing/beam_typescript_sdk:dev"
+                DOCKER_BASE + ":" + beamVersion.replace("-SNAPSHOT", ".dev"),
             );
           const deps = pipeline.components!.environments[envId].dependencies;
 
           // Package up this code as a dependency.
-          const result = childProcess.spawnSync("npm", ["pack"], {
-            encoding: "latin1",
-          });
+          const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "beam-pack-"));
+          const result = childProcess.spawnSync(
+            "npm",
+            ["pack", "--pack-destination", tmpDir],
+            {
+              encoding: "latin1",
+            },
+          );
           if (result.status === 0) {
             console.debug(result.stdout);
           } else {
             throw new Error(result.output);
           }
-          const packFile = path.resolve(result.stdout.trim());
+          const packFile = path.resolve(
+            path.join(tmpDir, result.stdout.trim()),
+          );
           deps.push(fileArtifact(packFile, "beam:artifact:type:npm:v1"));
 
           // If any dependencies are files, package them up as well.
@@ -238,8 +267,8 @@ export class PortableRunner extends Runner {
                     fileArtifact(
                       path,
                       "beam:artifact:type:npm_dep:v1",
-                      new TextEncoder().encode(dep)
-                    )
+                      new TextEncoder().encode(dep),
+                    ),
                   );
                 }
               }
@@ -267,8 +296,8 @@ export class PortableRunner extends Runner {
           Object.entries(options).map(([k, v]) => [
             `beam:option:${camel_to_snake(k)}:v1`,
             v,
-          ])
-        )
+          ]),
+        ),
       );
     }
     const client = await this.getClient();
@@ -285,10 +314,10 @@ export class PortableRunner extends Runner {
           new GrpcTransport({
             host: prepareResponse.artifactStagingEndpoint.url,
             channelCredentials: ChannelCredentials.createInsecure(),
-          })
+          }),
         ),
         prepareResponse.stagingSessionToken,
-        "/"
+        "/",
       );
     }
 
@@ -311,7 +340,7 @@ export class PortableRunner extends Runner {
 function fileArtifact(
   filePath: string,
   roleUrn: string,
-  rolePayload: Uint8Array | undefined = undefined
+  rolePayload: Uint8Array | undefined = undefined,
 ) {
   const hasher = crypto.createHash("sha256");
   hasher.update(fs.readFileSync(filePath));

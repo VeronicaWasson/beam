@@ -17,8 +17,8 @@
  */
 package org.apache.beam.runners.flink;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import java.io.IOException;
 import java.util.Collections;
@@ -27,10 +27,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import org.apache.beam.runners.core.Concatenate;
-import org.apache.beam.runners.core.construction.CreatePCollectionViewTranslation;
-import org.apache.beam.runners.core.construction.PTransformTranslation;
-import org.apache.beam.runners.core.construction.ParDoTranslation;
-import org.apache.beam.runners.core.construction.ReadTranslation;
 import org.apache.beam.runners.flink.translation.functions.FlinkAssignWindows;
 import org.apache.beam.runners.flink.translation.functions.FlinkDoFnFunction;
 import org.apache.beam.runners.flink.translation.functions.FlinkExplodeWindowsFunction;
@@ -67,7 +63,10 @@ import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.GlobalWindow;
 import org.apache.beam.sdk.transforms.windowing.TimestampCombiner;
 import org.apache.beam.sdk.transforms.windowing.WindowFn;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.CreatePCollectionViewTranslation;
+import org.apache.beam.sdk.util.construction.PTransformTranslation;
+import org.apache.beam.sdk.util.construction.ParDoTranslation;
+import org.apache.beam.sdk.util.construction.ReadTranslation;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
@@ -76,11 +75,13 @@ import org.apache.beam.sdk.values.PCollectionTuple;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.PValue;
 import org.apache.beam.sdk.values.TupleTag;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
 import org.apache.beam.sdk.values.WindowingStrategy;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Maps;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Multimap;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.MultimapBuilder;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Maps;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Multimap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.MultimapBuilder;
 import org.apache.flink.api.common.functions.RichGroupReduceFunction;
 import org.apache.flink.api.common.operators.Order;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -94,8 +95,6 @@ import org.apache.flink.api.java.operators.Grouping;
 import org.apache.flink.api.java.operators.MapOperator;
 import org.apache.flink.api.java.operators.SingleInputUdfOperator;
 import org.apache.flink.api.java.operators.UnsortedGrouping;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.optimizer.Optimizer;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Instant;
 
@@ -296,7 +295,7 @@ class FlinkBatchTransformTranslators {
                       inputCoder.getKeyCoder(), windowingStrategy.getWindowFn().windowCoder()));
       final TypeInformation<WindowedValue<KV<K, Iterable<InputT>>>> outputTypeInfo =
           new CoderTypeInformation<>(
-              WindowedValue.getFullCoder(
+              WindowedValues.getFullCoder(
                   KvCoder.of(
                       inputCoder.getKeyCoder(), IterableCoder.of(inputCoder.getValueCoder())),
                   windowingStrategy.getWindowFn().windowCoder()),
@@ -347,7 +346,7 @@ class FlinkBatchTransformTranslators {
 
       TypeInformation<WindowedValue<KV<K, List<InputT>>>> partialReduceTypeInfo =
           new CoderTypeInformation<>(
-              WindowedValue.getFullCoder(
+              WindowedValues.getFullCoder(
                   KvCoder.of(inputCoder.getKeyCoder(), accumulatorCoder),
                   windowingStrategy.getWindowFn().windowCoder()),
               context.getPipelineOptions());
@@ -413,12 +412,15 @@ class FlinkBatchTransformTranslators {
               outputType,
               FlinkIdentityFunction.of(),
               getCurrentTransformName(context));
-      final Configuration partitionOptions = new Configuration();
-      partitionOptions.setString(
-          Optimizer.HINT_SHIP_STRATEGY, Optimizer.HINT_SHIP_STRATEGY_REPARTITION);
-      context.setOutputDataSet(
-          context.getOutput(transform),
-          retypedDataSet.map(FlinkIdentityFunction.of()).withParameters(partitionOptions));
+      WindowedValues.WindowedValueCoder<KV<K, InputT>> kvWvCoder =
+          (WindowedValues.WindowedValueCoder<KV<K, InputT>>) outputType.getCoder();
+      KvCoder<K, InputT> kvCoder = (KvCoder<K, InputT>) kvWvCoder.getValueCoder();
+      DataSet<WindowedValue<KV<K, InputT>>> reshuffle =
+          retypedDataSet
+              .groupBy(new KvKeySelector<>(kvCoder.getKeyCoder()))
+              .<WindowedValue<KV<K, InputT>>>reduceGroup((i, c) -> i.forEach(c::collect))
+              .returns(outputType);
+      context.setOutputDataSet(context.getOutput(transform), reshuffle);
     }
   }
 
@@ -647,7 +649,8 @@ class FlinkBatchTransformTranslators {
 
       TypeInformation<WindowedValue<RawUnionValue>> typeInformation =
           new CoderTypeInformation<>(
-              WindowedValue.getFullCoder(unionCoder, windowingStrategy.getWindowFn().windowCoder()),
+              WindowedValues.getFullCoder(
+                  unionCoder, windowingStrategy.getWindowFn().windowCoder()),
               context.getPipelineOptions());
 
       List<PCollectionView<?>> sideInputs;
@@ -788,7 +791,7 @@ class FlinkBatchTransformTranslators {
                     })
                 .returns(
                     new CoderTypeInformation<>(
-                        WindowedValue.getFullCoder(
+                        WindowedValues.getFullCoder(
                             (Coder<T>) VoidCoder.of(), GlobalWindow.Coder.INSTANCE),
                         context.getPipelineOptions()));
       } else {

@@ -27,7 +27,7 @@ import org.apache.beam.sdk.values.PInput;
 import org.apache.beam.sdk.values.POutput;
 import org.apache.beam.sdk.values.PValue;
 import org.apache.beam.sdk.values.TupleTag;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /** The result of a {@link BigQueryIO.Write} transform. */
@@ -42,6 +42,8 @@ public final class WriteResult implements POutput {
   private final @Nullable PCollection<TableDestination> successfulBatchInserts;
   private final @Nullable TupleTag<BigQueryStorageApiInsertError> failedStorageApiInsertsTag;
   private final @Nullable PCollection<BigQueryStorageApiInsertError> failedStorageApiInserts;
+  private final @Nullable TupleTag<TableRow> successfulStorageApiInsertsTag;
+  private final @Nullable PCollection<TableRow> successfulStorageApiInserts;
 
   /** Creates a {@link WriteResult} in the given {@link Pipeline}. */
   static WriteResult in(
@@ -52,7 +54,9 @@ public final class WriteResult implements POutput {
       @Nullable TupleTag<TableDestination> successfulBatchInsertsTag,
       @Nullable PCollection<TableDestination> successfulBatchInserts,
       @Nullable TupleTag<BigQueryStorageApiInsertError> failedStorageApiInsertsTag,
-      @Nullable PCollection<BigQueryStorageApiInsertError> failedStorageApiInserts) {
+      @Nullable PCollection<BigQueryStorageApiInsertError> failedStorageApiInserts,
+      @Nullable TupleTag<TableRow> successfulStorageApiInsertsTag,
+      @Nullable PCollection<TableRow> successfulStorageApiInserts) {
     return new WriteResult(
         pipeline,
         failedInsertsTag,
@@ -63,7 +67,9 @@ public final class WriteResult implements POutput {
         successfulBatchInsertsTag,
         successfulBatchInserts,
         failedStorageApiInsertsTag,
-        failedStorageApiInserts);
+        failedStorageApiInserts,
+        successfulStorageApiInsertsTag,
+        successfulStorageApiInserts);
   }
 
   static WriteResult withExtendedErrors(
@@ -78,6 +84,8 @@ public final class WriteResult implements POutput {
         failedInsertsTag,
         failedInserts,
         successfulInserts,
+        null,
+        null,
         null,
         null,
         null,
@@ -116,7 +124,9 @@ public final class WriteResult implements POutput {
       @Nullable TupleTag<TableDestination> successfulInsertsTag,
       @Nullable PCollection<TableDestination> successfulBatchInserts,
       @Nullable TupleTag<BigQueryStorageApiInsertError> failedStorageApiInsertsTag,
-      @Nullable PCollection<BigQueryStorageApiInsertError> failedStorageApiInserts) {
+      @Nullable PCollection<BigQueryStorageApiInsertError> failedStorageApiInserts,
+      @Nullable TupleTag<TableRow> successfulStorageApiInsertsTag,
+      @Nullable PCollection<TableRow> successfulStorageApiInserts) {
     this.pipeline = pipeline;
     this.failedInsertsTag = failedInsertsTag;
     this.failedInserts = failedInserts;
@@ -127,6 +137,8 @@ public final class WriteResult implements POutput {
     this.successfulBatchInserts = successfulBatchInserts;
     this.failedStorageApiInsertsTag = failedStorageApiInsertsTag;
     this.failedStorageApiInserts = failedStorageApiInserts;
+    this.successfulStorageApiInsertsTag = successfulStorageApiInsertsTag;
+    this.successfulStorageApiInserts = successfulStorageApiInserts;
   }
 
   /**
@@ -169,11 +181,11 @@ public final class WriteResult implements POutput {
     Preconditions.checkArgumentNotNull(
         failedInsertsTag,
         "Cannot use getFailedInserts as this WriteResult uses extended errors"
-            + " information. Use getFailedInsertsWithErr instead");
+            + " information. Use getFailedInsertsWithErr or getFailedStorageApiInserts instead");
     return Preconditions.checkStateNotNull(
         failedInserts,
         "Cannot use getFailedInserts as this WriteResult uses extended errors"
-            + " information. Use getFailedInsertsWithErr instead");
+            + " information. Use getFailedInsertsWithErr or getFailedStorageApiInserts instead");
   }
 
   /**
@@ -187,13 +199,18 @@ public final class WriteResult implements POutput {
     Preconditions.checkArgumentNotNull(
         failedInsertsWithErrTag,
         "Cannot use getFailedInsertsWithErr as this WriteResult does not use"
-            + " extended errors. Use getFailedInserts instead");
+            + " extended errors. Use getFailedInserts or getFailedStorageApiInserts instead");
     return Preconditions.checkArgumentNotNull(
         failedInsertsWithErr,
         "Cannot use getFailedInsertsWithErr as this WriteResult does not use"
-            + " extended errors. Use getFailedInserts instead");
+            + " extended errors. Use getFailedInserts or getFailedStorageApiInserts instead");
   }
 
+  /**
+   * Return any rows that persistently fail to insert when using a storage-api method. For example:
+   * rows with values that do not match the BigQuery schema or rows that are too large to insert.
+   * This collection is in the global window.
+   */
   public PCollection<BigQueryStorageApiInsertError> getFailedStorageApiInserts() {
     Preconditions.checkStateNotNull(
         failedStorageApiInsertsTag,
@@ -201,6 +218,23 @@ public final class WriteResult implements POutput {
     return Preconditions.checkStateNotNull(
         failedStorageApiInserts,
         "Cannot use getFailedStorageApiInserts as this insert didn't use the storage API.");
+  }
+
+  /**
+   * Return all rows successfully inserted using one of the storage-api insert methods. Rows undergo
+   * a conversion process, so while these TableRow objects are logically the same as the rows in the
+   * initial PCollection, they may not be physically identical. This PCollection is in the global
+   * window.
+   */
+  public PCollection<TableRow> getSuccessfulStorageApiInserts() {
+    Preconditions.checkStateNotNull(
+        successfulStorageApiInsertsTag,
+        "Can only getSuccessfulStorageApiInserts if using the storage API and "
+            + "withPropagateSuccessfulStorageApiWrites() is set.");
+    return Preconditions.checkStateNotNull(
+        successfulStorageApiInserts,
+        "Can only getSuccessfulStorageApiInserts if using the storage API and "
+            + "withPropagateSuccessfulStorageApiWrites() is set.");
   }
 
   @Override

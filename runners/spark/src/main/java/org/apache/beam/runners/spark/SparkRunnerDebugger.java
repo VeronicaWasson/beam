@@ -19,7 +19,6 @@ package org.apache.beam.runners.spark;
 
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
-import org.apache.beam.runners.core.construction.SplittableParDo;
 import org.apache.beam.runners.spark.translation.EvaluationContext;
 import org.apache.beam.runners.spark.translation.SparkContextFactory;
 import org.apache.beam.runners.spark.translation.SparkPipelineTranslator;
@@ -30,6 +29,7 @@ import org.apache.beam.sdk.PipelineRunner;
 import org.apache.beam.sdk.options.ExperimentalOptions;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsValidator;
+import org.apache.beam.sdk.util.construction.SplittableParDo;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.streaming.api.java.JavaStreamingContext;
 import org.joda.time.Duration;
@@ -113,7 +113,7 @@ public final class SparkRunnerDebugger extends PipelineRunner<SparkPipelineResul
     SparkContextFactory.stopSparkContext(jsc);
 
     String debugString = visitor.getDebugString();
-    LOG.info("Translated Native Spark pipeline:\n" + debugString);
+    LOG.info("Translated Native Spark pipeline:\n{}", debugString);
     return new DebugSparkPipelineResult(debugString);
   }
 

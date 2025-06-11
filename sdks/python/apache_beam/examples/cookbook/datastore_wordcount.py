@@ -59,7 +59,7 @@ import argparse
 import logging
 import re
 import sys
-from typing import Iterable
+from collections.abc import Iterable
 from typing import Optional
 from typing import Text
 import uuid
@@ -87,9 +87,7 @@ class WordExtractingDoFn(beam.DoFn):
     self.word_counter = Metrics.counter('main', 'total_words')
     self.word_lengths_dist = Metrics.distribution('main', 'word_len_dist')
 
-  def process(self, element):
-    # type: (Entity) -> Optional[Iterable[Text]]
-
+  def process(self, element: Entity) -> Optional[Iterable[Text]]:
     """Extract words from the 'content' property of Cloud Datastore entities.
 
     The element is a line of text.  If the line is blank, note that, too.
@@ -121,8 +119,8 @@ class EntityWrapper(object):
 
   def make_entity(self, content):
     ancestor_key = Key([self._kind, self._ancestor],
-                       self._namespace,
-                       self._project)
+                       namespace=self._namespace,
+                       project=self._project)
     # Namespace and project are inherited from parent key.
     key = Key([self._kind, str(uuid.uuid4())], parent=ancestor_key)
     entity = Entity(key)

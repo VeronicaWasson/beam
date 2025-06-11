@@ -25,7 +25,7 @@ import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.values.PCollection;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.joda.time.Instant;
 import org.junit.Rule;
 import org.junit.Test;
@@ -94,14 +94,6 @@ public class SqlQuery2Test {
     @Override
     protected SqlQuery2 getQuery(long skipFactor) {
       return SqlQuery2.calciteSqlQuery2(skipFactor);
-    }
-  }
-
-  @RunWith(JUnit4.class)
-  public static class SqlQuery2TestZetaSql extends SqlQuery2TestCases {
-    @Override
-    protected SqlQuery2 getQuery(long skipFactor) {
-      return SqlQuery2.zetaSqlQuery2(skipFactor);
     }
   }
 

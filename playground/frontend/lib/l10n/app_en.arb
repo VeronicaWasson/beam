@@ -1,20 +1,4 @@
 {
-  "lightMode": "Light Mode",
-  "@lightMode": {
-    "description": "Title for a theme switch"
-  },
-  "darkMode": "Dark Mode",
-  "@darkMode": {
-    "description": "Title for a theme switch"
-  },
-  "newExample": "New Example",
-  "@newExample": {
-    "description": "Title for the New Example button"
-  },
-  "reset": "Reset",
-  "@reset": {
-    "description": "Title for the reset button"
-  },
   "run": "Run",
   "@run": {
     "description": "Title for the run button"
@@ -75,14 +59,6 @@
   "@sendFeedback": {
     "description": "Title of the send feedback button"
   },
-  "privacyPolicy": "Privacy Policy",
-  "@privacyPolicy": {
-    "description": "Title for the privacy policy button"
-  },
-  "copyright": "© The Apache Software Foundation",
-  "@copyright": {
-    "description": "Copyright text for the footer"
-  },
   "search": "Search",
   "@search": {
     "description": "Hint text for a search field"
@@ -115,9 +91,13 @@
   "@outputPlacementSemantic": {
     "description": "Text for the output placement semantics"
   },
-  "selectSdkDropdown": "Select SDK Dropdown",
-  "@outputPlacementSemantic": {
+  "selectSdkDropdownSemantics": "Select SDK Dropdown",
+  "@selectSdkDropdownSemantics": {
     "description": "Text label for SDK Dropdown semantics"
+  },
+  "selectSdkPlaceholder": "Loading...",
+  "@selectSdkPlaceholder": {
+    "description": "A placeholder for SDK dropdown when none is selected"
   },
   "close": "CLOSE",
   "@close": {
@@ -135,14 +115,6 @@
   "@enjoyingPlayground": {
     "description": "Title for the Enjoying Playground button"
   },
-  "reportIssue": "Report issue in GitHub",
-  "@reportIssue": {
-    "description": "Title for the Report issue in GitHub button"
-  },
-  "codeTextArea": "Code Text Area",
-  "@codeTextArea": {
-    "description": "Title for the Code text area semantics"
-  },
   "bottom": "Bottom",
   "@bottom": {
     "description": "Part of the output placements semantics label"
@@ -155,29 +127,9 @@
   "@left": {
     "description": "Part of the output placements semantics label"
   },
-  "clearOutput": "Clear Output",
-  "@clearOutput": {
-    "description": "Title for the Clear Output shortcut row"
-  },
   "pipelineOptions": "Pipeline Options",
   "@pipelineOptions": {
     "description": "Title for the Pipeline Options"
-  },
-  "rawPipelineOptions": "Raw",
-  "@rawPipelineOptions": {
-    "description": "Title for the Raw Pipeline Options Tab"
-  },
-  "optionsPipelineOptions": "Options",
-  "@optionsPipelineOptions": {
-    "description": "Title for the Options Pipeline Options Tab"
-  },
-  "saveAndClose": "Save & close",
-  "@saveAndClose": {
-    "description": "Text for save and close button on pipeline dropdown"
-  },
-  "addPipelineOptionParameter": "Add parameter",
-  "@addPipelineOptionParameter": {
-    "description": "Text for add parameter button on pipeline dropdown"
   },
   "input": "Input",
   "@input": {
@@ -191,14 +143,6 @@
   "@value": {
     "description": "Text value label"
   },
-  "pipelineOptionsError": "Please check the format (example: --key1 value1 --key2 value2), only alphanumeric and \",*,/,-,:,;,',. symbols are allowed",
-  "@pipelineOptionsError": {
-    "description": "Pipeline options parse error"
-  },
-  "viewOnGithub": "View on GitHub",
-  "@viewOnGithub": {
-    "description": "View on Github button"
-  },
   "addExample": "Add your own example",
   "@addExample": {
     "description": "Add example link text"
@@ -207,7 +151,7 @@
   "@exampleDescription": {
     "description": "Description icon label"
   },
-  "exampleMultifile": "Multifile example info",
+  "exampleMultifile": "Multifile",
   "@exampleDescription": {
     "exampleMultifile": "Multifile icon label"
   },
@@ -226,5 +170,25 @@
   "result": "Result",
   "@result": {
     "description": "Name for the output tab"
+  },
+  "shareMyCode": "Share my code",
+  "@shareMyCode": {
+    "description": "Text for the share button"
+  },
+  "link": "Link",
+  "@link": {
+    "description": "Name of the Link tab in Share dropdown"
+  },
+  "embed": "Embed",
+  "@embed": {
+    "description": "Name of the Embed tab in Share dropdown"
+  },
+  "linkReady": "Link is ready! Anyone with this link can view your example.",
+  "@linkReady": {
+    "description": "Text that appears when user sees link to code sample"
+  },
+  "iframeCodeReady": "With this code you can embed Playground to your website.",
+  "@iframeCodeReady": {
+    "description": "Text that appears when user sees Playground iframe code"
   }
 }

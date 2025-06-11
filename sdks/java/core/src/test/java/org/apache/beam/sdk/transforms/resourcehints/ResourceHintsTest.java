@@ -80,6 +80,20 @@ public class ResourceHintsTest implements Serializable {
   }
 
   @Test
+  public void testMaxBundlesPerWorkerMergesCorrectly() {
+    assertEquals(
+        "6",
+        new String(
+            ResourceHints.create()
+                .withMaxActiveBundlesPerWorker(2)
+                .mergeWithOuter(ResourceHints.create().withMaxActiveBundlesPerWorker(4))
+                .hints()
+                .get("beam:resources:max_active_bundles_per_worker:v1")
+                .toBytes(),
+            StandardCharsets.US_ASCII));
+  }
+
+  @Test
   public void testFromOptions() {
     ResourceHintsOptions options =
         PipelineOptionsFactory.fromArgs(
@@ -92,10 +106,18 @@ public class ResourceHintsTest implements Serializable {
             .withHint("beam:resources:bar", new ResourceHints.StringHint("foo")));
     options =
         PipelineOptionsFactory.fromArgs(
-                "--resourceHints=min_ram=1KB", "--resourceHints=accelerator=foo")
+                "--resourceHints=min_ram=1KB",
+                "--resourceHints=accelerator=foo",
+                "--resourceHints=cpu_count=4",
+                "--resourceHints=max_active_bundles_per_worker=2")
             .as(ResourceHintsOptions.class);
-    assertEquals(
-        ResourceHints.fromOptions(options),
-        ResourceHints.create().withMinRam(1000).withAccelerator("foo"));
+    ResourceHints fromOptions = ResourceHints.fromOptions(options);
+    ResourceHints expect =
+        ResourceHints.create()
+            .withMinRam(1000)
+            .withAccelerator("foo")
+            .withCPUCount(4)
+            .withMaxActiveBundlesPerWorker(2);
+    assertEquals(fromOptions, expect);
   }
 }

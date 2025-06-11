@@ -19,10 +19,10 @@
 
 import argparse
 import io
+import logging
 import os
-from typing import Iterable
+from collections.abc import Iterator
 from typing import Optional
-from typing import Tuple
 
 import apache_beam as beam
 import torch
@@ -33,13 +33,14 @@ from apache_beam.ml.inference.base import RunInference
 from apache_beam.ml.inference.pytorch_inference import PytorchModelHandlerTensor
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import SetupOptions
+from apache_beam.runners.runner import PipelineResult
 from PIL import Image
+from torchvision import models
 from torchvision import transforms
-from torchvision.models.mobilenetv2 import MobileNetV2
 
 
 def read_image(image_file_name: str,
-               path_to_dir: Optional[str] = None) -> Tuple[str, Image.Image]:
+               path_to_dir: Optional[str] = None) -> tuple[str, Image.Image]:
   if path_to_dir is not None:
     image_file_name = os.path.join(path_to_dir, image_file_name)
   with FileSystems().open(image_file_name, 'r') as file:
@@ -61,11 +62,9 @@ def preprocess_image(data: Image.Image) -> torch.Tensor:
   return transform(data)
 
 
-class PostProcessor(beam.DoFn):
-  def process(self, element: Tuple[str, PredictionResult]) -> Iterable[str]:
-    filename, prediction_result = element
-    prediction = torch.argmax(prediction_result.inference, dim=0)
-    yield filename + ',' + str(prediction.item())
+def filter_empty_lines(text: str) -> Iterator[str]:
+  if len(text.strip()) > 0:
+    yield text
 
 
 def parse_known_args(argv):
@@ -95,7 +94,13 @@ def parse_known_args(argv):
   return parser.parse_known_args(argv)
 
 
-def run(argv=None, model_class=None, model_params=None, save_main_session=True):
+def run(
+    argv=None,
+    model_class=None,
+    model_params=None,
+    save_main_session=True,
+    device='CPU',
+    test_pipeline=None) -> PipelineResult:
   """
   Args:
     argv: Command line arguments defined for this example.
@@ -103,14 +108,29 @@ def run(argv=None, model_class=None, model_params=None, save_main_session=True):
     model_params: Parameters passed to the constructor of the model_class.
                   These will be used to instantiate the model object in the
                   RunInference API.
+    save_main_session: Used for internal testing.
+    device: Device to be used on the Runner. Choices are (CPU, GPU).
+    test_pipeline: Used for internal testing.
   """
   known_args, pipeline_args = parse_known_args(argv)
   pipeline_options = PipelineOptions(pipeline_args)
   pipeline_options.view_as(SetupOptions).save_main_session = save_main_session
 
   if not model_class:
-    model_class = MobileNetV2
+    # default model class will be mobilenet with pretrained weights.
+    model_class = models.mobilenet_v2
     model_params = {'num_classes': 1000}
+
+  def preprocess(image_name: str) -> tuple[str, torch.Tensor]:
+    image_name, image = read_image(
+      image_file_name=image_name,
+      path_to_dir=known_args.images_dir)
+    return (image_name, preprocess_image(image))
+
+  def postprocess(element: tuple[str, PredictionResult]) -> str:
+    filename, prediction_result = element
+    prediction = torch.argmax(prediction_result.inference, dim=0)
+    return filename + ',' + str(prediction.item())
 
   # In this example we pass keyed inputs to RunInference transform.
   # Therefore, we use KeyedModelHandler wrapper over PytorchModelHandler.
@@ -118,29 +138,34 @@ def run(argv=None, model_class=None, model_params=None, save_main_session=True):
       PytorchModelHandlerTensor(
           state_dict_path=known_args.model_state_dict_path,
           model_class=model_class,
-          model_params=model_params))
+          model_params=model_params,
+          device=device,
+          min_batch_size=10,
+          max_batch_size=100)).with_preprocess_fn(
+              preprocess).with_postprocess_fn(postprocess)
 
-  with beam.Pipeline(options=pipeline_options) as p:
-    filename_value_pair = (
-        p
-        | 'ReadImageNames' >> beam.io.ReadFromText(
-            known_args.input, skip_header_lines=1)
-        | 'ReadImageData' >> beam.Map(
-            lambda image_name: read_image(
-                image_file_name=image_name, path_to_dir=known_args.images_dir))
-        | 'PreprocessImages' >> beam.MapTuple(
-            lambda file_name, data: (file_name, preprocess_image(data))))
-    predictions = (
-        filename_value_pair
-        | 'PyTorchRunInference' >> RunInference(model_handler)
-        | 'ProcessOutput' >> beam.ParDo(PostProcessor()))
+  pipeline = test_pipeline
+  if not test_pipeline:
+    pipeline = beam.Pipeline(options=pipeline_options)
 
-    if known_args.output:
-      predictions | "WriteOutputToGCS" >> beam.io.WriteToText( # pylint: disable=expression-not-assigned
-        known_args.output,
-        shard_name_template='',
-        append_trailing_newlines=True)
+  filename_value_pair = (
+      pipeline
+      | 'ReadImageNames' >> beam.io.ReadFromText(known_args.input)
+      | 'FilterEmptyLines' >> beam.ParDo(filter_empty_lines))
+  predictions = (
+      filename_value_pair
+      | 'PyTorchRunInference' >> RunInference(model_handler))
+
+  predictions | "WriteOutputToGCS" >> beam.io.WriteToText( # pylint: disable=expression-not-assigned
+    known_args.output,
+    shard_name_template='',
+    append_trailing_newlines=True)
+
+  result = pipeline.run()
+  result.wait_until_finish()
+  return result
 
 
 if __name__ == '__main__':
+  logging.getLogger().setLevel(logging.INFO)
   run()

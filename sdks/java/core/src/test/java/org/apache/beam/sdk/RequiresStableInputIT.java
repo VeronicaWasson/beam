@@ -95,9 +95,9 @@ public class RequiresStableInputIT {
 
     public static void writeTextToFileSideEffect(String text, String filename) throws IOException {
       ResourceId rid = FileSystems.matchNewResource(filename, false);
-      WritableByteChannel chan = FileSystems.create(rid, "text/plain");
-      chan.write(ByteBuffer.wrap(text.getBytes(StandardCharsets.UTF_8)));
-      chan.close();
+      try (WritableByteChannel chan = FileSystems.create(rid, "text/plain")) {
+        chan.write(ByteBuffer.wrap(text.getBytes(StandardCharsets.UTF_8)));
+      }
     }
   }
 
@@ -145,7 +145,7 @@ public class RequiresStableInputIT {
             value -> {
               throw new RuntimeException(
                   "Deliberate failure: should happen only once for each application of the DoFn"
-                      + "within the transform graph.");
+                      + " within the transform graph.");
             };
 
     PCollection<String> singleton = p.apply("CreatePCollectionOfOneValue", Create.of(VALUE));

@@ -34,7 +34,7 @@ import org.apache.beam.sdk.extensions.protobuf.Proto2CoderTestMessages.MessageWi
 import org.apache.beam.sdk.testing.CoderProperties;
 import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.values.TypeDescriptor;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
@@ -167,6 +167,12 @@ public class ProtoCoderTest {
     // Assert the encoded messages are not equal.
     Coder<MessageWithMap> coder = ProtoCoder.of(MessageWithMap.class);
     assertNotEquals(CoderUtils.encodeToBase64(coder, msg2), CoderUtils.encodeToBase64(coder, msg1));
+  }
+
+  @Test
+  public void testEncodedTypeDescriptor() {
+    Coder<MessageA> coder = ProtoCoder.of(MessageA.class);
+    assertEquals(TypeDescriptor.of(MessageA.class), coder.getEncodedTypeDescriptor());
   }
 
   @Test

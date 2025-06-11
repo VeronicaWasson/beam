@@ -17,13 +17,14 @@
  */
 package org.apache.beam.sdk.io.cassandra;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.ConsistencyLevel;
 import com.datastax.driver.core.PlainTextAuthProvider;
 import com.datastax.driver.core.QueryOptions;
+import com.datastax.driver.core.SSLOptions;
 import com.datastax.driver.core.Session;
 import com.datastax.driver.core.SocketOptions;
 import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
@@ -40,8 +41,6 @@ import java.util.concurrent.Future;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.SerializableCoder;
 import org.apache.beam.sdk.options.PipelineOptions;
@@ -56,8 +55,8 @@ import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PDone;
 import org.apache.beam.sdk.values.TypeDescriptor;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableSet;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -122,7 +121,6 @@ import org.slf4j.LoggerFactory;
  *     .withCoder(SerializableCoder.of(Person.class))
  * }</pre>
  */
-@Experimental(Kind.SOURCE_SINK)
 @SuppressWarnings({
   "rawtypes", // TODO(https://github.com/apache/beam/issues/20447)
   "nullness" // TODO(https://github.com/apache/beam/issues/20497)
@@ -194,6 +192,9 @@ public class CassandraIO {
 
     @Nullable
     abstract ValueProvider<Set<RingRange>> ringRanges();
+
+    @Nullable
+    abstract ValueProvider<SSLOptions> sslOptions();
 
     abstract Builder<T> builder();
 
@@ -388,6 +389,22 @@ public class CassandraIO {
       return builder().setRingRanges(ringRange).build();
     }
 
+    /**
+     * Optionally, specify {@link SSLOptions} configuration to utilize SSL. See
+     * https://docs.datastax.com/en/developer/java-driver/3.11/manual/ssl/#jsse-programmatic
+     */
+    public Read<T> withSsl(SSLOptions sslOptions) {
+      return withSsl(ValueProvider.StaticValueProvider.of(sslOptions));
+    }
+
+    /**
+     * Optionally, specify {@link SSLOptions} configuration to utilize SSL. See
+     * https://docs.datastax.com/en/developer/java-driver/3.11/manual/ssl/#jsse-programmatic
+     */
+    public Read<T> withSsl(ValueProvider<SSLOptions> sslOptions) {
+      return builder().setSslOptions(sslOptions).build();
+    }
+
     @Override
     public PCollection<T> expand(PBegin input) {
       checkArgument((hosts() != null && port() != null), "WithHosts() and withPort() are required");
@@ -425,7 +442,8 @@ public class CassandraIO {
                 read.localDc(),
                 read.consistencyLevel(),
                 read.connectTimeout(),
-                read.readTimeout())) {
+                read.readTimeout(),
+                read.sslOptions())) {
           if (isMurmur3Partitioner(cluster)) {
             LOG.info("Murmur3Partitioner detected, splitting");
             Integer splitCount;
@@ -498,6 +516,8 @@ public class CassandraIO {
 
       abstract Builder<T> setRingRanges(ValueProvider<Set<RingRange>> ringRange);
 
+      abstract Builder<T> setSslOptions(ValueProvider<SSLOptions> sslOptions);
+
       abstract Read<T> autoBuild();
 
       public Read<T> build() {
@@ -545,6 +565,8 @@ public class CassandraIO {
     abstract @Nullable ValueProvider<Integer> connectTimeout();
 
     abstract @Nullable ValueProvider<Integer> readTimeout();
+
+    abstract @Nullable ValueProvider<SSLOptions> sslOptions();
 
     abstract @Nullable SerializableFunction<Session, Mapper> mapperFactoryFn();
 
@@ -728,6 +750,22 @@ public class CassandraIO {
       return builder().setMapperFactoryFn(mapperFactoryFn).build();
     }
 
+    /**
+     * Optionally, specify {@link SSLOptions} configuration to utilize SSL. See
+     * https://docs.datastax.com/en/developer/java-driver/3.11/manual/ssl/#jsse-programmatic
+     */
+    public Write<T> withSsl(SSLOptions sslOptions) {
+      return withSsl(ValueProvider.StaticValueProvider.of(sslOptions));
+    }
+
+    /**
+     * Optionally, specify {@link SSLOptions} configuration to utilize SSL. See
+     * https://docs.datastax.com/en/developer/java-driver/3.11/manual/ssl/#jsse-programmatic
+     */
+    public Write<T> withSsl(ValueProvider<SSLOptions> sslOptions) {
+      return builder().setSslOptions(sslOptions).build();
+    }
+
     @Override
     public void validate(PipelineOptions pipelineOptions) {
       checkState(
@@ -801,6 +839,8 @@ public class CassandraIO {
       abstract Builder<T> setMapperFactoryFn(SerializableFunction<Session, Mapper> mapperFactoryFn);
 
       abstract Optional<SerializableFunction<Session, Mapper>> mapperFactoryFn();
+
+      abstract Builder<T> setSslOptions(ValueProvider<SSLOptions> sslOptions);
 
       abstract Write<T> autoBuild(); // not public
 
@@ -883,7 +923,8 @@ public class CassandraIO {
       ValueProvider<String> localDc,
       ValueProvider<String> consistencyLevel,
       ValueProvider<Integer> connectTimeout,
-      ValueProvider<Integer> readTimeout) {
+      ValueProvider<Integer> readTimeout,
+      ValueProvider<SSLOptions> sslOptions) {
 
     Cluster.Builder builder =
         Cluster.builder().addContactPoints(hosts.get().toArray(new String[0])).withPort(port.get());
@@ -916,6 +957,10 @@ public class CassandraIO {
       socketOptions.setReadTimeoutMillis(readTimeout.get());
     }
 
+    if (sslOptions != null) {
+      builder.withSSL(sslOptions.get());
+    }
+
     return builder.build();
   }
 
@@ -944,7 +989,8 @@ public class CassandraIO {
               spec.localDc(),
               spec.consistencyLevel(),
               spec.connectTimeout(),
-              spec.readTimeout());
+              spec.readTimeout(),
+              spec.sslOptions());
       this.session = cluster.connect(spec.keyspace().get());
       this.mapperFactoryFn = spec.mapperFactoryFn();
       this.mutateFutures = new ArrayList<>();

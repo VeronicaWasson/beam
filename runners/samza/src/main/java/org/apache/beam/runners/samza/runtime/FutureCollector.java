@@ -19,7 +19,7 @@ package org.apache.beam.runners.samza.runtime;
 
 import java.util.Collection;
 import java.util.concurrent.CompletionStage;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValue;
 
 /**
  * A future collector that buffers the output from the users {@link
@@ -35,6 +35,13 @@ public interface FutureCollector<OutT> {
    * @param element to add to the collector
    */
   void add(CompletionStage<WindowedValue<OutT>> element);
+
+  /**
+   * Outputs a collection of elements to the collector.
+   *
+   * @param elements to add to the collector
+   */
+  void addAll(CompletionStage<Collection<WindowedValue<OutT>>> elements);
 
   /**
    * Discards the elements within the collector. Once the elements have been discarded, callers need

@@ -52,7 +52,7 @@ import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1WriteFn.BaseBatchWriteFn;
 import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1WriteFn.BatchWriteFnWithSummary;
 import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1WriteFn.WriteElement;
 import org.apache.beam.sdk.io.gcp.firestore.RpcQos.RpcWriteAttempt.Element;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.joda.time.Instant;
 import org.junit.After;
 import org.junit.Test;
@@ -190,7 +190,7 @@ public final class FirestoreV1FnBatchWriteWithSummaryTest
 
     when(rpcQos.newWriteAttempt(any())).thenReturn(attempt);
     when(attempt.awaitSafeToProceed(any())).thenReturn(true);
-    when(attempt.<Write, Element<Write>>newFlushBuffer(any()))
+    when(attempt.<Element<Write>>newFlushBuffer(any()))
         .thenReturn(newFlushBuffer(options))
         .thenReturn(newFlushBuffer(options))
         .thenThrow(new IllegalStateException("too many attempt#newFlushBuffer calls"));

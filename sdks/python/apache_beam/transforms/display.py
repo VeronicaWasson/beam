@@ -45,6 +45,8 @@ from datetime import datetime
 from datetime import timedelta
 from typing import TYPE_CHECKING
 from typing import List
+from typing import Optional
+from typing import Union
 
 from apache_beam.portability import common_urns
 from apache_beam.portability.api import beam_runner_api_pb2
@@ -58,7 +60,8 @@ __all__ = ['HasDisplayData', 'DisplayDataItem', 'DisplayData']
 class HasDisplayData(object):
   """ Basic mixin for elements that contain display data.
 
-  It implements only the display_data method and a _namespace method.
+  It implements only the display_data method and a
+  _get_display_data_namespace method.
   """
   def display_data(self):
     # type: () -> dict
@@ -85,7 +88,7 @@ class HasDisplayData(object):
     """
     return {}
 
-  def _namespace(self):
+  def _get_display_data_namespace(self):
     # type: () -> str
     return '{}.{}'.format(self.__module__, self.__class__.__name__)
 
@@ -100,7 +103,8 @@ class DisplayData(object):
   ):
     # type: (...) -> None
     self.namespace = namespace
-    self.items = []  # type: List[DisplayDataItem]
+    self.items = [
+    ]  # type: List[Union[DisplayDataItem, beam_runner_api_pb2.DisplayData]]
     self._populate_items(display_data_dict)
 
   def _populate_items(self, display_data_dict):
@@ -109,29 +113,30 @@ class DisplayData(object):
     for key, element in display_data_dict.items():
       if isinstance(element, HasDisplayData):
         subcomponent_display_data = DisplayData(
-            element._namespace(), element.display_data())
+            element._get_display_data_namespace(), element.display_data())
         self.items += subcomponent_display_data.items
-        continue
 
-      if isinstance(element, DisplayDataItem):
+      elif isinstance(element, DisplayDataItem):
         if element.should_drop():
           continue
         element.key = key
         element.namespace = self.namespace
         self.items.append(element)
-        continue
 
-      # If it's not a HasDisplayData element,
-      # nor a dictionary, then it's a simple value
-      self.items.append(
-          DisplayDataItem(element, namespace=self.namespace, key=key))
+      elif isinstance(element, beam_runner_api_pb2.DisplayData):
+        self.items.append(element)
+
+      else:
+        # If it's not a HasDisplayData element,
+        # nor a dictionary, then it's a simple value
+        self.items.append(
+            DisplayDataItem(element, namespace=self.namespace, key=key))
 
   def to_proto(self):
     # type: (...) -> List[beam_runner_api_pb2.DisplayData]
 
     """Returns a List of Beam proto representation of Display data."""
-    def create_payload(dd):
-      display_data_dict = None
+    def create_payload(dd) -> Optional[beam_runner_api_pb2.LabelledPayload]:
       try:
         display_data_dict = dd.get_dict()
       except ValueError:
@@ -168,7 +173,7 @@ class DisplayData(object):
       elif isinstance(value, (float, complex)):
         return beam_runner_api_pb2.LabelledPayload(
             label=label,
-            double_value=value,
+            double_value=value,  # type: ignore[arg-type]
             key=display_data_dict['key'],
             namespace=display_data_dict.get('namespace', ''))
       else:
@@ -178,12 +183,15 @@ class DisplayData(object):
 
     dd_protos = []
     for dd in self.items:
-      dd_proto = create_payload(dd)
-      if dd_proto:
-        dd_protos.append(
-            beam_runner_api_pb2.DisplayData(
-                urn=common_urns.StandardDisplayData.DisplayData.LABELLED.urn,
-                payload=create_payload(dd).SerializeToString()))
+      if isinstance(dd, beam_runner_api_pb2.DisplayData):
+        dd_protos.append(dd)
+      else:
+        dd_payload = create_payload(dd)
+        if dd_payload:
+          dd_protos.append(
+              beam_runner_api_pb2.DisplayData(
+                  urn=common_urns.StandardDisplayData.DisplayData.LABELLED.urn,
+                  payload=dd_payload.SerializeToString()))
     return dd_protos
 
   @classmethod
@@ -213,10 +221,9 @@ class DisplayData(object):
 
     items = {
         k: (v if DisplayDataItem._get_value_type(v) is not None else str(v))
-        for k,
-        v in pipeline_options.display_data().items()
+        for k, v in pipeline_options.display_data().items()
     }
-    return cls(pipeline_options._namespace(), items)
+    return cls(pipeline_options._get_display_data_namespace(), items)
 
   @classmethod
   def create_from(cls, has_display_data):
@@ -236,7 +243,9 @@ class DisplayData(object):
       raise ValueError(
           'Element of class {}.{} does not subclass HasDisplayData'.format(
               has_display_data.__module__, has_display_data.__class__.__name__))
-    return cls(has_display_data._namespace(), has_display_data.display_data())
+    return cls(
+        has_display_data._get_display_data_namespace(),
+        has_display_data.display_data())
 
 
 class DisplayDataItem(object):

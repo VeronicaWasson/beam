@@ -26,11 +26,12 @@ import org.apache.beam.sdk.io.gcp.spanner.changestreams.dao.PartitionMetadataDao
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.model.ChildPartition;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.model.ChildPartitionsRecord;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.model.PartitionMetadata;
+import org.apache.beam.sdk.io.gcp.spanner.changestreams.restriction.RestrictionInterrupter;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.restriction.TimestampRange;
 import org.apache.beam.sdk.transforms.DoFn.ProcessContinuation;
 import org.apache.beam.sdk.transforms.splittabledofn.ManualWatermarkEstimator;
 import org.apache.beam.sdk.transforms.splittabledofn.RestrictionTracker;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
 import org.joda.time.Instant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -94,28 +95,38 @@ public class ChildPartitionsRecordAction {
    * @param record the change stream child partition record received
    * @param tracker the restriction tracker of the {@link
    *     org.apache.beam.sdk.io.gcp.spanner.changestreams.dofn.ReadChangeStreamPartitionDoFn} SDF
+   * @param interrupter the restriction interrupter suggesting early termination of the processing
    * @param watermarkEstimator the watermark estimator of the {@link
    *     org.apache.beam.sdk.io.gcp.spanner.changestreams.dofn.ReadChangeStreamPartitionDoFn} SDF
    * @return {@link Optional#empty()} if the caller can continue processing more records. A non
    *     empty {@link Optional} with {@link ProcessContinuation#stop()} if this function was unable
-   *     to claim the {@link ChildPartitionsRecord} timestamp
+   *     to claim the {@link ChildPartitionsRecord} timestamp. A non empty {@link Optional} with
+   *     {@link ProcessContinuation#resume()} if this function should commit what has already been
+   *     processed and resume.
    */
   @VisibleForTesting
   public Optional<ProcessContinuation> run(
       PartitionMetadata partition,
       ChildPartitionsRecord record,
       RestrictionTracker<TimestampRange, Timestamp> tracker,
+      RestrictionInterrupter<Timestamp> interrupter,
       ManualWatermarkEstimator<Instant> watermarkEstimator) {
 
     final String token = partition.getPartitionToken();
 
-    LOG.debug("[" + token + "] Processing child partition record " + record);
+    LOG.debug("[{}] Processing child partition record {}", token, record);
 
     final Timestamp startTimestamp = record.getStartTimestamp();
     final Instant startInstant = new Instant(startTimestamp.toSqlTimestamp().getTime());
-    if (!tracker.tryClaim(startTimestamp)) {
+    if (interrupter.tryInterrupt(startTimestamp)) {
       LOG.debug(
-          "[" + token + "] Could not claim queryChangeStream(" + startTimestamp + "), stopping");
+          "[{}] Soft deadline reached with child partitions record at {}, rescheduling",
+          token,
+          startTimestamp);
+      return Optional.of(ProcessContinuation.resume());
+    }
+    if (!tracker.tryClaim(startTimestamp)) {
+      LOG.debug("[{}] Could not claim queryChangeStream({}), stopping", token, startTimestamp);
       return Optional.of(ProcessContinuation.stop());
     }
     watermarkEstimator.setWatermark(startInstant);
@@ -124,7 +135,7 @@ public class ChildPartitionsRecordAction {
       processChildPartition(partition, record, childPartition);
     }
 
-    LOG.debug("[" + token + "] Child partitions action completed successfully");
+    LOG.debug("[{}] Child partitions action completed successfully", token);
     return Optional.empty();
   }
 
@@ -137,11 +148,7 @@ public class ChildPartitionsRecordAction {
     final String childPartitionToken = childPartition.getToken();
     final boolean isSplit = isSplit(childPartition);
     LOG.debug(
-        "["
-            + partitionToken
-            + "] Processing child partition"
-            + (isSplit ? " split" : " merge")
-            + " event");
+        "[{}] Processing child partition {} event", partitionToken, (isSplit ? "split" : "merge"));
 
     final PartitionMetadata row =
         toPartitionMetadata(
@@ -149,7 +156,7 @@ public class ChildPartitionsRecordAction {
             partition.getEndTimestamp(),
             partition.getHeartbeatMillis(),
             childPartition);
-    LOG.debug("[" + partitionToken + "] Inserting child partition token " + childPartitionToken);
+    LOG.debug("[{}] Inserting child partition token {}", partitionToken, childPartitionToken);
     final Boolean insertedRow =
         partitionMetadataDao
             .runInTransaction(
@@ -160,7 +167,8 @@ public class ChildPartitionsRecordAction {
                   } else {
                     return false;
                   }
-                })
+                },
+                "InsertChildPartition")
             .getResult();
     if (insertedRow && isSplit) {
       metrics.incPartitionRecordSplitCount();
@@ -168,11 +176,7 @@ public class ChildPartitionsRecordAction {
       metrics.incPartitionRecordMergeCount();
     } else {
       LOG.debug(
-          "["
-              + partitionToken
-              + "] Child token "
-              + childPartitionToken
-              + " already exists, skipping...");
+          "[{}] Child token {} already exists, skipping...", partitionToken, childPartitionToken);
     }
   }
 

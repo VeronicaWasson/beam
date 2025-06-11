@@ -52,6 +52,7 @@ import software.amazon.awssdk.regions.Region;
 @JsonInclude(value = JsonInclude.Include.NON_EMPTY)
 @JsonDeserialize(builder = ClientConfiguration.Builder.class)
 public abstract class ClientConfiguration implements Serializable {
+  public static final ClientConfiguration EMPTY = ClientConfiguration.builder().build();
 
   /**
    * Optional {@link AwsCredentialsProvider}. If set, this overwrites the default in {@link
@@ -74,6 +75,13 @@ public abstract class ClientConfiguration implements Serializable {
   public @Nullable @Pure Region region() {
     return regionId() != null ? Region.of(regionId()) : null;
   }
+
+  /**
+   * Optional flag to skip certificate verification. Should only be overriden for test scenarios. If
+   * set, this overwrites the default in {@link AwsOptions#skipCertificateVerification()}.
+   */
+  @JsonProperty
+  public abstract @Nullable @Pure Boolean skipCertificateVerification();
 
   /**
    * Optional service endpoint to use AWS compatible services instead, e.g. for testing. If set,
@@ -154,6 +162,13 @@ public abstract class ClientConfiguration implements Serializable {
       retry.accept(builder);
       return retry(builder.build());
     }
+
+    /**
+     * Optional flag to skip certificate verification. Should only be overriden for test scenarios.
+     * If set, this overwrites the default in {@link AwsOptions#skipCertificateVerification()}.
+     */
+    @JsonProperty
+    public abstract Builder skipCertificateVerification(boolean skipCertificateVerification);
 
     abstract Builder regionId(String region);
 

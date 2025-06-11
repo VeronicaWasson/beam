@@ -35,7 +35,7 @@ import java.util.List;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.dao.PartitionMetadataAdminDao;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.model.PartitionMetadata;
 import org.apache.beam.sdk.io.gcp.spanner.changestreams.model.PartitionMetadata.State;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Sets;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Sets;
 
 /** This class is responsible for transforming a {@link Struct} to a {@link PartitionMetadata}. */
 public class PartitionMetadataMapper {
@@ -80,7 +80,10 @@ public class PartitionMetadataMapper {
   public PartitionMetadata from(Struct row) {
     return PartitionMetadata.newBuilder()
         .setPartitionToken(row.getString(COLUMN_PARTITION_TOKEN))
-        .setParentTokens(Sets.newHashSet(row.getStringList(COLUMN_PARENT_TOKENS)))
+        .setParentTokens(
+            !row.isNull(COLUMN_PARENT_TOKENS)
+                ? Sets.newHashSet(row.getStringList(COLUMN_PARENT_TOKENS))
+                : null)
         .setStartTimestamp(row.getTimestamp(COLUMN_START_TIMESTAMP))
         .setEndTimestamp(row.getTimestamp(COLUMN_END_TIMESTAMP))
         .setHeartbeatMillis(row.getLong(COLUMN_HEARTBEAT_MILLIS))

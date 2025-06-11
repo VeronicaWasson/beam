@@ -26,16 +26,11 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import org.apache.beam.runners.core.construction.SplittableParDo;
-import org.apache.beam.runners.core.construction.TransformInputs;
-import org.apache.beam.runners.core.construction.graph.ProjectionPushdownOptimizer;
 import org.apache.beam.runners.core.metrics.MetricsPusher;
-import org.apache.beam.runners.spark.aggregators.AggregatorsAccumulator;
-import org.apache.beam.runners.spark.metrics.AggregatorMetricSource;
-import org.apache.beam.runners.spark.metrics.CompositeSource;
 import org.apache.beam.runners.spark.metrics.MetricsAccumulator;
 import org.apache.beam.runners.spark.metrics.SparkBeamMetricSource;
 import org.apache.beam.runners.spark.translation.EvaluationContext;
+import org.apache.beam.runners.spark.translation.GroupByKeyVisitor;
 import org.apache.beam.runners.spark.translation.SparkContextFactory;
 import org.apache.beam.runners.spark.translation.SparkPipelineTranslator;
 import org.apache.beam.runners.spark.translation.TransformEvaluator;
@@ -56,6 +51,9 @@ import org.apache.beam.sdk.runners.TransformHierarchy;
 import org.apache.beam.sdk.runners.TransformHierarchy.Node;
 import org.apache.beam.sdk.transforms.Combine;
 import org.apache.beam.sdk.transforms.PTransform;
+import org.apache.beam.sdk.util.construction.SplittableParDo;
+import org.apache.beam.sdk.util.construction.TransformInputs;
+import org.apache.beam.sdk.util.construction.graph.ProjectionPushdownOptimizer;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollection.IsBounded;
 import org.apache.beam.sdk.values.PCollectionView;
@@ -63,7 +61,7 @@ import org.apache.beam.sdk.values.PInput;
 import org.apache.beam.sdk.values.POutput;
 import org.apache.beam.sdk.values.PValue;
 import org.apache.beam.sdk.values.TupleTag;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 import org.apache.spark.SparkEnv$;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.metrics.MetricsSystem;
@@ -153,7 +151,7 @@ public final class SparkRunner extends PipelineRunner<SparkPipelineResult> {
     MetricsEnvironment.setMetricsSupported(true);
 
     // visit the pipeline to determine the translation mode
-    detectTranslationMode(pipeline);
+    detectTranslationMode(pipeline, pipelineOptions);
 
     // Default to using the primitive versions of Read.Bounded and Read.Unbounded.
     // TODO(https://github.com/apache/beam/issues/20530): Use SDF read as default when we address
@@ -180,15 +178,12 @@ public final class SparkRunner extends PipelineRunner<SparkPipelineResult> {
       // Checkpoint aggregator/metrics values
       jssc.addStreamingListener(
           new JavaStreamingListenerWrapper(
-              new AggregatorsAccumulator.AccumulatorCheckpointingSparkListener()));
-      jssc.addStreamingListener(
-          new JavaStreamingListenerWrapper(
               new MetricsAccumulator.AccumulatorCheckpointingSparkListener()));
 
       // register user-defined listeners.
       for (JavaStreamingListener listener :
           pipelineOptions.as(SparkContextOptions.class).getListeners()) {
-        LOG.info("Registered listener {}." + listener.getClass().getSimpleName());
+        LOG.info("Registered listener {}.", listener.getClass().getSimpleName());
         jssc.addStreamingListener(new JavaStreamingListenerWrapper(listener));
       }
 
@@ -219,6 +214,10 @@ public final class SparkRunner extends PipelineRunner<SparkPipelineResult> {
 
       // update the cache candidates
       updateCacheCandidates(pipeline, translator, evaluationContext);
+      updateDependentTransforms(pipeline, translator, evaluationContext);
+
+      // update GBK candidates for memory optimized transform
+      pipeline.traverseTopologically(new GroupByKeyVisitor(translator, evaluationContext));
 
       initAccumulators(pipelineOptions, jsc);
       startPipeline =
@@ -252,41 +251,38 @@ public final class SparkRunner extends PipelineRunner<SparkPipelineResult> {
 
   private void registerMetricsSource(String appName) {
     final MetricsSystem metricsSystem = SparkEnv$.MODULE$.get().metricsSystem();
-    final AggregatorMetricSource aggregatorMetricSource =
-        new AggregatorMetricSource(null, AggregatorsAccumulator.getInstance().value());
-    final SparkBeamMetricSource metricsSource = new SparkBeamMetricSource(null);
-    final CompositeSource compositeSource =
-        new CompositeSource(
-            appName + ".Beam",
-            metricsSource.metricRegistry(),
-            aggregatorMetricSource.metricRegistry());
+    final SparkBeamMetricSource metricsSource = new SparkBeamMetricSource(appName + ".Beam");
     // re-register the metrics in case of context re-use
-    metricsSystem.removeSource(compositeSource);
-    metricsSystem.registerSource(compositeSource);
+    metricsSystem.removeSource(metricsSource);
+    metricsSystem.registerSource(metricsSource);
   }
 
   /** Init Metrics/Aggregators accumulators. This method is idempotent. */
   public static void initAccumulators(SparkPipelineOptions opts, JavaSparkContext jsc) {
     // Init metrics accumulators
     MetricsAccumulator.init(opts, jsc);
-    AggregatorsAccumulator.init(opts, jsc);
   }
 
   /** Visit the pipeline to determine the translation mode (batch/streaming). */
-  private void detectTranslationMode(Pipeline pipeline) {
+  static void detectTranslationMode(Pipeline pipeline, SparkPipelineOptions pipelineOptions) {
     TranslationModeDetector detector = new TranslationModeDetector();
     pipeline.traverseTopologically(detector);
     if (detector.getTranslationMode().equals(TranslationMode.STREAMING)) {
       // set streaming mode if it's a streaming pipeline
-      this.pipelineOptions.setStreaming(true);
+      pipelineOptions.setStreaming(true);
     }
   }
 
   /** Evaluator that update/populate the cache candidates. */
   public static void updateCacheCandidates(
       Pipeline pipeline, SparkPipelineTranslator translator, EvaluationContext evaluationContext) {
-    CacheVisitor cacheVisitor = new CacheVisitor(translator, evaluationContext);
-    pipeline.traverseTopologically(cacheVisitor);
+    pipeline.traverseTopologically(new CacheVisitor(translator, evaluationContext));
+  }
+
+  /** Evaluator that update/populate information about dependent transforms for pCollections. */
+  public static void updateDependentTransforms(
+      Pipeline pipeline, SparkPipelineTranslator translator, EvaluationContext evaluationContext) {
+    pipeline.traverseTopologically(new DependentTransformsVisitor(translator, evaluationContext));
   }
 
   /** The translation mode of the Beam Pipeline. */

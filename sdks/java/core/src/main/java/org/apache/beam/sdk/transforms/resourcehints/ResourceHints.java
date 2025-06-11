@@ -17,8 +17,9 @@
  */
 package org.apache.beam.sdk.transforms.resourcehints;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
@@ -27,11 +28,13 @@ import java.util.regex.Pattern;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.model.pipeline.v1.RunnerApi.StandardResourceHints;
 import org.apache.beam.sdk.options.PipelineOptions;
-import org.apache.beam.vendor.grpc.v1p43p2.com.google.protobuf.ProtocolMessageEnum;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Charsets;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Splitter;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.ProtocolMessageEnum;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Splitter;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.checkerframework.checker.nullness.qual.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Pipeline authors can use resource hints to provide additional information to runners about the
@@ -42,8 +45,12 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  * <p>Interpretation of hints is provided by Beam runners.
  */
 public class ResourceHints {
+  private static final Logger LOG = LoggerFactory.getLogger(ResourceHints.class);
   private static final String MIN_RAM_URN = "beam:resources:min_ram_bytes:v1";
   private static final String ACCELERATOR_URN = "beam:resources:accelerator:v1";
+  private static final String CPU_COUNT_URN = "beam:resources:cpu_count:v1";
+  private static final String MAX_ACTIVE_BUNDLES_PER_WORKER =
+      "beam:resources:max_active_bundles_per_worker:v1";
 
   // TODO: reference this from a common location in all packages that use this.
   private static String getUrn(ProtocolMessageEnum value) {
@@ -53,6 +60,10 @@ public class ResourceHints {
   static {
     checkState(MIN_RAM_URN.equals(getUrn(StandardResourceHints.Enum.MIN_RAM_BYTES)));
     checkState(ACCELERATOR_URN.equals(getUrn(StandardResourceHints.Enum.ACCELERATOR)));
+    checkState(CPU_COUNT_URN.equals(getUrn(StandardResourceHints.Enum.CPU_COUNT)));
+    checkState(
+        MAX_ACTIVE_BUNDLES_PER_WORKER.equals(
+            (getUrn(StandardResourceHints.Enum.MAX_ACTIVE_BUNDLES_PER_WORKER))));
   }
 
   private static ImmutableMap<String, String> hintNameToUrn =
@@ -60,12 +71,19 @@ public class ResourceHints {
           .put("minRam", MIN_RAM_URN)
           .put("min_ram", MIN_RAM_URN) // Courtesy alias.
           .put("accelerator", ACCELERATOR_URN)
+          .put("cpuCount", CPU_COUNT_URN)
+          .put("cpu_count", CPU_COUNT_URN) // Courtesy alias.
+          .put("max_active_bundles_per_worker", MAX_ACTIVE_BUNDLES_PER_WORKER)
+          .put("maxActiveBundlesPerWorker", MAX_ACTIVE_BUNDLES_PER_WORKER) // Courtesy alias.
+          .put("max_active_bundle_per_worker", MAX_ACTIVE_BUNDLES_PER_WORKER) // Courtesy alias.
           .build();
 
   private static ImmutableMap<String, Function<String, ResourceHint>> parsers =
       ImmutableMap.<String, Function<String, ResourceHint>>builder()
           .put(MIN_RAM_URN, s -> new BytesHint(BytesHint.parse(s)))
           .put(ACCELERATOR_URN, s -> new StringHint(s))
+          .put(CPU_COUNT_URN, s -> new IntHint(IntHint.parse(s)))
+          .put(MAX_ACTIVE_BUNDLES_PER_WORKER, s -> new IntHint(IntHint.parse(s)))
           .build();
 
   private static final ResourceHints EMPTY = new ResourceHints(ImmutableMap.of());
@@ -103,7 +121,8 @@ public class ResourceHints {
       } else {
         urn = nameOrUrn;
       }
-      ResourceHint value = parsers.getOrDefault(urn, s -> new StringHint(s)).apply(stringValue);
+      ResourceHint value =
+          Preconditions.checkNotNull(parsers.getOrDefault(urn, StringHint::new)).apply(stringValue);
       result = result.withHint(urn, value);
     }
     return result;
@@ -162,13 +181,15 @@ public class ResourceHints {
     }
 
     @Override
-    public ResourceHint mergeWithOuter(ResourceHint outer) {
-      return new BytesHint(Math.max(value, ((BytesHint) outer).value));
+    public ResourceHint mergeWithOuter(ResourceHint outer, boolean isSum) {
+      return isSum
+          ? new BytesHint(value + ((BytesHint) outer).value)
+          : new BytesHint(Math.max(value, ((BytesHint) outer).value));
     }
 
     @Override
     public byte[] toBytes() {
-      return String.valueOf(value).getBytes(Charsets.US_ASCII);
+      return String.valueOf(value).getBytes(StandardCharsets.US_ASCII);
     }
   }
 
@@ -185,7 +206,7 @@ public class ResourceHints {
 
     @Override
     public byte[] toBytes() {
-      return value.getBytes(Charsets.US_ASCII);
+      return value.getBytes(StandardCharsets.US_ASCII);
     }
 
     @Override
@@ -207,8 +228,70 @@ public class ResourceHints {
     }
   }
 
-  /** Sets desired minimal available RAM size to have in transform's execution environment. */
+  /*package*/ static class IntHint extends ResourceHint {
+    private final int value;
+
+    @Override
+    public boolean equals(@Nullable Object other) {
+      if (other == null) {
+        return false;
+      } else if (this == other) {
+        return true;
+      } else if (other instanceof IntHint) {
+        return ((IntHint) other).value == value;
+      } else {
+        return false;
+      }
+    }
+
+    @Override
+    public int hashCode() {
+      return Integer.hashCode(value);
+    }
+
+    public IntHint(int value) {
+      this.value = value;
+    }
+
+    public static int parse(String s) {
+      return Integer.parseInt(s, 10);
+    }
+
+    @Override
+    public ResourceHint mergeWithOuter(ResourceHint outer, boolean isSum) {
+      return isSum
+          ? new IntHint(value + ((IntHint) outer).value)
+          : new IntHint(Math.max(value, ((IntHint) outer).value));
+    }
+
+    @Override
+    public byte[] toBytes() {
+      return String.valueOf(value).getBytes(StandardCharsets.US_ASCII);
+    }
+  }
+
+  /**
+   * Sets desired minimal available RAM size to have in transform's execution environment.
+   *
+   * @param ramBytes specifies a positive RAM size in bytes. A number greater than 2G
+   *     (Integer.MAX_VALUE) is typical.
+   */
   public ResourceHints withMinRam(long ramBytes) {
+    if (ramBytes <= 0L) {
+      // TODO(yathu) ignore invalid value as of Beam v2.47.0. throw error in future version.
+      LOG.error(
+          "Encountered invalid non-positive minimum ram hint value {}.\n"
+              + "Likely cause is an (overflowing) int expression is passed in. "
+              + "The value is ignored. In the future, The method will require an object Long type "
+              + "and throw an IllegalArgumentException for invalid values.",
+          ramBytes);
+      return this;
+    } else if (ramBytes <= Integer.MAX_VALUE) {
+      LOG.warn(
+          "Minimum available RAM size ({}) is set too small.\n"
+              + "Likely cause is an (overflowing) int expression is passed in.",
+          ramBytes);
+    }
     return withHint(MIN_RAM_URN, new BytesHint(ramBytes));
   }
 
@@ -239,6 +322,34 @@ public class ResourceHints {
     return new ResourceHints(newHints.build());
   }
 
+  /**
+   * Sets desired minimal CPU or vCPU count to have in transform's execution environment.
+   *
+   * @param cpuCount specifies a positive CPU count.
+   */
+  public ResourceHints withCPUCount(int cpuCount) {
+    if (cpuCount <= 0) {
+      LOG.error(
+          "Encountered invalid non-positive cpu count hint value {}.\n"
+              + "The value is ignored. In the future, The method will require an object Long type "
+              + "and throw an IllegalArgumentException for invalid values.",
+          cpuCount);
+      return this;
+    }
+    return withHint(CPU_COUNT_URN, new IntHint(cpuCount));
+  }
+
+  public ResourceHints withMaxActiveBundlesPerWorker(int maxActiveBundlesPerWorker) {
+    if (maxActiveBundlesPerWorker <= 0) {
+      LOG.error(
+          "Encountered invalid non-positive max active bundles per worker hint value {}.\n"
+              + "The value is ignored.",
+          maxActiveBundlesPerWorker);
+      return this;
+    }
+    return withHint(MAX_ACTIVE_BUNDLES_PER_WORKER, new IntHint(maxActiveBundlesPerWorker));
+  }
+
   public Map<String, ResourceHint> hints() {
     return hints;
   }
@@ -251,15 +362,19 @@ public class ResourceHints {
     } else {
       ImmutableMap.Builder<String, ResourceHint> newHints = ImmutableMap.builder();
       for (Map.Entry<String, ResourceHint> outerHint : outer.hints().entrySet()) {
-        if (hints.containsKey(outerHint.getKey())) {
+        String key = outerHint.getKey();
+        if (hints.containsKey(key)) {
           newHints.put(
-              outerHint.getKey(),
-              hints.get(outerHint.getKey()).mergeWithOuter(outerHint.getValue()));
+              key,
+              hints
+                  .get(key)
+                  .mergeWithOuter(
+                      outerHint.getValue(), /*isSum*/ key.equals(MAX_ACTIVE_BUNDLES_PER_WORKER)));
         } else {
           newHints.put(outerHint);
         }
       }
-      for (Map.Entry hint : hints.entrySet()) {
+      for (Map.Entry<String, ResourceHint> hint : hints.entrySet()) {
         if (!outer.hints.containsKey(hint.getKey())) {
           newHints.put(hint);
         }

@@ -34,7 +34,6 @@ import org.apache.beam.runners.spark.SparkPipelineResult;
 import org.apache.beam.runners.spark.TestSparkPipelineOptions;
 import org.apache.beam.runners.spark.TestSparkRunner;
 import org.apache.beam.runners.spark.UsesCheckpointRecovery;
-import org.apache.beam.runners.spark.aggregators.AggregatorsAccumulator;
 import org.apache.beam.runners.spark.io.MicrobatchSource;
 import org.apache.beam.runners.spark.metrics.MetricsAccumulator;
 import org.apache.beam.runners.spark.translation.streaming.utils.EmbeddedKafkaCluster;
@@ -68,10 +67,10 @@ import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.PDone;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Optional;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.util.concurrent.Uninterruptibles;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Optional;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.util.concurrent.Uninterruptibles;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.Serializer;
@@ -83,6 +82,7 @@ import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
@@ -145,6 +145,7 @@ public class ResumeFromCheckpointStreamingTest implements Serializable {
 
   @Test
   @Category(UsesCheckpointRecovery.class)
+  @Ignore("Very flaky: https://github.com/apache/beam/issues/34946")
   public void testWithResume() throws Exception {
     // write to Kafka
     produce(
@@ -279,7 +280,7 @@ public class ResumeFromCheckpointStreamingTest implements Serializable {
     options.setExpectedAssertions(expectedAssertions);
     options.setRunner(TestSparkRunner.class);
     options.setEnableSparkMetricSinks(false);
-    options.setForceStreaming(true);
+    options.setStreaming(true);
     options.setCheckpointDir(temporaryFolder.getRoot().getPath());
     // timeout is per execution so it can be injected by the caller.
     if (stopWatermarkOption.isPresent()) {
@@ -314,7 +315,6 @@ public class ResumeFromCheckpointStreamingTest implements Serializable {
 
   @After
   public void clean() {
-    AggregatorsAccumulator.clear();
     MetricsAccumulator.clear();
     GlobalWatermarkHolder.clear();
     MicrobatchSource.clearCache();

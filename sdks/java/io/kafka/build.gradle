@@ -29,72 +29,81 @@ provideIntegrationTestingDependencies()
 enableJavaPerformanceTesting()
 
 description = "Apache Beam :: SDKs :: Java :: IO :: Kafka"
-ext.summary = "Library to read Kafka topics."
+ext {
+    summary = "Library to read Kafka topics."
+    // newer versions e.g. 7.6.* require dropping support for older kafka versions.
+    confluentVersion = "7.5.5"
+}
 
 def kafkaVersions = [
-    '01103': "0.11.0.3",
-    '100': "1.0.0",
-    '111': "1.1.1",
     '201': "2.0.1",
-    '211': "2.1.1",
-    '222': "2.2.2",
     '231': "2.3.1",
     '241': "2.4.1",
     '251': "2.5.1",
-]
-
-def sdfKafkaVersions = [
-        '201',
-        '211',
-        '222',
-        '231',
-        '241',
-        '251'
+    '282': "2.8.2",
+    '312': "3.1.2",
+    '390': "3.9.0",
 ]
 
 kafkaVersions.each{k,v -> configurations.create("kafkaVersion$k")}
 
 dependencies {
-  implementation library.java.vendored_guava_26_0_jre
+  implementation library.java.vendored_guava_32_1_2_jre
   provided library.java.jackson_dataformat_csv
   permitUnusedDeclared library.java.jackson_dataformat_csv
   implementation project(path: ":sdks:java:core", configuration: "shadow")
-  implementation project(":runners:core-construction-java")
+  implementation project(path: ":model:pipeline", configuration: "shadow")
+  implementation project(":sdks:java:extensions:avro")
+  implementation project(":sdks:java:extensions:protobuf")
   implementation project(":sdks:java:expansion-service")
   permitUnusedDeclared project(":sdks:java:expansion-service") // BEAM-11761
   implementation library.java.avro
   // Get back to "provided" since 2.14
   provided library.java.kafka_clients
+  if (JavaVersion.current().compareTo(JavaVersion.VERSION_21) >= 0) {
+    // this dependency is a provided dependency for kafka-avro-serializer. It is not needed to compile with Java<=17
+    // but needed for compile only under Java21, specifically, required for extending from AbstractKafkaAvroDeserializer
+    compileOnly library.java.kafka
+  }
   testImplementation library.java.kafka_clients
+  testImplementation project(path: ":runners:core-java")
   implementation library.java.slf4j_api
   implementation library.java.joda_time
   implementation library.java.jackson_annotations
   implementation library.java.jackson_databind
-  implementation "org.springframework:spring-expression:5.3.18"
-  implementation ("io.confluent:kafka-avro-serializer:5.3.2") {
+  implementation (group: 'com.google.cloud.hosted.kafka', name: 'managed-kafka-auth-login-handler', version: '1.0.5') {
+    // "kafka-clients" has to be provided since user can use its own version.
+    exclude group: 'org.apache.kafka', module: 'kafka-clients'
+  }
+  implementation ("io.confluent:kafka-avro-serializer:${confluentVersion}") {
     // zookeeper depends on "spotbugs-annotations:3.1.9" which clashes with current
     // "spotbugs-annotations:3.1.12" used in Beam. Not required.
     exclude group: "org.apache.zookeeper", module: "zookeeper"
     // "kafka-clients" has to be provided since user can use its own version.
     exclude group: "org.apache.kafka", module: "kafka-clients"
   }
-  implementation ("io.confluent:kafka-schema-registry-client:5.3.2") {
+  implementation ("io.confluent:kafka-schema-registry-client:${confluentVersion}") {
     // It depends on "spotbugs-annotations:3.1.9" which clashes with current
     // "spotbugs-annotations:3.1.12" used in Beam. Not required.
     exclude group: "org.apache.zookeeper", module: "zookeeper"
     // "kafka-clients" has to be provided since user can use its own version.
     exclude group: "org.apache.kafka", module: "kafka-clients"
   }
+  // everit_json is needed for Kafka Read SchemaTransform tests that rely on JSON-schema translation.
+  permitUnusedDeclared library.java.everit_json_schema
+  provided library.java.everit_json_schema
   testImplementation project(path: ":sdks:java:core", configuration: "shadowTest")
   testImplementation project(":sdks:java:io:synthetic")
-  testImplementation project(path: ":sdks:java:io:common", configuration: "testRuntimeMigration")
-  testImplementation project(path: ":sdks:java:testing:test-utils", configuration: "testRuntimeMigration")
+  testImplementation project(":sdks:java:managed")
+  testImplementation project(path: ":sdks:java:extensions:avro", configuration: "testRuntimeMigration")
+  testImplementation project(path: ":sdks:java:extensions:protobuf", configuration: "testRuntimeMigration")
+  testImplementation project(path: ":sdks:java:io:common")
+  testImplementation project(path: ":sdks:java:testing:test-utils")
   // For testing Cross-language transforms
-  testImplementation project(":runners:core-construction-java")
   testImplementation library.java.avro
   testImplementation library.java.junit
-  testImplementation library.java.powermock
-  testImplementation library.java.powermock_mockito
+  testImplementation library.java.mockito_core
+  testRuntimeOnly library.java.mockito_inline
   testImplementation library.java.testcontainers_kafka
   testRuntimeOnly library.java.slf4j_jdk14
   testRuntimeOnly project(path: ":runners:direct-java", configuration: "shadow")
@@ -116,48 +125,24 @@ kafkaVersions.each {kv ->
     outputs.upToDateWhen { false }
     testClassesDirs = sourceSets.test.output.classesDirs
     classpath =  configurations."kafkaVersion${kv.key}" + sourceSets.test.runtimeClasspath
+    systemProperty "beam.target.kafka.version", kv.value
+
     include '**/KafkaIOTest.class'
   }
 }
 
-kafkaVersions.each {kv ->
-  task "kafkaVersion${kv.key}BatchIT"(type: Test) {
-    group = "Verification"
-    description = "Runs KafkaIO IT tests with Kafka clients API $kv.value"
-    outputs.upToDateWhen { false }
-    testClassesDirs = sourceSets.test.output.classesDirs
-    classpath =  configurations."kafkaVersion${kv.key}" + sourceSets.test.runtimeClasspath
-
-    def pipelineOptions = [
-        '--sourceOptions={' +
-            '"numRecords": "1000",' +
-            '"keySizeBytes": "10",' +
-            '"valueSizeBytes": "90"' +
-            '}',
-        "--readTimeout=120",
-        "--kafkaTopic=beam",
-        "--withTestcontainers=true",
-        "--kafkaContainerVersion=5.5.2",
-    ]
-
-    systemProperty "beamTestPipelineOptions", groovy.json.JsonOutput.toJson(pipelineOptions)
-    include '**/KafkaIOIT.class'
-
-    filter {
-      excludeTestsMatching "*InStreaming"
-      if (!(kv.key in sdfKafkaVersions)) excludeTestsMatching "*DynamicPartitions" //admin client create partitions does not exist in kafka 0.11.0.3 and kafka sdf does not appear to work for kafka versions <2.0.1
-      if (!(kv.key in sdfKafkaVersions)) excludeTestsMatching "*SDFResumesCorrectly" //Kafka SDF does not work for kafka versions <2.0.1
-    }
-  }
-}
-
+//Because this runs many integration jobs in parallel, each of which use a
+//container, it can fail locally due to performance limitations on a desktop.
+//To avoid this, use --max-workers=N, where N is less than half your CPUs.
+//4 is a good start for parallelism without overloading your computer.
 task kafkaVersionsCompatibilityTest {
   group = "Verification"
   description = 'Runs KafkaIO with different Kafka client APIs'
   def testNames = createTestList(kafkaVersions, "Test")
-  def batchItTestNames = createTestList(kafkaVersions, "BatchIT")
   dependsOn testNames
-  dependsOn batchItTestNames
+  kafkaVersions.keySet().each {
+    dependsOn (":sdks:java:io:kafka:kafka-${it}:kafkaVersion${it}BatchIT")
+  }
 }
 
 static def createTestList(Map<String, String> prefixMap, String suffix) {

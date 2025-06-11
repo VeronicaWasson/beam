@@ -18,7 +18,10 @@
 """Unit tests for the transform.util classes."""
 
 # pytype: skip-file
+# pylint: disable=too-many-function-args
 
+import collections
+import importlib
 import logging
 import math
 import random
@@ -26,21 +29,29 @@ import re
 import time
 import unittest
 import warnings
+from collections.abc import Mapping
+from datetime import datetime
 
 import pytest
+import pytz
+from parameterized import param
+from parameterized import parameterized
 
 import apache_beam as beam
 from apache_beam import GroupByKey
 from apache_beam import Map
 from apache_beam import WindowInto
 from apache_beam.coders import coders
+from apache_beam.metrics import MetricsFilter
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import StandardOptions
+from apache_beam.options.pipeline_options import TypeOptions
 from apache_beam.portability import common_urns
 from apache_beam.portability.api import beam_runner_api_pb2
 from apache_beam.pvalue import AsList
 from apache_beam.pvalue import AsSingleton
 from apache_beam.runners import pipeline_context
+from apache_beam.testing.synthetic_pipeline import SyntheticSource
 from apache_beam.testing.test_pipeline import TestPipeline
 from apache_beam.testing.test_stream import TestStream
 from apache_beam.testing.util import SortLists
@@ -67,6 +78,9 @@ from apache_beam.utils import proto_utils
 from apache_beam.utils import timestamp
 from apache_beam.utils.timestamp import MAX_TIMESTAMP
 from apache_beam.utils.timestamp import MIN_TIMESTAMP
+from apache_beam.utils.windowed_value import PANE_INFO_UNKNOWN
+from apache_beam.utils.windowed_value import PaneInfo
+from apache_beam.utils.windowed_value import PaneInfoTiming
 from apache_beam.utils.windowed_value import WindowedValue
 
 warnings.filterwarnings(
@@ -185,15 +199,59 @@ class FakeClock(object):
 
 
 class BatchElementsTest(unittest.TestCase):
+  NUM_ELEMENTS = 10
+  BATCH_SIZE = 5
+
+  @staticmethod
+  def _create_test_data():
+    scientists = [
+        "Einstein",
+        "Darwin",
+        "Copernicus",
+        "Pasteur",
+        "Curie",
+        "Faraday",
+        "Newton",
+        "Bohr",
+        "Galilei",
+        "Maxwell"
+    ]
+
+    data = []
+    for i in range(BatchElementsTest.NUM_ELEMENTS):
+      index = i % len(scientists)
+      data.append(scientists[index])
+    return data
+
   def test_constant_batch(self):
     # Assumes a single bundle...
-    with TestPipeline() as p:
-      res = (
-          p
-          | beam.Create(range(35))
-          | util.BatchElements(min_batch_size=10, max_batch_size=10)
-          | beam.Map(len))
-      assert_that(res, equal_to([10, 10, 10, 5]))
+    p = TestPipeline()
+    output = (
+        p
+        | beam.Create(range(35))
+        | util.BatchElements(min_batch_size=10, max_batch_size=10)
+        | beam.Map(len))
+    assert_that(output, equal_to([10, 10, 10, 5]))
+    res = p.run()
+    res.wait_until_finish()
+    metrics = res.metrics()
+    results = metrics.query(MetricsFilter().with_name("batch_size"))
+    self.assertEqual(len(results["distributions"]), 1)
+
+  def test_constant_batch_no_metrics(self):
+    p = TestPipeline()
+    output = (
+        p
+        | beam.Create(range(35))
+        | util.BatchElements(
+            min_batch_size=10, max_batch_size=10, record_metrics=False)
+        | beam.Map(len))
+    assert_that(output, equal_to([10, 10, 10, 5]))
+    res = p.run()
+    res.wait_until_finish()
+    metrics = res.metrics()
+    results = metrics.query(MetricsFilter().with_name("batch_size"))
+    self.assertEqual(len(results["distributions"]), 0)
 
   def test_grows_to_max_batch(self):
     # Assumes a single bundle...
@@ -228,27 +286,92 @@ class BatchElementsTest(unittest.TestCase):
               7,  # elements in [30, 47)
           ]))
 
+  def test_global_batch_timestamps(self):
+    # Assumes a single bundle
+    with TestPipeline() as p:
+      res = (
+          p
+          | beam.Create(range(3), reshuffle=False)
+          | util.BatchElements(min_batch_size=2, max_batch_size=2)
+          | beam.Map(
+              lambda batch, timestamp=beam.DoFn.TimestampParam:
+              (len(batch), timestamp)))
+      assert_that(
+          res,
+          equal_to([
+              (2, GlobalWindow().max_timestamp()),
+              (1, GlobalWindow().max_timestamp()),
+          ]))
+
   def test_sized_batches(self):
     with TestPipeline() as p:
       res = (
           p
-          | beam.Create([
-              'a', 'a', 'aaaaaaaaaa',  # First batch.
-              'aaaaaa', 'aaaaa',       # Second batch.
-              'a', 'aaaaaaa', 'a', 'a' # Third batch.
-              ], reshuffle=False)
+          | beam.Create(
+              [
+                  'a',
+                  'a',  # First batch.
+                  'aaaaaaaaaa',  # Second batch.
+                  'aaaaa',
+                  'aaaaa',  # Third batch.
+                  'a',
+                  'aaaaaaa',
+                  'a',
+                  'a'  # Fourth batch.
+              ],
+              reshuffle=False)
           | util.BatchElements(
               min_batch_size=10, max_batch_size=10, element_size_fn=len)
           | beam.Map(lambda batch: ''.join(batch))
           | beam.Map(len))
-      assert_that(res, equal_to([12, 11, 10]))
+      assert_that(res, equal_to([2, 10, 10, 10]))
+
+  def test_sized_windowed_batches(self):
+    # Assumes a single bundle, in order...
+    with TestPipeline() as p:
+      res = (
+          p
+          | beam.Create(range(1, 8), reshuffle=False)
+          | beam.Map(lambda t: window.TimestampedValue('a' * t, t))
+          | beam.WindowInto(window.FixedWindows(3))
+          | util.BatchElements(
+              min_batch_size=11,
+              max_batch_size=11,
+              element_size_fn=len,
+              clock=FakeClock())
+          | beam.Map(lambda batch: ''.join(batch)))
+      assert_that(
+          res,
+          equal_to([
+              'a' * (1 + 2),  # Elements in [1, 3)
+              'a' * (3 + 4),  # Elements in [3, 6)
+              'a' * 5,
+              'a' * 6,  # Elements in [6, 9)
+              'a' * 7,
+          ]))
 
   def test_target_duration(self):
     clock = FakeClock()
     batch_estimator = util._BatchSizeEstimator(
         target_batch_overhead=None, target_batch_duration_secs=10, clock=clock)
     batch_duration = lambda batch_size: 1 + .7 * batch_size
-    # 1 + 12 * .7 is as close as we can get to 10 as possible.
+    # 14 * .7 is as close as we can get to 10 as possible.
+    expected_sizes = [1, 2, 4, 8, 14, 14, 14]
+    actual_sizes = []
+    for _ in range(len(expected_sizes)):
+      actual_sizes.append(batch_estimator.next_batch_size())
+      with batch_estimator.record_time(actual_sizes[-1]):
+        clock.sleep(batch_duration(actual_sizes[-1]))
+    self.assertEqual(expected_sizes, actual_sizes)
+
+  def test_target_duration_including_fixed_cost(self):
+    clock = FakeClock()
+    batch_estimator = util._BatchSizeEstimator(
+        target_batch_overhead=None,
+        target_batch_duration_secs_including_fixed_cost=10,
+        clock=clock)
+    batch_duration = lambda batch_size: 1 + .7 * batch_size
+    # 1 + 14 * .7 is as close as we can get to 10 as possible.
     expected_sizes = [1, 2, 4, 8, 12, 12, 12]
     actual_sizes = []
     for _ in range(len(expected_sizes)):
@@ -403,6 +526,142 @@ class BatchElementsTest(unittest.TestCase):
     self._run_regression_test(
         util._BatchSizeEstimator.linear_regression_numpy, True)
 
+  def test_stateful_constant_batch(self):
+    # Assumes a single bundle...
+    p = TestPipeline()
+    output = (
+        p
+        | beam.Create(range(35))
+        | util.BatchElements(
+            min_batch_size=10, max_batch_size=10, max_batch_duration_secs=100)
+        | beam.Map(len))
+    assert_that(output, equal_to([10, 10, 10, 5]))
+    res = p.run()
+    res.wait_until_finish()
+
+  def test_stateful_in_global_window(self):
+    with TestPipeline() as pipeline:
+      collection = pipeline \
+                   | beam.Create(
+                     BatchElementsTest._create_test_data()) \
+                   | util.BatchElements(
+                     min_batch_size=BatchElementsTest.BATCH_SIZE,
+                     max_batch_size=BatchElementsTest.BATCH_SIZE,
+                     max_batch_duration_secs=100)
+      num_batches = collection | beam.combiners.Count.Globally()
+      assert_that(
+          num_batches,
+          equal_to([
+              int(
+                  math.ceil(
+                      BatchElementsTest.NUM_ELEMENTS /
+                      BatchElementsTest.BATCH_SIZE))
+          ]))
+
+  def test_stateful_buffering_timer_in_fixed_window_streaming(self):
+    window_duration = 6
+    max_buffering_duration_secs = 100
+
+    start_time = timestamp.Timestamp(0)
+    test_stream = (
+        TestStream().add_elements([
+            TimestampedValue(value, start_time + i)
+            for i, value in enumerate(BatchElementsTest._create_test_data())
+        ]).advance_processing_time(150).advance_watermark_to(
+            start_time + window_duration).advance_watermark_to(
+                start_time + window_duration +
+                1).advance_watermark_to_infinity())
+
+    with TestPipeline(options=StandardOptions(streaming=True)) as pipeline:
+      # To trigger the processing time timer, use a fake clock with start time
+      # being Timestamp(0).
+      fake_clock = FakeClock(now=start_time)
+
+      num_elements_per_batch = (
+          pipeline | test_stream
+          | "fixed window" >> WindowInto(FixedWindows(window_duration))
+          | util.BatchElements(
+              min_batch_size=BatchElementsTest.BATCH_SIZE,
+              max_batch_size=BatchElementsTest.BATCH_SIZE,
+              max_batch_duration_secs=max_buffering_duration_secs,
+              clock=fake_clock)
+          | "count elements in batch" >> Map(lambda x: (None, len(x)))
+          | GroupByKey()
+          | "global window" >> WindowInto(GlobalWindows())
+          | FlatMapTuple(lambda k, vs: vs))
+
+      # Window duration is 6 and batch size is 5, so output batch size
+      # should be 5 (flush because of batch size reached).
+      expected_0 = 5
+      # There is only one element left in the window so batch size
+      # should be 1 (flush because of max buffering duration reached).
+      expected_1 = 1
+      # Collection has 10 elements, there are only 4 left, so batch size should
+      # be 4 (flush because of end of window reached).
+      expected_2 = 4
+      assert_that(
+          num_elements_per_batch,
+          equal_to([expected_0, expected_1, expected_2]),
+          "assert2")
+
+  def test_stateful_buffering_timer_in_global_window_streaming(self):
+    max_buffering_duration_secs = 42
+
+    start_time = timestamp.Timestamp(0)
+    test_stream = TestStream().advance_watermark_to(start_time)
+    for i, value in enumerate(BatchElementsTest._create_test_data()):
+      test_stream.add_elements(
+          [TimestampedValue(value, start_time + i)]) \
+        .advance_processing_time(5)
+    test_stream.advance_watermark_to(
+        start_time + BatchElementsTest.NUM_ELEMENTS + 1) \
+      .advance_watermark_to_infinity()
+
+    with TestPipeline(options=StandardOptions(streaming=True)) as pipeline:
+      # Set a batch size larger than the total number of elements.
+      # Since we're in a global window, we would have been waiting
+      # for all the elements to arrive without the buffering time limit.
+      batch_size = BatchElementsTest.NUM_ELEMENTS * 2
+
+      # To trigger the processing time timer, use a fake clock with start time
+      # being Timestamp(0). Since the fake clock never really advances during
+      # the pipeline execution, meaning that the timer is always set to the same
+      # value, the timer will be fired on every element after the first firing.
+      fake_clock = FakeClock(now=start_time)
+
+      num_elements_per_batch = (
+          pipeline | test_stream
+          | WindowInto(
+              GlobalWindows(),
+              trigger=Repeatedly(AfterCount(1)),
+              accumulation_mode=trigger.AccumulationMode.DISCARDING)
+          | util.BatchElements(
+              min_batch_size=batch_size,
+              max_batch_size=batch_size,
+              max_batch_duration_secs=max_buffering_duration_secs,
+              clock=fake_clock)
+          | 'count elements in batch' >> Map(lambda x: (None, len(x)))
+          | GroupByKey()
+          | FlatMapTuple(lambda k, vs: vs))
+
+      # We will flush twice when the max buffering duration is reached and when
+      # the global window ends.
+      assert_that(num_elements_per_batch, equal_to([9, 1]))
+
+  def test_stateful_grows_to_max_batch(self):
+    # Assumes a single bundle...
+    with TestPipeline() as p:
+      res = (
+          p
+          | beam.Create(range(164))
+          | util.BatchElements(
+              min_batch_size=1,
+              max_batch_size=50,
+              max_batch_duration_secs=100,
+              clock=FakeClock())
+          | beam.Map(len))
+      assert_that(res, equal_to([1, 1, 2, 4, 8, 16, 32, 50, 50]))
+
 
 class IdentityWindowTest(unittest.TestCase):
   def test_window_preserved(self):
@@ -547,15 +806,17 @@ class ReshuffleTest(unittest.TestCase):
     with TestPipeline() as pipeline:
       data = [(1, 1), (2, 1), (3, 1), (1, 2), (2, 2), (1, 4)]
       expected_data = [
-          TestWindowedValue(v, t - .001, [w])
-          for (v, t, w) in [((1, contains_in_any_order([2, 1])),
-                             4.0,
-                             IntervalWindow(1.0, 4.0)),
-                            ((2, contains_in_any_order([2, 1])),
-                             4.0,
+          TestWindowedValue(
+              v,
+              t - .001, [w],
+              pane_info=PaneInfo(True, False, PaneInfoTiming.ON_TIME, 0, 0))
+          for (v, t, w) in [((1, contains_in_any_order([2, 1])), 4.0,
                              IntervalWindow(1.0, 4.0)), (
-                                 (3, [1]), 3.0, IntervalWindow(1.0, 3.0)), (
-                                     (1, [4]), 6.0, IntervalWindow(4.0, 6.0))]
+                                 (2, contains_in_any_order([2, 1])), 4.0,
+                                 IntervalWindow(1.0, 4.0)), ((
+                                     3, [1]), 3.0, IntervalWindow(1.0, 3.0)), ((
+                                         1,
+                                         [4]), 6.0, IntervalWindow(4.0, 6.0))]
       ]
       before_reshuffle = (
           pipeline
@@ -580,25 +841,27 @@ class ReshuffleTest(unittest.TestCase):
     any_order = contains_in_any_order
     with TestPipeline() as pipeline:
       data = [(1, 1), (2, 1), (3, 1), (1, 2), (2, 2), (1, 4)]
+
       expected_windows = [
           TestWindowedValue(v, t, [w])
-          for (v, t, w) in [((1, 1), 1.0, IntervalWindow(1.0, 3.0)), (
-              (2, 1), 1.0, IntervalWindow(1.0, 3.0)), (
-                  (3, 1), 1.0, IntervalWindow(1.0, 3.0)), (
-                      (1, 2), 2.0, IntervalWindow(2.0, 4.0)), (
+          for (v, t, w) in [((1, 1), 1.0, IntervalWindow(1.0, 3.0)), ((
+              2, 1), 1.0, IntervalWindow(1.0, 3.0)), ((
+                  3, 1), 1.0, IntervalWindow(1.0, 3.0)), ((
+                      1, 2), 2.0, IntervalWindow(2.0, 4.0)), (
                           (2, 2), 2.0,
-                          IntervalWindow(2.0, 4.0)), ((1, 4),
-                                                      4.0,
+                          IntervalWindow(2.0, 4.0)), ((1, 4), 4.0,
                                                       IntervalWindow(4.0, 6.0))]
       ]
       expected_merged_windows = [
-          TestWindowedValue(v, t - .001, [w])
+          TestWindowedValue(
+              v,
+              t - .001, [w],
+              pane_info=PaneInfo(True, False, PaneInfoTiming.ON_TIME, 0, 0))
           for (v, t,
                w) in [((1, any_order([2, 1])), 4.0, IntervalWindow(1.0, 4.0)), (
                    (2, any_order([2, 1])), 4.0, IntervalWindow(1.0, 4.0)), (
                        (3, [1]), 3.0,
-                       IntervalWindow(1.0, 3.0)), ((1, [4]),
-                                                   6.0,
+                       IntervalWindow(1.0, 3.0)), ((1, [4]), 6.0,
                                                    IntervalWindow(4.0, 6.0))]
       ]
       before_reshuffle = (
@@ -696,6 +959,187 @@ class ReshuffleTest(unittest.TestCase):
       assert_that(
           after_reshuffle, equal_to(expected_data), label='after reshuffle')
 
+  @parameterized.expand([
+      param(compat_version=None),
+      param(compat_version="2.64.0"),
+  ])
+  def test_reshuffle_custom_window_preserves_metadata(self, compat_version):
+    """Tests that Reshuffle preserves pane info."""
+    element_count = 12
+    timestamp_value = timestamp.Timestamp(0)
+    l = [
+        TimestampedValue(("key", i), timestamp_value)
+        for i in range(element_count)
+    ]
+
+    expected_timestamp = GlobalWindow().max_timestamp()
+    expected = [
+        TestWindowedValue(
+            ('key', [0, 1, 2]),
+            expected_timestamp,
+            [GlobalWindow()],
+            pane_info=PaneInfo(
+                is_first=True,
+                is_last=False,
+                timing=PaneInfoTiming.EARLY,  # 0
+                index=0,
+                nonspeculative_index=-1)),
+        TestWindowedValue(
+            ('key', [3, 4, 5]),
+            expected_timestamp,
+            [GlobalWindow()],
+            pane_info=PaneInfo(
+                is_first=False,
+                is_last=False,
+                timing=PaneInfoTiming.EARLY,  # 0
+                index=1,
+                nonspeculative_index=-1)),
+        TestWindowedValue(
+            ('key', [6, 7, 8]),
+            expected_timestamp,
+            [GlobalWindow()],
+            pane_info=PaneInfo(
+                is_first=False,
+                is_last=False,
+                timing=PaneInfoTiming.EARLY,  # 0
+                index=2,
+                nonspeculative_index=-1)),
+        TestWindowedValue(
+            ('key', [9, 10, 11]),
+            expected_timestamp,
+            [GlobalWindow()],
+            pane_info=PaneInfo(
+                is_first=False,
+                is_last=False,
+                timing=PaneInfoTiming.EARLY,  # 0
+                index=3,
+                nonspeculative_index=-1))
+    ] if compat_version is None else ([
+        TestWindowedValue(('key', [0, 1, 2]),
+                          expected_timestamp, [GlobalWindow()],
+                          PANE_INFO_UNKNOWN),
+        TestWindowedValue(('key', [3, 4, 5]),
+                          expected_timestamp, [GlobalWindow()],
+                          PANE_INFO_UNKNOWN),
+        TestWindowedValue(('key', [6, 7, 8]),
+                          expected_timestamp, [GlobalWindow()],
+                          PANE_INFO_UNKNOWN),
+        TestWindowedValue(('key', [9, 10, 11]),
+                          expected_timestamp, [GlobalWindow()],
+                          PANE_INFO_UNKNOWN)
+    ])
+
+    options = PipelineOptions(update_compatibility_version=compat_version)
+    options.view_as(StandardOptions).streaming = True
+
+    with beam.Pipeline(options=options) as p:
+      stream_source = (
+          TestStream().advance_watermark_to(0).advance_processing_time(
+              100).add_elements(l[:element_count // 4]).advance_processing_time(
+                  100).advance_watermark_to(100).add_elements(
+                      l[element_count // 4:2 * element_count // 4]).
+          advance_processing_time(100).advance_watermark_to(200).add_elements(
+              l[2 * element_count // 4:3 * element_count //
+                4]).advance_processing_time(
+                    100).advance_watermark_to(300).add_elements(
+                        l[3 * element_count // 4:]).advance_processing_time(
+                            100).advance_watermark_to_infinity())
+      grouped = (
+          p | stream_source
+          | "Rewindow" >> beam.WindowInto(
+              beam.window.GlobalWindows(),
+              trigger=trigger.Repeatedly(trigger.AfterProcessingTime(1)),
+              accumulation_mode=trigger.AccumulationMode.DISCARDING)
+          | beam.GroupByKey())
+
+      after_reshuffle = (grouped | 'Reshuffle' >> beam.Reshuffle())
+
+      assert_that(
+          after_reshuffle,
+          equal_to(expected),
+          label='CheckMetadataPreserved',
+          reify_windows=True)
+
+  @parameterized.expand([
+      param(compat_version=None),
+      param(compat_version="2.64.0"),
+  ])
+  def test_reshuffle_default_window_preserves_metadata(self, compat_version):
+    """Tests that Reshuffle preserves timestamp, window, and pane info
+    metadata."""
+
+    no_firing = PaneInfo(
+        is_first=True,
+        is_last=True,
+        timing=PaneInfoTiming.UNKNOWN,
+        index=0,
+        nonspeculative_index=0)
+
+    on_time_only = PaneInfo(
+        is_first=True,
+        is_last=True,
+        timing=PaneInfoTiming.ON_TIME,
+        index=0,
+        nonspeculative_index=0)
+
+    late_firing = PaneInfo(
+        is_first=False,
+        is_last=False,
+        timing=PaneInfoTiming.LATE,
+        index=1,
+        nonspeculative_index=1)
+
+    expected_preserved = [
+        TestWindowedValue('a', MIN_TIMESTAMP, [GlobalWindow()], no_firing),
+        TestWindowedValue(
+            'b', timestamp.Timestamp(0), [GlobalWindow()], on_time_only),
+        TestWindowedValue(
+            'c', timestamp.Timestamp(33), [GlobalWindow()], late_firing),
+        TestWindowedValue(
+            'd', GlobalWindow().max_timestamp(), [GlobalWindow()], no_firing)
+    ]
+
+    expected_not_preserved = [
+        TestWindowedValue(
+            'a', MIN_TIMESTAMP, [GlobalWindow()], PANE_INFO_UNKNOWN),
+        TestWindowedValue(
+            'b', timestamp.Timestamp(0), [GlobalWindow()], PANE_INFO_UNKNOWN),
+        TestWindowedValue(
+            'c', timestamp.Timestamp(33), [GlobalWindow()], PANE_INFO_UNKNOWN),
+        TestWindowedValue(
+            'd',
+            GlobalWindow().max_timestamp(), [GlobalWindow()],
+            PANE_INFO_UNKNOWN)
+    ]
+
+    expected = (
+        expected_preserved
+        if compat_version is None else expected_not_preserved)
+
+    options = PipelineOptions(update_compatibility_version=compat_version)
+    with TestPipeline(options=options) as pipeline:
+      # Create windowed values with specific metadata
+      elements = [
+          WindowedValue('a', MIN_TIMESTAMP, [GlobalWindow()], no_firing),
+          WindowedValue(
+              'b', timestamp.Timestamp(0), [GlobalWindow()], on_time_only),
+          WindowedValue(
+              'c', timestamp.Timestamp(33), [GlobalWindow()], late_firing),
+          WindowedValue(
+              'd', GlobalWindow().max_timestamp(), [GlobalWindow()], no_firing)
+      ]
+
+      after_reshuffle = (
+          pipeline
+          | 'Create' >> beam.Create(elements)
+          | 'Reshuffle' >> beam.Reshuffle())
+
+      assert_that(
+          after_reshuffle,
+          equal_to(expected),
+          label='CheckMetadataPreserved',
+          reify_windows=True)
+
   @pytest.mark.it_validatesrunner
   def test_reshuffle_preserves_timestamps(self):
     with TestPipeline() as pipeline:
@@ -764,6 +1208,82 @@ class ReshuffleTest(unittest.TestCase):
           equal_to(expected_data),
           label="formatted_after_reshuffle")
 
+  global _Unpicklable
+  global _UnpicklableCoder
+
+  class _Unpicklable(object):
+    def __init__(self, value):
+      self.value = value
+
+    def __getstate__(self):
+      raise NotImplementedError()
+
+    def __setstate__(self, state):
+      raise NotImplementedError()
+
+  class _UnpicklableCoder(beam.coders.Coder):
+    def encode(self, value):
+      return str(value.value).encode()
+
+    def decode(self, encoded):
+      return _Unpicklable(int(encoded.decode()))
+
+    def to_type_hint(self):
+      return _Unpicklable
+
+    def is_deterministic(self):
+      return True
+
+  def reshuffle_unpicklable_in_global_window_helper(
+      self, update_compatibility_version=None):
+    with TestPipeline(options=PipelineOptions(
+        update_compatibility_version=update_compatibility_version)) as pipeline:
+      data = [_Unpicklable(i) for i in range(5)]
+      expected_data = [0, 10, 20, 30, 40]
+      result = (
+          pipeline
+          | beam.Create(data)
+          | beam.WindowInto(GlobalWindows())
+          | beam.Reshuffle()
+          | beam.Map(lambda u: u.value * 10))
+      assert_that(result, equal_to(expected_data))
+
+  def test_reshuffle_unpicklable_in_global_window(self):
+    beam.coders.registry.register_coder(_Unpicklable, _UnpicklableCoder)
+
+    self.reshuffle_unpicklable_in_global_window_helper()
+    # An exception is raised when running reshuffle on unpicklable objects
+    # prior to 2.64.0
+    self.assertRaises(
+        RuntimeError,
+        self.reshuffle_unpicklable_in_global_window_helper,
+        "2.63.0")
+
+  def reshuffle_unpicklable_in_non_global_window_helper(
+      self, update_compatibility_version=None):
+    with TestPipeline(options=PipelineOptions(
+        update_compatibility_version=update_compatibility_version)) as pipeline:
+      data = [_Unpicklable(i) for i in range(5)]
+      expected_data = [0, 0, 0, 10, 10, 10, 20, 20, 20, 30, 30, 30, 40, 40, 40]
+      result = (
+          pipeline
+          | beam.Create(data)
+          | beam.WindowInto(window.SlidingWindows(size=3, period=1))
+          | beam.Reshuffle()
+          | beam.Map(lambda u: u.value * 10))
+      assert_that(result, equal_to(expected_data))
+
+  def test_reshuffle_unpicklable_in_non_global_window(self):
+    beam.coders.registry.register_coder(_Unpicklable, _UnpicklableCoder)
+
+    self.reshuffle_unpicklable_in_non_global_window_helper()
+    # An exception is raised when running reshuffle on unpicklable objects
+    # prior to 2.64.0
+    self.assertRaises(
+        RuntimeError,
+        self.reshuffle_unpicklable_in_non_global_window_helper,
+        "2.63.0")
+
 
 class WithKeysTest(unittest.TestCase):
   def setUp(self):
@@ -773,13 +1293,14 @@ class WithKeysTest(unittest.TestCase):
     with TestPipeline() as p:
       pc = p | beam.Create(self.l)
       with_keys = pc | util.WithKeys('k')
-    assert_that(with_keys, equal_to([('k', 1), ('k', 2), ('k', 3)], ))
+      assert_that(with_keys, equal_to([('k', 1), ('k', 2), ('k', 3)],
+                                      ))
 
   def test_callable_k(self):
     with TestPipeline() as p:
       pc = p | beam.Create(self.l)
       with_keys = pc | util.WithKeys(lambda x: x * x)
-    assert_that(with_keys, equal_to([(1, 1), (4, 2), (9, 3)]))
+      assert_that(with_keys, equal_to([(1, 1), (4, 2), (9, 3)]))
 
   @staticmethod
   def _test_args_kwargs_fn(x, multiply, subtract):
@@ -790,7 +1311,7 @@ class WithKeysTest(unittest.TestCase):
       pc = p | beam.Create(self.l)
       with_keys = pc | util.WithKeys(
           WithKeysTest._test_args_kwargs_fn, 2, subtract=1)
-    assert_that(with_keys, equal_to([(1, 1), (3, 2), (5, 3)]))
+      assert_that(with_keys, equal_to([(1, 1), (3, 2), (5, 3)]))
 
   def test_sideinputs(self):
     with TestPipeline() as p:
@@ -798,12 +1319,10 @@ class WithKeysTest(unittest.TestCase):
       si1 = AsList(p | "side input 1" >> beam.Create([1, 2, 3]))
       si2 = AsSingleton(p | "side input 2" >> beam.Create([10]))
       with_keys = pc | util.WithKeys(
-          lambda x,
-          the_list,
-          the_singleton: x + sum(the_list) + the_singleton,
+          lambda x, the_list, the_singleton: x + sum(the_list) + the_singleton,
           si1,
           the_singleton=si2)
-    assert_that(with_keys, equal_to([(17, 1), (18, 2), (19, 3)]))
+      assert_that(with_keys, equal_to([(17, 1), (18, 2), (19, 3)]))
 
 
 class GroupIntoBatchesTest(unittest.TestCase):
@@ -846,6 +1365,19 @@ class GroupIntoBatchesTest(unittest.TestCase):
                       GroupIntoBatchesTest.BATCH_SIZE))
           ]))
 
+  def test_in_global_window_with_synthetic_source(self):
+    with beam.Pipeline() as pipeline:
+      collection = (
+          pipeline
+          | beam.io.Read(
+              SyntheticSource({
+                  "numRecords": 10, "keySizeBytes": 1, "valueSizeBytes": 1
+              }))
+          | "identical keys" >> beam.Map(lambda x: (None, x[1]))
+          | "Group key" >> beam.GroupIntoBatches(2)
+          | "count size" >> beam.Map(lambda x: len(x[1])))
+      assert_that(collection, equal_to([2, 2, 2, 2, 2]))
+
   def test_with_sharded_key_in_global_window(self):
     with TestPipeline() as pipeline:
       collection = (
@@ -870,8 +1402,8 @@ class GroupIntoBatchesTest(unittest.TestCase):
     start_time = timestamp.Timestamp(0)
     test_stream = (
         TestStream().add_elements([
-            TimestampedValue(value, start_time + i) for i,
-            value in enumerate(GroupIntoBatchesTest._create_test_data())
+            TimestampedValue(value, start_time + i)
+            for i, value in enumerate(GroupIntoBatchesTest._create_test_data())
         ]).advance_processing_time(150).advance_watermark_to(
             start_time + window_duration).advance_watermark_to(
                 start_time + window_duration +
@@ -971,6 +1503,24 @@ class GroupIntoBatchesTest(unittest.TestCase):
               ShardedKeyType[typehints.Tuple[int, int]],  # type: ignore[misc]
               typehints.Iterable[str]])
 
+  def test_runtime_type_check(self):
+    options = PipelineOptions()
+    options.view_as(TypeOptions).runtime_type_check = True
+    with TestPipeline(options=options) as pipeline:
+      collection = (
+          pipeline
+          | beam.Create(GroupIntoBatchesTest._create_test_data())
+          | util.GroupIntoBatches(GroupIntoBatchesTest.BATCH_SIZE))
+      num_batches = collection | beam.combiners.Count.Globally()
+      assert_that(
+          num_batches,
+          equal_to([
+              int(
+                  math.ceil(
+                      GroupIntoBatchesTest.NUM_ELEMENTS /
+                      GroupIntoBatchesTest.BATCH_SIZE))
+          ]))
+
   def _test_runner_api_round_trip(self, transform, urn):
     context = pipeline_context.PipelineContext()
     proto = transform.to_runner_api(context)
@@ -1044,6 +1594,71 @@ class ToStringTest(unittest.TestCase):
       result = (
           p | beam.Create([("one", 1), ("two", 2)]) | util.ToString.Kvs(""))
       assert_that(result, equal_to(["one1", "two2"]))
+
+
+class LogElementsTest(unittest.TestCase):
+  @pytest.fixture(scope="function")
+  def _capture_stdout_log(request, capsys):
+    with TestPipeline() as p:
+      result = (
+          p | beam.Create([
+              TimestampedValue(
+                  "event",
+                  datetime(2022, 10, 1, 0, 0, 0, 0,
+                           tzinfo=pytz.UTC).timestamp()),
+              TimestampedValue(
+                  "event",
+                  datetime(2022, 10, 2, 0, 0, 0, 0,
+                           tzinfo=pytz.UTC).timestamp()),
+          ])
+          | beam.WindowInto(FixedWindows(60))
+          | util.LogElements(
+              prefix='prefix_', with_window=True, with_timestamp=True))
+
+    request.captured_stdout = capsys.readouterr().out
+    return result
+
+  @pytest.mark.usefixtures("_capture_stdout_log")
+  def test_stdout_logs(self):
+    assert self.captured_stdout == \
+      ("prefix_event, timestamp='2022-10-01T00:00:00Z', "
+       "window(start=2022-10-01T00:00:00Z, end=2022-10-01T00:01:00Z)\n"
+       "prefix_event, timestamp='2022-10-02T00:00:00Z', "
+       "window(start=2022-10-02T00:00:00Z, end=2022-10-02T00:01:00Z)\n"), \
+      f'Received from stdout: {self.captured_stdout}'
+
+  def test_ptransform_output(self):
+    with TestPipeline() as p:
+      result = (
+          p
+          | beam.Create(['a', 'b', 'c'])
+          | util.LogElements(prefix='prefix_'))
+      assert_that(result, equal_to(['a', 'b', 'c']))
+
+  @pytest.fixture(scope="function")
+  def _capture_logs(request, caplog):
+    with caplog.at_level(logging.INFO):
+      with TestPipeline() as p:
+        _ = (
+            p | "info" >> beam.Create(["element"])
+            | "I" >> beam.LogElements(prefix='info_', level=logging.INFO))
+        _ = (
+            p | "warning" >> beam.Create(["element"])
+            | "W" >> beam.LogElements(prefix='warning_', level=logging.WARNING))
+        _ = (
+            p | "error" >> beam.Create(["element"])
+            | "E" >> beam.LogElements(prefix='error_', level=logging.ERROR))
+
+    request.captured_log = caplog.text
+
+  @pytest.mark.usefixtures("_capture_logs")
+  def test_setting_level_uses_appropriate_log_channel(self):
+    self.assertTrue(
+        re.compile('INFO(.*)info_element').search(self.captured_log))
+    self.assertTrue(
+        re.compile('WARNING(.*)warning_element').search(self.captured_log))
+    self.assertTrue(
+        re.compile('ERROR(.*)error_element').search(self.captured_log))
 
 
 class ReifyTest(unittest.TestCase):
@@ -1471,6 +2086,61 @@ class RegexTest(unittest.TestCase):
           "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog"
       ]]
       assert_that(result, equal_to(expected_result))
+
+
+class TeeTest(unittest.TestCase):
+  _side_effects: Mapping[str, int] = collections.defaultdict(int)
+
+  def test_tee(self):
+    # The imports here are to avoid issues with the class (and its attributes)
+    # possibly being pickled rather than referenced.
+    def cause_side_effect(element):
+      importlib.import_module(__name__).TeeTest._side_effects[element] += 1
+
+    def count_side_effects(element):
+      return importlib.import_module(__name__).TeeTest._side_effects[element]
+
+    with TestPipeline() as p:
+      result = (
+          p
+          | beam.Create(['a', 'b', 'c'])
+          | 'TeePTransform' >> beam.Tee(beam.Map(cause_side_effect))
+          | 'TeeCallable' >> beam.Tee(
+              lambda pcoll: pcoll | beam.Map(
+                  lambda element: cause_side_effect('X' + element))))
+      assert_that(result, equal_to(['a', 'b', 'c']))
+
+    self.assertEqual(count_side_effects('a'), 1)
+    self.assertEqual(count_side_effects('Xa'), 1)
+
+
+class WaitOnTest(unittest.TestCase):
+  def test_find(self):
+    # We need shared reference that survives pickling.
+    def increment_global_counter():
+      try:
+        value = getattr(beam, '_WAIT_ON_TEST_COUNTER', 0)
+        return value
+      finally:
+        setattr(beam, '_WAIT_ON_TEST_COUNTER', value + 1)
+
+    def record(tag):
+      return f'Record({tag})' >> beam.Map(
+          lambda x: (x[0], tag, increment_global_counter()))
+
+    with TestPipeline() as p:
+      start = p | beam.Create([(None, ), (None, )])
+      x = start | record('x')
+      y = start | 'WaitForX' >> util.WaitOn(x) | record('y')
+      z = start | 'WaitForY' >> util.WaitOn(y) | record('z')
+      result = x | 'WaitForYZ' >> util.WaitOn(y, z) | record('result')
+      assert_that(x, equal_to([(None, 'x', 0), (None, 'x', 1)]), label='x')
+      assert_that(y, equal_to([(None, 'y', 2), (None, 'y', 3)]), label='y')
+      assert_that(z, equal_to([(None, 'z', 4), (None, 'z', 5)]), label='z')
+      assert_that(
+          result,
+          equal_to([(None, 'result', 6), (None, 'result', 7)]),
+          label='result')
 
 
 if __name__ == '__main__':

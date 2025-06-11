@@ -18,13 +18,10 @@
 package org.apache.beam.sdk.options;
 
 import java.util.List;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.options.Validation.Required;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /** Pipeline options common to all portable runners. */
-@Experimental(Kind.PORTABILITY)
 public interface PortablePipelineOptions extends PipelineOptions, FileStagingOptions {
 
   @Description(
@@ -101,7 +98,7 @@ public interface PortablePipelineOptions extends PipelineOptions, FileStagingOpt
 
   @Description(
       "Options for configuring the default environment of portable workers. This environment will be used for all executable stages except for external transforms. Recognized options depend on the value of defaultEnvironmentType:\n"
-          + "DOCKER: docker_container_image (optional), e.g. 'apache/beam_java8_sdk:latest'. If unset, will default to the latest official release of the Beam Java SDK corresponding to your Java runtime version (8 or 11).\n"
+          + "DOCKER: docker_container_image (optional), e.g. 'apache/beam_java21_sdk:latest'. If unset, will default to the latest official release of the Beam Java SDK corresponding to your Java runtime version (11, 17 or 21).\n"
           + "EXTERNAL: external_service_address (required), e.g. 'localhost:50000'\n"
           + "PROCESS: process_command (required), process_variables (optional). process_command must be the location of an executable file that starts a Beam SDK worker. process_variables is a comma-separated list of environment variable assignments which will be set before running the process, e.g. 'FOO=a,BAR=b'\n\n"
           + "environmentOptions and defaultEnvironmentConfig are mutually exclusive. Prefer environmentOptions.")
@@ -126,4 +123,21 @@ public interface PortablePipelineOptions extends PipelineOptions, FileStagingOpt
 
     return "";
   }
+
+  /**
+   * If {@literal true} and PipelineOption tempLocation is set, save a heap dump before shutting
+   * down the JVM due to GC thrashing or out of memory. The heap will be dumped to local disk and
+   * then uploaded to the tempLocation.
+   *
+   * <p>CAUTION: Heap dumps can take up more disk than the JVM memory. Ensure the local disk is
+   * configured to have sufficient free space before enabling this option.
+   */
+  @Description(
+      "If {@literal true} and PipelineOption tempLocation is set, save a heap dump before shutting"
+          + " down the JVM due to GC thrashing or out of memory. The heap will be dumped to local"
+          + " disk and then uploaded to the tempLocation.")
+  @Default.Boolean(false)
+  boolean getEnableHeapDumps();
+
+  void setEnableHeapDumps(boolean enableHeapDumps);
 }

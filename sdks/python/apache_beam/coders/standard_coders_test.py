@@ -29,7 +29,9 @@ from copy import deepcopy
 from typing import Dict
 from typing import Tuple
 
+import numpy as np
 import yaml
+from numpy.testing import assert_array_equal
 
 from apache_beam.coders import coder_impl
 from apache_beam.portability.api import beam_runner_api_pb2
@@ -137,65 +139,48 @@ class StandardCodersTest(unittest.TestCase):
       'beam:coder:bool:v1': lambda x: x,
       'beam:coder:string_utf8:v1': lambda x: x,
       'beam:coder:varint:v1': lambda x: x,
-      'beam:coder:kv:v1': lambda x,
-      key_parser,
-      value_parser: (key_parser(x['key']), value_parser(x['value'])),
+      'beam:coder:kv:v1': lambda x, key_parser, value_parser:
+      (key_parser(x['key']), value_parser(x['value'])),
       'beam:coder:interval_window:v1': lambda x: IntervalWindow(
-          start=Timestamp(micros=(x['end'] - x['span']) * 1000),
-          end=Timestamp(micros=x['end'] * 1000)),
-      'beam:coder:iterable:v1': lambda x,
-      parser: list(map(parser, x)),
-      'beam:coder:state_backed_iterable:v1': lambda x,
-      parser: list(map(parser, x)),
+          start=Timestamp(micros=(x['end'] - x['span']) * 1000), end=Timestamp(
+              micros=x['end'] * 1000)),
+      'beam:coder:iterable:v1': lambda x, parser: list(map(parser, x)),
+      'beam:coder:state_backed_iterable:v1': lambda x, parser: list(
+          map(parser, x)),
       'beam:coder:global_window:v1': lambda x: window.GlobalWindow(),
-      'beam:coder:windowed_value:v1': lambda x,
-      value_parser,
+      'beam:coder:windowed_value:v1': lambda x, value_parser, window_parser:
+      windowed_value.create(
+          value_parser(x['value']), x['timestamp'] * 1000, tuple(
+              window_parser(w) for w in x['windows'])),
+      'beam:coder:param_windowed_value:v1': lambda x, value_parser,
       window_parser: windowed_value.create(
-          value_parser(x['value']),
-          x['timestamp'] * 1000,
-          tuple(window_parser(w) for w in x['windows'])),
-      'beam:coder:param_windowed_value:v1': lambda x,
-      value_parser,
-      window_parser: windowed_value.create(
-          value_parser(x['value']),
-          x['timestamp'] * 1000,
-          tuple(window_parser(w) for w in x['windows']),
-          PaneInfo(
-              x['pane']['is_first'],
-              x['pane']['is_last'],
-              PaneInfoTiming.from_string(x['pane']['timing']),
-              x['pane']['index'],
-              x['pane']['on_time_index'])),
-      'beam:coder:timer:v1': lambda x,
-      value_parser,
-      window_parser: userstate.Timer(
-          user_key=value_parser(x['userKey']),
-          dynamic_timer_tag=x['dynamicTimerTag'],
-          clear_bit=x['clearBit'],
-          windows=tuple(window_parser(w) for w in x['windows']),
-          fire_timestamp=None,
-          hold_timestamp=None,
-          paneinfo=None) if x['clearBit'] else userstate.Timer(
-              user_key=value_parser(x['userKey']),
-              dynamic_timer_tag=x['dynamicTimerTag'],
-              clear_bit=x['clearBit'],
-              fire_timestamp=Timestamp(micros=x['fireTimestamp'] * 1000),
-              hold_timestamp=Timestamp(micros=x['holdTimestamp'] * 1000),
-              windows=tuple(window_parser(w) for w in x['windows']),
-              paneinfo=PaneInfo(
-                  x['pane']['is_first'],
-                  x['pane']['is_last'],
-                  PaneInfoTiming.from_string(x['pane']['timing']),
-                  x['pane']['index'],
-                  x['pane']['on_time_index'])),
+          value_parser(x['value']), x['timestamp'] * 1000, tuple(
+              window_parser(w) for w in x['windows']), PaneInfo(
+                  x['pane']['is_first'], x['pane']['is_last'], PaneInfoTiming.
+                  from_string(x['pane']['timing']), x['pane']['index'], x[
+                      'pane']['on_time_index'])),
+      'beam:coder:timer:v1': lambda x, value_parser, window_parser: userstate.
+      Timer(
+          user_key=value_parser(x['userKey']), dynamic_timer_tag=x[
+              'dynamicTimerTag'], clear_bit=x['clearBit'], windows=tuple(
+                  window_parser(w) for w in x['windows']), fire_timestamp=None,
+          hold_timestamp=None, paneinfo=None)
+      if x['clearBit'] else userstate.Timer(
+          user_key=value_parser(x['userKey']), dynamic_timer_tag=x[
+              'dynamicTimerTag'], clear_bit=x['clearBit'], fire_timestamp=
+          Timestamp(micros=x['fireTimestamp'] * 1000), hold_timestamp=Timestamp(
+              micros=x['holdTimestamp'] * 1000), windows=tuple(
+                  window_parser(w) for w in x['windows']), paneinfo=PaneInfo(
+                      x['pane']['is_first'], x['pane']['is_last'],
+                      PaneInfoTiming.from_string(x['pane']['timing']), x[
+                          'pane']['index'], x['pane']['on_time_index'])),
       'beam:coder:double:v1': parse_float,
-      'beam:coder:sharded_key:v1': lambda x,
-      value_parser: ShardedKey(
+      'beam:coder:sharded_key:v1': lambda x, value_parser: ShardedKey(
           key=value_parser(x['key']), shard_id=x['shardId'].encode('utf-8')),
-      'beam:coder:custom_window:v1': lambda x,
-      window_parser: window_parser(x['window']),
-      'beam:coder:nullable:v1': lambda x,
-      value_parser: x.encode('utf-8') if x else None
+      'beam:coder:custom_window:v1': lambda x, window_parser: window_parser(
+          x['window']),
+      'beam:coder:nullable:v1': lambda x, value_parser: x.encode('utf-8')
+      if x else None
   }
 
   def test_standard_coders(self):
@@ -230,6 +215,29 @@ class StandardCodersTest(unittest.TestCase):
           # Only verify decoding for a non-deterministic coder
           self.assertEqual(
               decode_nested(coder, expected_encoded, nested), value)
+
+    if spec['coder']['urn'] == 'beam:coder:row:v1':
+      # Test batch encoding/decoding as well.
+      values = [
+          parse_value(json_value) for json_value in spec['examples'].values()
+      ]
+      columnar = {
+          field.name: np.array([getattr(value, field.name) for value in values])
+          for field in coder.schema.fields
+      }
+      dest = {
+          field: np.empty_like(values)
+          for field, values in columnar.items()
+      }
+      for column in dest.values():
+        column[:] = 0 if 'int' in column.dtype.name else None
+      expected_encoded = ''.join(spec['examples'].keys()).encode('latin1')
+      actual_encoded = encode_batch(coder, columnar)
+      assert_equal(expected_encoded, actual_encoded)
+      decoded_count = decode_batch(coder, expected_encoded, dest)
+      assert_equal(len(spec['examples']), decoded_count)
+      for field, values in dest.items():
+        assert_array_equal(columnar[field], dest[field])
 
   def parse_coder(self, spec):
     context = pipeline_context.PipelineContext()
@@ -275,7 +283,7 @@ class StandardCodersTest(unittest.TestCase):
   # Used when --fix is passed.
 
   fix = False
-  to_fix = {}  # type: Dict[Tuple[int, bytes], bytes]
+  to_fix: Dict[Tuple[int, bytes], bytes] = {}
 
   @classmethod
   def tearDownClass(cls):
@@ -303,6 +311,17 @@ def encode_nested(coder, value, nested=True):
 def decode_nested(coder, encoded, nested=True):
   return coder.get_impl().decode_from_stream(
       coder_impl.create_InputStream(encoded), nested)
+
+
+def encode_batch(row_coder, values):
+  out = coder_impl.create_OutputStream()
+  row_coder.get_impl().encode_batch_to_stream(values, out)
+  return out.get()
+
+
+def decode_batch(row_coder, encoded, dest):
+  return row_coder.get_impl().decode_batch_from_stream(
+      dest, coder_impl.create_InputStream(encoded))
 
 
 if __name__ == '__main__':

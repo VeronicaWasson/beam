@@ -16,10 +16,17 @@
  * limitations under the License.
  */
 
+/**
+ * Various transforms useful for asserting the expected contents of
+ * PCollections, primarily for for testing.
+ *
+ * @packageDocumentation
+ */
+
 import * as beam from "../index";
 import { globalWindows } from "../transforms/windowings";
-import * as internal from "../transforms/internal";
-
+import { requireForSerialization } from "../serialization";
+import { packageName } from "../utils/packageJson";
 import * as assert from "assert";
 
 // TODO(serialization): See if we can avoid this.
@@ -28,8 +35,17 @@ function callAssertDeepEqual(a, b) {
 }
 
 // TODO: (Naming)
+/**
+ * A PTransform that will fail the pipeline if the input PCollection does not
+ * contain exactly the given elements (in any order).  Useful for writing test,
+ * e.g.
+ *
+ *```js
+ * pcoll.apply(assertDeepEqual(1, 2, 3));
+ *```
+ */
 export function assertDeepEqual<T>(
-  expected: T[]
+  expected: T[],
 ): beam.PTransform<beam.PCollection<T>, void> {
   return beam.withName(
     `assertDeepEqual(${JSON.stringify(expected).substring(0, 100)})`,
@@ -38,20 +54,27 @@ export function assertDeepEqual<T>(
         assertContentsSatisfies((actual: T[]) => {
           const actualArray: T[] = [...actual];
           expected.sort((a, b) =>
-            JSON.stringify(a) < JSON.stringify(b) ? -1 : 1
+            JSON.stringify(a) < JSON.stringify(b) ? -1 : 1,
           );
           actualArray.sort((a, b) =>
-            JSON.stringify(a) < JSON.stringify(b) ? -1 : 1
+            JSON.stringify(a) < JSON.stringify(b) ? -1 : 1,
           );
           callAssertDeepEqual(actualArray, expected);
-        })
+        }),
       );
-    }
+    },
   );
 }
 
+/**
+ * A PTransform that will fail the pipeline if the given callback fails when
+ * called with the input PCollection's elements.
+ *
+ * Note that the callback must not be sensitive to ordering, as the ordering
+ * of the provided elements is not well determined.
+ */
 export function assertContentsSatisfies<T>(
-  check: (actual: T[]) => void
+  check: (actual: T[]) => void,
 ): beam.PTransform<beam.PCollection<T>, void> {
   function expand(pcoll: beam.PCollection<T>) {
     // We provide some value here to ensure there is at least one element
@@ -74,19 +97,18 @@ export function assertContentsSatisfies<T>(
             kv.value?.filter((o) => o.tag === "actual").map((o) => o.value) ||
             [];
           check(actual);
-        })
+        }),
       );
   }
 
   return beam.withName(
     `assertContentsSatisfies(${beam.extractName(check)})`,
-    expand
+    expand,
   );
 }
 
-import { requireForSerialization } from "../serialization";
-requireForSerialization("apache-beam/testing/assert", exports);
-requireForSerialization("apache-beam/testing/assert", {
+requireForSerialization(`${packageName}/testing/assert`, exports);
+requireForSerialization(`${packageName}/testing/assert`, {
   callAssertDeepEqual,
 });
 requireForSerialization("assert");

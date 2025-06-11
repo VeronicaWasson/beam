@@ -17,8 +17,8 @@
  */
 package org.apache.beam.sdk.extensions.gcp.util.gcsfs;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Strings.isNullOrEmpty;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Strings.isNullOrEmpty;
 
 import com.google.api.services.storage.model.StorageObject;
 import java.io.File;
@@ -80,7 +80,7 @@ public class GcsPath implements Path, Serializable {
    */
   public static GcsPath fromUri(URI uri) {
     checkArgument(uri.getScheme().equalsIgnoreCase(SCHEME), "URI: %s is not a GCS URI", uri);
-    checkArgument(uri.getPort() == -1, "GCS URI may not specify port: %s (%i)", uri, uri.getPort());
+    checkArgument(uri.getPort() == -1, "GCS URI may not specify port: %s (%s)", uri, uri.getPort());
     checkArgument(
         isNullOrEmpty(uri.getUserInfo()),
         "GCS URI may not specify userInfo: %s (%s)",

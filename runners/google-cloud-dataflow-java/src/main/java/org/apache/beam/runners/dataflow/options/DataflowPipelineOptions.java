@@ -17,10 +17,10 @@
  */
 package org.apache.beam.runners.dataflow.options;
 
+import com.google.api.services.dataflow.Dataflow;
 import java.util.List;
 import java.util.Map;
 import org.apache.beam.runners.dataflow.DataflowRunner;
-import org.apache.beam.sdk.annotations.Experimental;
 import org.apache.beam.sdk.extensions.gcp.options.GcpOptions;
 import org.apache.beam.sdk.extensions.gcp.options.GcsOptions;
 import org.apache.beam.sdk.io.FileSystems;
@@ -31,7 +31,6 @@ import org.apache.beam.sdk.options.ApplicationNameOptions;
 import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.DefaultValueFactory;
 import org.apache.beam.sdk.options.Description;
-import org.apache.beam.sdk.options.Hidden;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.StreamingOptions;
 import org.apache.beam.sdk.options.Validation;
@@ -52,8 +51,8 @@ public interface DataflowPipelineOptions
         BigQueryOptions,
         GcsOptions,
         StreamingOptions,
-        CloudDebuggerOptions,
         DataflowWorkerLoggingOptions,
+        DataflowStreamingPipelineOptions,
         DataflowProfilingOptions,
         PubsubOptions {
 
@@ -106,6 +105,19 @@ public interface DataflowPipelineOptions
           + "Must either be local or Cloud Storage.")
   String getTemplateLocation();
 
+  /**
+   * Sets the Cloud Storage path where the Dataflow template will be stored. Required for creating
+   * Flex Templates or Classic Templates.
+   *
+   * <p>Example:
+   *
+   * <pre>{@code
+   * DataflowPipelineOptions options = PipelineOptionsFactory.as(DataflowPipelineOptions.class);
+   * options.setTemplateLocation("gs://your-bucket/templates/my-template");
+   * }</pre>
+   *
+   * @param value Cloud Storage path for storing the Dataflow template.
+   */
   void setTemplateLocation(String value);
 
   /**
@@ -114,14 +126,15 @@ public interface DataflowPipelineOptions
    */
   @Description(
       "Service options are set by the user and configure the service. This "
-          + "decouples service side feature availability from the Apache Beam release cycle.")
+          + "decouples service side feature availability from the Apache Beam release cycle. "
+          + "For a list of service options, see "
+          + "https://cloud.google.com/dataflow/docs/reference/service-options "
+          + "in the Dataflow documentation.")
   List<String> getDataflowServiceOptions();
 
   void setDataflowServiceOptions(List<String> options);
 
   /** Run the job as a specific service account, instead of the default GCE robot. */
-  @Hidden
-  @Experimental
   @Description("Run the job as a specific service account, instead of the default GCE robot.")
   String getServiceAccount();
 
@@ -140,6 +153,25 @@ public interface DataflowPipelineOptions
   String getRegion();
 
   void setRegion(String region);
+
+  /**
+   * Dataflow endpoint to use.
+   *
+   * <p>Defaults to the current version of the Google Cloud Dataflow API, at the time the current
+   * SDK version was released.
+   *
+   * <p>If the string contains "://", then this is treated as a URL, otherwise {@link
+   * #getApiRootUrl()} is used as the root URL.
+   */
+  @Description(
+      "The URL for the Dataflow API. If the string contains \"://\", this"
+          + " will be treated as the entire URL, otherwise will be treated relative to apiRootUrl.")
+  @Override
+  @Default.String(Dataflow.DEFAULT_SERVICE_PATH)
+  String getDataflowEndpoint();
+
+  @Override
+  void setDataflowEndpoint(String value);
 
   /** Labels that will be applied to the billing records for this job. */
   @Description("Labels that will be applied to the billing records for this job.")
@@ -162,10 +194,8 @@ public interface DataflowPipelineOptions
   enum FlexResourceSchedulingGoal {
     /** No goal specified. */
     UNSPECIFIED,
-
     /** Optimize for lower execution time. */
     SPEED_OPTIMIZED,
-
     /** Optimize for lower cost. */
     COST_OPTIMIZED,
   }
@@ -179,6 +209,7 @@ public interface DataflowPipelineOptions
 
   /** Returns a default staging location under {@link GcpOptions#getGcpTempLocation}. */
   class StagingLocationFactory implements DefaultValueFactory<String> {
+
     private static final Logger LOG = LoggerFactory.getLogger(StagingLocationFactory.class);
 
     @Override
@@ -191,7 +222,7 @@ public interface DataflowPipelineOptions
       } catch (Exception e) {
         throw new IllegalArgumentException(
             "Error constructing default value for stagingLocation: failed to retrieve gcpTempLocation. "
-                + "Either stagingLocation must be set explicitly or a valid value must be provided"
+                + "Either stagingLocation must be set explicitly or a valid value must be provided "
                 + "for gcpTempLocation.",
             e);
       }

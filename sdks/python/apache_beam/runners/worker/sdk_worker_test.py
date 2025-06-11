@@ -28,6 +28,7 @@ import grpc
 import hamcrest as hc
 import mock
 
+from apache_beam.coders import FastPrimitivesCoder
 from apache_beam.coders import VarIntCoder
 from apache_beam.internal.metrics.metric import Metrics as InternalMetrics
 from apache_beam.metrics import monitoring_infos
@@ -125,7 +126,7 @@ class SdkWorkerTest(unittest.TestCase):
 
   def test_inactive_bundle_processor_returns_empty_progress_response(self):
     bundle_processor = mock.MagicMock()
-    bundle_processor_cache = BundleProcessorCache(None, None, {})
+    bundle_processor_cache = BundleProcessorCache(None, None, None, {})
     bundle_processor_cache.activate('instruction_id')
     worker = SdkWorker(bundle_processor_cache)
     split_request = beam_fn_api_pb2.InstructionRequest(
@@ -137,7 +138,7 @@ class SdkWorkerTest(unittest.TestCase):
         beam_fn_api_pb2.InstructionResponse(
             instruction_id='progress_instruction_id',
             process_bundle_progress=beam_fn_api_pb2.
-            ProcessBundleProgressResponse()))
+            ProcessBundleProgressResponse(consuming_received_data=False)))
 
     # Add a mock bundle processor as if it was running before it's released
     bundle_processor_cache.active_bundle_processors['instruction_id'] = (
@@ -148,11 +149,11 @@ class SdkWorkerTest(unittest.TestCase):
         beam_fn_api_pb2.InstructionResponse(
             instruction_id='progress_instruction_id',
             process_bundle_progress=beam_fn_api_pb2.
-            ProcessBundleProgressResponse()))
+            ProcessBundleProgressResponse(consuming_received_data=False)))
 
   def test_failed_bundle_processor_returns_failed_progress_response(self):
     bundle_processor = mock.MagicMock()
-    bundle_processor_cache = BundleProcessorCache(None, None, {})
+    bundle_processor_cache = BundleProcessorCache(None, None, None, {})
     bundle_processor_cache.activate('instruction_id')
     worker = SdkWorker(bundle_processor_cache)
 
@@ -171,7 +172,7 @@ class SdkWorkerTest(unittest.TestCase):
 
   def test_inactive_bundle_processor_returns_empty_split_response(self):
     bundle_processor = mock.MagicMock()
-    bundle_processor_cache = BundleProcessorCache(None, None, {})
+    bundle_processor_cache = BundleProcessorCache(None, None, None, {})
     bundle_processor_cache.activate('instruction_id')
     worker = SdkWorker(bundle_processor_cache)
     split_request = beam_fn_api_pb2.InstructionRequest(
@@ -194,7 +195,7 @@ class SdkWorkerTest(unittest.TestCase):
             instruction_id='split_instruction_id',
             process_bundle_split=beam_fn_api_pb2.ProcessBundleSplitResponse()))
 
-  def get_responses(self, instruction_requests):
+  def get_responses(self, instruction_requests, data_sampler=None):
     """Evaluates and returns {id: InstructionResponse} for the requests."""
     test_controller = BeamFnControlServicer(instruction_requests)
 
@@ -205,13 +206,15 @@ class SdkWorkerTest(unittest.TestCase):
     server.start()
 
     harness = sdk_worker.SdkHarness(
-        "localhost:%s" % test_port, state_cache_size=100)
+        "localhost:%s" % test_port,
+        state_cache_size=100,
+        data_sampler=data_sampler)
     harness.run()
     return test_controller.responses
 
   def test_harness_monitoring_infos_and_metadata(self):
     # Clear the process wide metric container.
-    MetricsEnvironment.process_wide_container().reset()
+    MetricsEnvironment.process_wide_container().metrics = {}
     # Create a process_wide metric.
     urn = 'my.custom.urn'
     labels = {'key': 'value'}
@@ -255,7 +258,7 @@ class SdkWorkerTest(unittest.TestCase):
 
   def test_failed_bundle_processor_returns_failed_split_response(self):
     bundle_processor = mock.MagicMock()
-    bundle_processor_cache = BundleProcessorCache(None, None, {})
+    bundle_processor_cache = BundleProcessorCache(None, None, None, {})
     bundle_processor_cache.activate('instruction_id')
     worker = SdkWorker(bundle_processor_cache)
 
@@ -271,6 +274,61 @@ class SdkWorkerTest(unittest.TestCase):
         worker.do_instruction(split_request).error,
         hc.contains_string(
             'Bundle processing associated with instruction_id has failed'))
+
+  def test_data_sampling_response(self):
+    # Create a data sampler with some fake sampled data. This data will be seen
+    # in the sample response.
+    coder = FastPrimitivesCoder()
+
+    class FakeDataSampler:
+      def samples(self, pcollection_ids):
+        return beam_fn_api_pb2.SampleDataResponse(
+            element_samples={
+                'pcoll_id_1': beam_fn_api_pb2.SampleDataResponse.ElementList(
+                    elements=[
+                        beam_fn_api_pb2.SampledElement(
+                            element=coder.encode_nested('a'))
+                    ]),
+                'pcoll_id_2': beam_fn_api_pb2.SampleDataResponse.ElementList(
+                    elements=[
+                        beam_fn_api_pb2.SampledElement(
+                            element=coder.encode_nested('b'))
+                    ])
+            })
+
+      def stop(self):
+        pass
+
+    data_sampler = FakeDataSampler()
+
+    # Create and send the fake reponse. The SdkHarness should query the
+    # DataSampler and fill out the sample response.
+    sample_request = beam_fn_api_pb2.InstructionRequest(
+        instruction_id='sample_request',
+        sample_data=beam_fn_api_pb2.SampleDataRequest(
+            pcollection_ids=['pcoll_id_1', 'pcoll_id_2']))
+    responses = self.get_responses([sample_request], data_sampler)
+    self.assertEqual(len(responses), 1)
+
+    # Get and assert the correct response.
+    response = responses['sample_request']
+    expected_response = beam_fn_api_pb2.InstructionResponse(
+        instruction_id='sample_request',
+        sample_data=beam_fn_api_pb2.SampleDataResponse(
+            element_samples={
+                'pcoll_id_1': beam_fn_api_pb2.SampleDataResponse.ElementList(
+                    elements=[
+                        beam_fn_api_pb2.SampledElement(
+                            element=coder.encode_nested('a'))
+                    ]),
+                'pcoll_id_2': beam_fn_api_pb2.SampleDataResponse.ElementList(
+                    elements=[
+                        beam_fn_api_pb2.SampledElement(
+                            element=coder.encode_nested('b'))
+                    ])
+            }))
+
+    self.assertEqual(response, expected_response)
 
 
 class CachingStateHandlerTest(unittest.TestCase):
@@ -294,7 +352,7 @@ class CachingStateHandlerTest(unittest.TestCase):
         yield
 
     underlying_state = FakeUnderlyingState()
-    state_cache = statecache.StateCache(100)
+    state_cache = statecache.StateCache(100 << 20)
     caching_state_hander = GlobalCachingStateHandler(
         state_cache, underlying_state)
 
@@ -430,7 +488,7 @@ class CachingStateHandlerTest(unittest.TestCase):
     coder = VarIntCoder()
 
     underlying_state_handler = self.UnderlyingStateHandler()
-    state_cache = statecache.StateCache(100)
+    state_cache = statecache.StateCache(100 << 20)
     handler = GlobalCachingStateHandler(state_cache, underlying_state_handler)
 
     def get():
@@ -460,7 +518,7 @@ class CachingStateHandlerTest(unittest.TestCase):
 
   def test_continuation_token(self):
     underlying_state_handler = self.UnderlyingStateHandler()
-    state_cache = statecache.StateCache(100)
+    state_cache = statecache.StateCache(100 << 20)
     handler = GlobalCachingStateHandler(state_cache, underlying_state_handler)
 
     coder = VarIntCoder()
@@ -516,77 +574,60 @@ class ShortIdCacheTest(unittest.TestCase):
     test_cases = [
         TestCase(*args) for args in [
             (
-                "1",
-                metrics_pb2.MonitoringInfo(
+                "1", metrics_pb2.MonitoringInfo(
                     urn="beam:metric:user:distribution_int64:v1",
                     type="beam:metrics:distribution_int64:v1")),
             (
-                "2",
-                metrics_pb2.MonitoringInfo(
+                "2", metrics_pb2.MonitoringInfo(
                     urn="beam:metric:element_count:v1",
                     type="beam:metrics:sum_int64:v1")),
             (
-                "3",
-                metrics_pb2.MonitoringInfo(
+                "3", metrics_pb2.MonitoringInfo(
                     urn="beam:metric:ptransform_progress:completed:v1",
                     type="beam:metrics:progress:v1")),
             (
-                "4",
-                metrics_pb2.MonitoringInfo(
+                "4", metrics_pb2.MonitoringInfo(
                     urn="beam:metric:user:distribution_double:v1",
                     type="beam:metrics:distribution_double:v1")),
             (
-                "5",
-                metrics_pb2.MonitoringInfo(
+                "5", metrics_pb2.MonitoringInfo(
                     urn="TestingSentinelUrn", type="TestingSentinelType")),
             (
-                "6",
-                metrics_pb2.MonitoringInfo(
+                "6", metrics_pb2.MonitoringInfo(
                     urn=
                     "beam:metric:pardo_execution_time:finish_bundle_msecs:v1",
                     type="beam:metrics:sum_int64:v1")),
             # This case and the next one validates that different labels
             # with the same urn are in fact assigned different short ids.
             (
-                "7",
-                metrics_pb2.MonitoringInfo(
+                "7", metrics_pb2.MonitoringInfo(
                     urn="beam:metric:user:sum_int64:v1",
-                    type="beam:metrics:sum_int64:v1",
-                    labels={
-                        "PTRANSFORM": "myT",
-                        "NAMESPACE": "harness",
+                    type="beam:metrics:sum_int64:v1", labels={
+                        "PTRANSFORM": "myT", "NAMESPACE": "harness",
                         "NAME": "metricNumber7"
                     })),
             (
-                "8",
-                metrics_pb2.MonitoringInfo(
+                "8", metrics_pb2.MonitoringInfo(
                     urn="beam:metric:user:sum_int64:v1",
-                    type="beam:metrics:sum_int64:v1",
-                    labels={
-                        "PTRANSFORM": "myT",
-                        "NAMESPACE": "harness",
+                    type="beam:metrics:sum_int64:v1", labels={
+                        "PTRANSFORM": "myT", "NAMESPACE": "harness",
                         "NAME": "metricNumber8"
                     })),
             (
-                "9",
-                metrics_pb2.MonitoringInfo(
+                "9", metrics_pb2.MonitoringInfo(
                     urn="beam:metric:user:top_n_double:v1",
-                    type="beam:metrics:top_n_double:v1",
-                    labels={
-                        "PTRANSFORM": "myT",
-                        "NAMESPACE": "harness",
+                    type="beam:metrics:top_n_double:v1", labels={
+                        "PTRANSFORM": "myT", "NAMESPACE": "harness",
                         "NAME": "metricNumber7"
                     })),
             (
-                "a",
-                metrics_pb2.MonitoringInfo(
+                "a", metrics_pb2.MonitoringInfo(
                     urn="beam:metric:element_count:v1",
                     type="beam:metrics:sum_int64:v1",
                     labels={"PCOLLECTION": "myPCol"})),
             # validate payload is ignored for shortId assignment
             (
-                "3",
-                metrics_pb2.MonitoringInfo(
+                "3", metrics_pb2.MonitoringInfo(
                     urn="beam:metric:ptransform_progress:completed:v1",
                     type="beam:metrics:progress:v1",
                     payload=b"this is ignored!"))
@@ -622,8 +663,8 @@ class ShortIdCacheTest(unittest.TestCase):
 def monitoringInfoMetadata(info):
   return {
       descriptor.name: value
-      for descriptor,
-      value in info.ListFields() if not descriptor.name == "payload"
+      for descriptor, value in info.ListFields()
+      if not descriptor.name == "payload"
   }
 
 

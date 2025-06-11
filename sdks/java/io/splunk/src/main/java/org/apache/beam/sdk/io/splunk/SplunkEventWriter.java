@@ -17,8 +17,8 @@
  */
 package org.apache.beam.sdk.io.splunk;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.api.client.http.HttpResponse;
 import com.google.api.client.http.HttpResponseException;
@@ -26,12 +26,21 @@ import com.google.auto.value.AutoValue;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import java.io.IOException;
-import java.io.UnsupportedEncodingException;
+import java.io.InputStream;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
 import java.security.KeyManagementException;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
+import java.security.cert.CertificateException;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import org.apache.beam.repackaged.core.org.apache.commons.compress.utils.IOUtils;
+import org.apache.beam.sdk.io.FileSystems;
+import org.apache.beam.sdk.io.fs.MatchResult;
 import org.apache.beam.sdk.metrics.Counter;
+import org.apache.beam.sdk.metrics.Distribution;
 import org.apache.beam.sdk.metrics.Metrics;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.state.BagState;
@@ -45,8 +54,11 @@ import org.apache.beam.sdk.state.ValueState;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.values.KV;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.MoreObjects;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.MoreObjects;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.net.InetAddresses;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.net.InternetDomainName;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Duration;
 import org.slf4j.Logger;
@@ -62,8 +74,10 @@ import org.slf4j.LoggerFactory;
 })
 abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWriteError> {
 
-  private static final Integer DEFAULT_BATCH_COUNT = 1;
+  private static final Integer DEFAULT_BATCH_COUNT = 10;
   private static final Boolean DEFAULT_DISABLE_CERTIFICATE_VALIDATION = false;
+  private static final Boolean DEFAULT_ENABLE_BATCH_LOGS = true;
+  private static final Boolean DEFAULT_ENABLE_GZIP_HTTP_COMPRESSION = true;
   private static final Logger LOG = LoggerFactory.getLogger(SplunkEventWriter.class);
   private static final long DEFAULT_FLUSH_DELAY = 2;
   private static final Counter INPUT_COUNTER =
@@ -72,9 +86,28 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
       Metrics.counter(SplunkEventWriter.class, "outbound-successful-events");
   private static final Counter FAILED_WRITES =
       Metrics.counter(SplunkEventWriter.class, "outbound-failed-events");
+  private static final Counter INVALID_REQUESTS =
+      Metrics.counter(SplunkEventWriter.class, "http-invalid-requests");
+  private static final Counter SERVER_ERROR_REQUESTS =
+      Metrics.counter(SplunkEventWriter.class, "http-server-error-requests");
+  private static final Counter VALID_REQUESTS =
+      Metrics.counter(SplunkEventWriter.class, "http-valid-requests");
+  private static final Distribution SUCCESSFUL_WRITE_LATENCY_MS =
+      Metrics.distribution(SplunkEventWriter.class, "successful_write_to_splunk_latency_ms");
+  private static final Distribution UNSUCCESSFUL_WRITE_LATENCY_MS =
+      Metrics.distribution(SplunkEventWriter.class, "unsuccessful_write_to_splunk_latency_ms");
+  private static final Distribution SUCCESSFUL_WRITE_BATCH_SIZE =
+      Metrics.distribution(SplunkEventWriter.class, "write_to_splunk_batch");
   private static final String BUFFER_STATE_NAME = "buffer";
   private static final String COUNT_STATE_NAME = "count";
   private static final String TIME_ID_NAME = "expiry";
+
+  private static final Pattern URL_PATTERN = Pattern.compile("^http(s?)://([^:]+)(:[0-9]+)?$");
+
+  @VisibleForTesting
+  protected static final String INVALID_URL_FORMAT_MESSAGE =
+      "Invalid url format. Url format should match PROTOCOL://HOST[:PORT], where PORT is optional. "
+          + "Supported Protocols are http and https. eg: http://hostname:8088";
 
   @StateId(BUFFER_STATE_NAME)
   private final StateSpec<BagState<SplunkEvent>> buffer = StateSpecs.bag();
@@ -88,6 +121,8 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
   private Integer batchCount;
   private Boolean disableValidation;
   private HttpEventPublisher publisher;
+  private Boolean enableBatchLogs;
+  private Boolean enableGzipHttpCompression;
 
   private static final Gson GSON =
       new GsonBuilder().setFieldNamingStrategy(f -> f.getName().toLowerCase()).create();
@@ -105,10 +140,17 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
 
   abstract @Nullable ValueProvider<Integer> inputBatchCount();
 
+  abstract @Nullable ValueProvider<String> rootCaCertificatePath();
+
+  abstract @Nullable ValueProvider<Boolean> enableBatchLogs();
+
+  abstract @Nullable ValueProvider<Boolean> enableGzipHttpCompression();
+
   @Setup
   public void setup() {
 
     checkArgument(url().isAccessible(), "url is required for writing events.");
+    checkArgument(isValidUrlFormat(url().get()), INVALID_URL_FORMAT_MESSAGE);
     checkArgument(token().isAccessible(), "Access token is required for writing events.");
 
     // Either user supplied or default batchCount.
@@ -134,12 +176,40 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
       LOG.info("Disable certificate validation set to: {}", disableValidation);
     }
 
+    // Either user supplied or default enableBatchLogs.
+    if (enableBatchLogs == null) {
+
+      if (enableBatchLogs() != null) {
+        enableBatchLogs = enableBatchLogs().get();
+      }
+
+      enableBatchLogs = MoreObjects.firstNonNull(enableBatchLogs, DEFAULT_ENABLE_BATCH_LOGS);
+      LOG.info("Enable Batch logs set to: {}", enableBatchLogs);
+    }
+
+    // Either user supplied or default enableGzipHttpCompression.
+    if (enableGzipHttpCompression == null) {
+
+      if (enableGzipHttpCompression() != null) {
+        enableGzipHttpCompression = enableGzipHttpCompression().get();
+      }
+
+      enableGzipHttpCompression =
+          MoreObjects.firstNonNull(enableGzipHttpCompression, DEFAULT_ENABLE_GZIP_HTTP_COMPRESSION);
+      LOG.info("Enable gzip http compression set to: {}", enableGzipHttpCompression);
+    }
+
     try {
       HttpEventPublisher.Builder builder =
           HttpEventPublisher.newBuilder()
               .withUrl(url().get())
               .withToken(token().get())
-              .withDisableCertificateValidation(disableValidation);
+              .withDisableCertificateValidation(disableValidation)
+              .withEnableGzipHttpCompression(enableGzipHttpCompression);
+
+      if (rootCaCertificatePath() != null && rootCaCertificatePath().get() != null) {
+        builder.withRootCaCertificate(getCertFromGcsAsBytes(rootCaCertificatePath().get()));
+      }
 
       publisher = builder.build();
       LOG.info("Successfully created HttpEventPublisher");
@@ -147,7 +217,8 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
     } catch (NoSuchAlgorithmException
         | KeyStoreException
         | KeyManagementException
-        | UnsupportedEncodingException e) {
+        | IOException
+        | CertificateException e) {
       LOG.error("Error creating HttpEventPublisher: {}", e.getMessage());
       throw new RuntimeException(e);
     }
@@ -172,8 +243,9 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
     timer.offset(Duration.standardSeconds(DEFAULT_FLUSH_DELAY)).setRelative();
 
     if (count >= batchCount) {
-
-      LOG.info("Flushing batch of {} events", count);
+      if (enableBatchLogs) {
+        LOG.info("Flushing batch of {} events", count);
+      }
       flush(receiver, bufferState, countState);
     }
   }
@@ -186,7 +258,9 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
       throws IOException {
 
     if (MoreObjects.<Long>firstNonNull(countState.read(), 0L) > 0) {
-      LOG.info("Flushing window with {} events", countState.read());
+      if (enableBatchLogs) {
+        LOG.info("Flushing window with {} events", countState.read());
+      }
       flush(receiver, bufferState, countState);
     }
   }
@@ -219,18 +293,38 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
 
       HttpResponse response = null;
       List<SplunkEvent> events = Lists.newArrayList(bufferState.read());
+      long startTime = System.nanoTime();
       try {
         // Important to close this response to avoid connection leak.
         response = publisher.execute(events);
 
         if (!response.isSuccessStatusCode()) {
+          UNSUCCESSFUL_WRITE_LATENCY_MS.update(nanosToMillis(System.nanoTime() - startTime));
+          FAILED_WRITES.inc(countState.read());
+          int statusCode = response.getStatusCode();
+          if (statusCode >= 400 && statusCode < 500) {
+            INVALID_REQUESTS.inc();
+          } else if (statusCode >= 500 && statusCode < 600) {
+            SERVER_ERROR_REQUESTS.inc();
+          }
+
+          logWriteFailures(
+              countState,
+              response.getStatusCode(),
+              response.parseAsString(),
+              response.getStatusMessage());
           flushWriteFailures(
               events, response.getStatusMessage(), response.getStatusCode(), receiver);
-          logWriteFailures(countState);
 
         } else {
-          LOG.info("Successfully wrote {} events", countState.read());
+          SUCCESSFUL_WRITE_LATENCY_MS.update(nanosToMillis(System.nanoTime() - startTime));
           SUCCESS_WRITES.inc(countState.read());
+          VALID_REQUESTS.inc();
+          SUCCESSFUL_WRITE_BATCH_SIZE.update(countState.read());
+
+          if (enableBatchLogs) {
+            LOG.info("Successfully wrote {} events", countState.read());
+          }
         }
 
       } catch (HttpResponseException e) {
@@ -239,13 +333,26 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
             e.getStatusCode(),
             e.getContent(),
             e.getStatusMessage());
-        logWriteFailures(countState);
+        UNSUCCESSFUL_WRITE_LATENCY_MS.update(nanosToMillis(System.nanoTime() - startTime));
+        FAILED_WRITES.inc(countState.read());
+        int statusCode = e.getStatusCode();
+        if (statusCode >= 400 && statusCode < 500) {
+          INVALID_REQUESTS.inc();
+        } else if (statusCode >= 500 && statusCode < 600) {
+          SERVER_ERROR_REQUESTS.inc();
+        }
+
+        logWriteFailures(countState, e.getStatusCode(), e.getContent(), e.getStatusMessage());
 
         flushWriteFailures(events, e.getStatusMessage(), e.getStatusCode(), receiver);
 
       } catch (IOException ioe) {
         LOG.error("Error writing to Splunk: {}", ioe.getMessage());
-        logWriteFailures(countState);
+        UNSUCCESSFUL_WRITE_LATENCY_MS.update(nanosToMillis(System.nanoTime() - startTime));
+        FAILED_WRITES.inc(countState.read());
+        INVALID_REQUESTS.inc();
+
+        logWriteFailures(countState, 0, ioe.getMessage(), null);
 
         flushWriteFailures(events, ioe.getMessage(), null, receiver);
 
@@ -255,17 +362,40 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
         bufferState.clear();
         countState.clear();
 
-        if (response != null) {
-          response.disconnect();
+        // We've observed cases where errors at this point can cause the pipeline to keep retrying
+        // the same events over and over (e.g. from Dataflow Runner's Pub/Sub implementation). Since
+        // the events have either been published or wrapped for error handling, we can safely
+        // ignore this error, though there may or may not be a leak of some type depending on
+        // HttpResponse's implementation. However, any potential leak would still happen if we let
+        // the exception fall through, so this isn't considered a major issue.
+        try {
+          if (response != null) {
+            response.ignore();
+          }
+        } catch (IOException e) {
+          LOG.warn(
+              "Error ignoring response from Splunk. Messages should still have published, but there"
+                  + " might be a connection leak.",
+              e);
         }
       }
     }
   }
 
-  /** Logs write failures and update {@link Counter}. */
-  private void logWriteFailures(@StateId(COUNT_STATE_NAME) ValueState<Long> countState) {
-    LOG.error("Failed to write {} events", countState.read());
-    FAILED_WRITES.inc(countState.read());
+  /** Utility method to log write failures. */
+  private void logWriteFailures(
+      @StateId(COUNT_STATE_NAME) ValueState<Long> countState,
+      int statusCode,
+      String content,
+      String statusMessage) {
+    if (enableBatchLogs) {
+      LOG.error("Failed to write {} events", countState.read());
+    }
+    LOG.error(
+        "Error writing to Splunk. StatusCode: {}, content: {}, StatusMessage: {}",
+        statusCode,
+        content,
+        statusMessage);
   }
 
   /**
@@ -304,6 +434,43 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
     }
   }
 
+  /**
+   * Reads a root CA certificate from GCS and returns it as raw bytes.
+   *
+   * @param filePath path to root CA cert in GCS
+   * @return raw contents of cert
+   * @throws RuntimeException thrown if not able to read or parse cert
+   */
+  public static byte[] getCertFromGcsAsBytes(String filePath) throws IOException {
+    MatchResult.Metadata fileMetadata = FileSystems.matchSingleFileSpec(filePath);
+    ReadableByteChannel channel = FileSystems.open(fileMetadata.resourceId());
+    try (InputStream inputStream = Channels.newInputStream(channel)) {
+      return IOUtils.toByteArray(inputStream);
+    } catch (IOException e) {
+      throw new RuntimeException("Error when reading: " + filePath, e);
+    }
+  }
+
+  @VisibleForTesting
+  static boolean isValidUrlFormat(String url) {
+    Matcher matcher = URL_PATTERN.matcher(url);
+    if (matcher.find()) {
+      String host = matcher.group(2);
+      return InetAddresses.isInetAddress(host) || InternetDomainName.isValid(host);
+    }
+    return false;
+  }
+
+  /**
+   * Converts Nanoseconds to Milliseconds.
+   *
+   * @param ns time in nanoseconds
+   * @return time in milliseconds
+   */
+  private static long nanosToMillis(long ns) {
+    return Math.round(((double) ns) / 1e6);
+  }
+
   @AutoValue.Builder
   abstract static class Builder {
 
@@ -318,6 +485,12 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
     abstract Builder setDisableCertificateValidation(
         ValueProvider<Boolean> disableCertificateValidation);
 
+    abstract Builder setRootCaCertificatePath(ValueProvider<String> rootCaCertificatePath);
+
+    abstract Builder setEnableBatchLogs(ValueProvider<Boolean> enableBatchLogs);
+
+    abstract Builder setEnableGzipHttpCompression(ValueProvider<Boolean> enableGzipHttpCompression);
+
     abstract Builder setInputBatchCount(ValueProvider<Integer> inputBatchCount);
 
     abstract SplunkEventWriter autoBuild();
@@ -330,6 +503,9 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
      */
     Builder withUrl(ValueProvider<String> url) {
       checkArgument(url != null, "withURL(url) called with null input.");
+      if (url.isAccessible()) {
+        checkArgument(isValidUrlFormat(url.get()), INVALID_URL_FORMAT_MESSAGE);
+      }
       return setUrl(url);
     }
 
@@ -341,6 +517,7 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
      */
     Builder withUrl(String url) {
       checkArgument(url != null, "withURL(url) called with null input.");
+      checkArgument(isValidUrlFormat(url), INVALID_URL_FORMAT_MESSAGE);
       return setUrl(ValueProvider.StaticValueProvider.of(url));
     }
 
@@ -384,6 +561,36 @@ abstract class SplunkEventWriter extends DoFn<KV<Integer, SplunkEvent>, SplunkWr
      */
     Builder withDisableCertificateValidation(ValueProvider<Boolean> disableCertificateValidation) {
       return setDisableCertificateValidation(disableCertificateValidation);
+    }
+
+    /**
+     * Method to set the root CA certificate path.
+     *
+     * @param rootCaCertificatePath Path to root CA certificate
+     * @return {@link Builder}
+     */
+    public Builder withRootCaCertificatePath(ValueProvider<String> rootCaCertificatePath) {
+      return setRootCaCertificatePath(rootCaCertificatePath);
+    }
+
+    /**
+     * Method to enable batch logs.
+     *
+     * @param enableBatchLogs for enabling batch logs.
+     * @return {@link Builder}
+     */
+    public Builder withEnableBatchLogs(ValueProvider<Boolean> enableBatchLogs) {
+      return setEnableBatchLogs(enableBatchLogs);
+    }
+
+    /**
+     * Method to specify if HTTP requests sent to Splunk should be GZIP encoded.
+     *
+     * @param enableGzipHttpCompression whether to enable Gzip encoding.
+     * @return {@link Builder}
+     */
+    public Builder withEnableGzipHttpCompression(ValueProvider<Boolean> enableGzipHttpCompression) {
+      return setEnableGzipHttpCompression(enableGzipHttpCompression);
     }
 
     /** Builds a new {@link SplunkEventWriter} objects based on the configuration. */

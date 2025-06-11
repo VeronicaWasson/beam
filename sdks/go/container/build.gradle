@@ -27,6 +27,8 @@ goBuild {
   outputLocation = './build/target/${GOOS}_${GOARCH}/boot'
 }
 
+def pushContainers = project.rootProject.hasProperty(["isRelease"]) || project.rootProject.hasProperty("push-containers")
+
 docker {
   name containerImageName(
           name: project.docker_image_default_repo_prefix + "go_sdk",
@@ -38,12 +40,17 @@ docker {
   files "./build/"
   buildArgs(['pull_licenses': project.rootProject.hasProperty(["docker-pull-licenses"]) ||
                      project.rootProject.hasProperty(["isRelease"])])
+  buildx project.useBuildx()
+  platform(*project.containerPlatforms())
+  load project.useBuildx() && !pushContainers
+  push pushContainers
 }
 dockerPrepare.dependsOn tasks.named("goBuild")
 
 // Ensure that making the docker image builds any required artifacts
 if (project.rootProject.hasProperty(["docker-pull-licenses"])) {
   task copyGolangLicenses(type: Copy) {
+    project.logger.lifecycle('docker-pull-licenses set, running go-licenses')
     from "${project(':release:go-licenses:go').buildDir}/output"
     into "build/target/go-licenses"
     dependsOn ':release:go-licenses:go:createLicenses'
@@ -51,12 +58,14 @@ if (project.rootProject.hasProperty(["docker-pull-licenses"])) {
   dockerPrepare.dependsOn 'copyGolangLicenses'
 } else {
   task skipPullLicenses(type: Exec) {
+    project.logger.lifecycle('docker-pull-licenses not set, skipping go-licenses')
     executable "sh"
-    args "-c", "mkdir -p build/target/go-licenses"
+    // Touch a dummy file to ensure the directory exists.
+    args "-c", "mkdir -p build/target/go-licenses && touch build/target/go-licenses/skip"
   }
   dockerPrepare.dependsOn 'skipPullLicenses'
 }
 
 task pushAll {
-  dependsOn ":sdks:go:container:dockerPush"
+  dependsOn ":sdks:go:container:docker"
 }

@@ -17,11 +17,11 @@
  */
 package org.apache.beam.runners.fnexecution.wire;
 
-import static org.apache.beam.runners.core.construction.BeamUrns.getUrn;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.MoreObjects.firstNonNull;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList.toImmutableList;
+import static org.apache.beam.sdk.util.construction.BeamUrns.getUrn;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.MoreObjects.firstNonNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList.toImmutableList;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
@@ -40,6 +40,7 @@ import com.google.auto.value.AutoValue;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -56,10 +57,6 @@ import org.apache.beam.model.fnexecution.v1.BeamFnApi.StateRequest;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi.StateResponse;
 import org.apache.beam.model.pipeline.v1.RunnerApi.StandardCoders;
 import org.apache.beam.model.pipeline.v1.SchemaApi;
-import org.apache.beam.runners.core.construction.CoderTranslation.TranslationContext;
-import org.apache.beam.runners.core.construction.CoderTranslator;
-import org.apache.beam.runners.core.construction.ModelCoderRegistrar;
-import org.apache.beam.runners.core.construction.Timer;
 import org.apache.beam.sdk.coders.BooleanCoder;
 import org.apache.beam.sdk.coders.ByteCoder;
 import org.apache.beam.sdk.coders.Coder;
@@ -83,22 +80,28 @@ import org.apache.beam.sdk.transforms.windowing.IntervalWindow.IntervalWindowCod
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
 import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.util.ShardedKey;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.CoderTranslation.TranslationContext;
+import org.apache.beam.sdk.util.construction.CoderTranslator;
+import org.apache.beam.sdk.util.construction.ModelCoderRegistrar;
+import org.apache.beam.sdk.util.construction.Timer;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.Row;
-import org.apache.beam.vendor.grpc.v1p43p2.com.google.protobuf.ByteString;
-import org.apache.beam.vendor.grpc.v1p43p2.com.google.protobuf.InvalidProtocolBufferException;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.MoreObjects;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Splitter;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableBiMap;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.io.CharStreams;
+import org.apache.beam.sdk.values.WindowedValues;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.ByteString;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.InvalidProtocolBufferException;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.MoreObjects;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Splitter;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableBiMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.io.CharStreams;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.junit.runners.Parameterized.Parameter;
@@ -110,6 +113,7 @@ import org.junit.runners.Parameterized.Parameters;
   "rawtypes", // TODO(https://github.com/apache/beam/issues/20447)
 })
 public class CommonCoderTest {
+  @Rule public transient Timeout globalTimeout = Timeout.seconds(600);
   private static final String STANDARD_CODERS_YAML_PATH =
       "/org/apache/beam/model/fnexecution/v1/standard_coders.yaml";
 
@@ -127,10 +131,10 @@ public class CommonCoderTest {
           .put(getUrn(StandardCoders.Enum.DOUBLE), DoubleCoder.class)
           .put(
               getUrn(StandardCoders.Enum.WINDOWED_VALUE),
-              WindowedValue.FullWindowedValueCoder.class)
+              WindowedValues.FullWindowedValueCoder.class)
           .put(
               getUrn(StandardCoders.Enum.PARAM_WINDOWED_VALUE),
-              WindowedValue.ParamWindowedValueCoder.class)
+              WindowedValues.ParamWindowedValueCoder.class)
           .put(getUrn(StandardCoders.Enum.ROW), RowCoder.class)
           .put(getUrn(StandardCoders.Enum.SHARDED_KEY), ShardedKey.Coder.class)
           .put(getUrn(StandardCoders.Enum.CUSTOM_WINDOW), TimestampPrefixingWindowCoder.class)
@@ -343,8 +347,8 @@ public class CommonCoderTest {
     } else if (s.equals(getUrn(StandardCoders.Enum.WINDOWED_VALUE))
         || s.equals(getUrn(StandardCoders.Enum.PARAM_WINDOWED_VALUE))) {
       Map<String, Object> kvMap = (Map<String, Object>) value;
-      Coder valueCoder = ((WindowedValue.FullWindowedValueCoder) coder).getValueCoder();
-      Coder windowCoder = ((WindowedValue.FullWindowedValueCoder) coder).getWindowCoder();
+      Coder valueCoder = ((WindowedValues.FullWindowedValueCoder) coder).getValueCoder();
+      Coder windowCoder = ((WindowedValues.FullWindowedValueCoder) coder).getWindowCoder();
       Object windowValue =
           convertValue(kvMap.get("value"), coderSpec.getComponents().get(0), valueCoder);
       Instant timestamp = new Instant(((Number) kvMap.get("timestamp")).longValue());
@@ -361,7 +365,7 @@ public class CommonCoderTest {
               PaneInfo.Timing.valueOf((String) paneInfoMap.get("timing")),
               (int) paneInfoMap.get("index"),
               (int) paneInfoMap.get("on_time_index"));
-      return WindowedValue.of(windowValue, timestamp, windows, paneInfo);
+      return WindowedValues.of(windowValue, timestamp, windows, paneInfo);
     } else if (s.equals(getUrn(StandardCoders.Enum.DOUBLE))) {
       return Double.parseDouble((String) value);
     } else if (s.equals(getUrn(StandardCoders.Enum.ROW))) {
@@ -422,6 +426,11 @@ public class CommonCoderTest {
         return (String) value;
       case BOOLEAN:
         return (Boolean) value;
+      case DATETIME:
+        // convert shifted millis to epoch millis as in InstantCoder
+        return new Instant((Long) value + -9223372036854775808L);
+      case DECIMAL:
+        return new BigDecimal((String) value);
       case BYTES:
         // extract String as byte[]
         return ((String) value).getBytes(StandardCharsets.ISO_8859_1);
@@ -462,10 +471,10 @@ public class CommonCoderTest {
       case LOGICAL_TYPE:
         // Logical types are represented as their representation types in YAML. Parse as the
         // representation type, then convert to the base type.
-        return fieldType
-            .getLogicalType()
-            .toInputType(parseField(value, fieldType.getLogicalType().getBaseType()));
-      default: // DECIMAL, DATETIME
+        Schema.LogicalType<Object, Object> logicalType =
+            (Schema.LogicalType<Object, Object>) fieldType.getLogicalType();
+        return logicalType.toInputType(parseField(value, fieldType.getLogicalType().getBaseType()));
+      default:
         throw new IllegalArgumentException("Unsupported type name: " + fieldType.getTypeName());
     }
   }

@@ -21,7 +21,12 @@ import * as runnerApi from "../proto/beam_runner_api";
 export const TYPESCRIPT_DEFAULT_ENVIRONMENT_URN = "js_default";
 
 function javascriptCapabilities(): string[] {
-  return []; // TODO: Cleanup. Actually populate.
+  // TODO: Cleanup. Actually populate.
+  return [
+    // This is needed for sessions to work...
+    "beam:coder:interval_window:v1",
+    "beam:protocol:sibling_workers:v1",
+  ];
 }
 
 export function defaultJsEnvironment() {
@@ -35,7 +40,7 @@ export function jsEnvironment(
   urn: string,
   payload: Uint8Array,
   resourceHints: { [key: string]: Uint8Array } = {},
-  artifacts: runnerApi.ArtifactInformation[] = []
+  artifacts: runnerApi.ArtifactInformation[] = [],
 ): runnerApi.Environment {
   return {
     urn: urn,
@@ -50,7 +55,7 @@ export function jsEnvironment(
 function asNewEnvironment(
   env: runnerApi.Environment,
   urn: string,
-  payload: Uint8Array
+  payload: Uint8Array,
 ) {
   return {
     urn: urn,
@@ -64,7 +69,7 @@ function asNewEnvironment(
 
 export function asExternalEnvironment(
   env: runnerApi.Environment,
-  address: string
+  address: string,
 ) {
   return asNewEnvironment(
     env,
@@ -75,17 +80,17 @@ export function asExternalEnvironment(
         authentication: null!,
       },
       params: {},
-    })
+    }),
   );
 }
 
 export function asDockerEnvironment(
   env: runnerApi.Environment,
-  containerImage: string
+  containerImage: string,
 ) {
   return asNewEnvironment(
     env,
     "beam:env:docker:v1",
-    runnerApi.DockerPayload.toBinary({ containerImage: containerImage })
+    runnerApi.DockerPayload.toBinary({ containerImage: containerImage }),
   );
 }

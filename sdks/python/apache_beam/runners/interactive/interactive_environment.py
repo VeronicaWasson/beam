@@ -29,7 +29,6 @@ import importlib
 import logging
 import os
 import tempfile
-import warnings
 from collections.abc import Iterable
 from pathlib import PurePath
 
@@ -374,11 +373,6 @@ class InteractiveEnvironment(object):
     given pipeline. If the pipeline is absent from the environment while
     create_if_absent is True, creates and returns a new file based cache
     manager for the pipeline."""
-    warnings.filterwarnings(
-        'ignore',
-        'options is deprecated since First stable release. References to '
-        '<pipeline>.options will not be supported',
-        category=DeprecationWarning)
 
     cache_manager = self._cache_managers.get(str(id(pipeline)), None)
     pipeline_runner = detect_pipeline_runner(pipeline)
@@ -468,8 +462,7 @@ class InteractiveEnvironment(object):
     """Returns a description of the recording for all watched pipelnes."""
     return {
         self.pipeline_id_to_pipeline(pid): rm.describe()
-        for pid,
-        rm in self._recording_managers.items()
+        for pid, rm in self._recording_managers.items()
     }
 
   def set_pipeline_result(self, pipeline, result):
@@ -717,7 +710,11 @@ class InteractiveEnvironment(object):
   def _get_gcs_cache_dir(self, pipeline, cache_dir):
     cache_dir_path = PurePath(cache_dir)
     if len(cache_dir_path.parts) < 2:
-      _LOGGER.error('GCS bucket cache path is too short to be valid.')
+      _LOGGER.error(
+          'GCS bucket cache path "%s" is too short to be valid. See '
+          'https://cloud.google.com/storage/docs/naming-buckets for '
+          'the expected format.',
+          cache_dir)
       raise ValueError('cache_root GCS bucket path is invalid.')
     bucket_name = cache_dir_path.parts[1]
     assert_bucket_exists(bucket_name)

@@ -17,12 +17,18 @@
  */
 package org.apache.beam.runners.samza.runtime;
 
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.runners.core.DoFnRunner;
 import org.apache.beam.runners.core.DoFnRunners;
@@ -33,9 +39,6 @@ import org.apache.beam.runners.core.StateTags;
 import org.apache.beam.runners.core.StatefulDoFnRunner;
 import org.apache.beam.runners.core.StepContext;
 import org.apache.beam.runners.core.TimerInternals;
-import org.apache.beam.runners.core.construction.Timer;
-import org.apache.beam.runners.core.construction.graph.ExecutableStage;
-import org.apache.beam.runners.fnexecution.control.BundleProgressHandler;
 import org.apache.beam.runners.fnexecution.control.OutputReceiverFactory;
 import org.apache.beam.runners.fnexecution.control.RemoteBundle;
 import org.apache.beam.runners.fnexecution.control.StageBundleFactory;
@@ -52,17 +55,19 @@ import org.apache.beam.sdk.state.BagState;
 import org.apache.beam.sdk.state.TimeDomain;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.DoFnSchemaInformation;
-import org.apache.beam.sdk.transforms.reflect.DoFnSignature;
-import org.apache.beam.sdk.transforms.reflect.DoFnSignatures;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.WindowedValueMultiReceiver;
+import org.apache.beam.sdk.util.construction.Timer;
+import org.apache.beam.sdk.util.construction.graph.ExecutableStage;
+import org.apache.beam.sdk.util.construction.graph.PipelineNode;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TypeDescriptor;
+import org.apache.beam.sdk.values.WindowedValue;
 import org.apache.beam.sdk.values.WindowingStrategy;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 import org.apache.samza.context.Context;
 import org.joda.time.Instant;
 
@@ -85,19 +90,25 @@ public class SamzaDoFnRunners {
       SideInputHandler sideInputHandler,
       SamzaTimerInternalsFactory<?> timerInternalsFactory,
       Coder<?> keyCoder,
-      DoFnRunners.OutputManager outputManager,
+      WindowedValueMultiReceiver outputManager,
       Coder<InT> inputCoder,
       List<TupleTag<?>> sideOutputTags,
       Map<TupleTag<?>, Coder<?>> outputCoders,
       DoFnSchemaInformation doFnSchemaInformation,
-      Map<String, PCollectionView<?>> sideInputMapping) {
+      Map<String, PCollectionView<?>> sideInputMapping,
+      Map<String, String> stateIdToStoreIdMapping,
+      OpEmitter emitter,
+      FutureCollector futureCollector) {
     final KeyedInternals keyedInternals;
     final TimerInternals timerInternals;
     final StateInternals stateInternals;
-    final DoFnSignature signature = DoFnSignatures.getSignature(doFn.getClass());
     final SamzaStoreStateInternals.Factory<?> stateInternalsFactory =
         SamzaStoreStateInternals.createStateInternalsFactory(
-            transformId, keyCoder, context.getTaskContext(), pipelineOptions, signature);
+            transformId,
+            keyCoder,
+            context.getTaskContext(),
+            pipelineOptions,
+            stateIdToStoreIdMapping);
 
     final SamzaExecutionContext executionContext =
         (SamzaExecutionContext) context.getApplicationContainerContext();
@@ -133,6 +144,7 @@ public class SamzaDoFnRunners {
                 underlyingRunner, executionContext.getMetricsContainer(), transformFullName)
             : underlyingRunner;
 
+    final DoFnRunner<InT, FnOutT> doFnRunnerWithStates;
     if (keyedInternals != null) {
       final DoFnRunner<InT, FnOutT> statefulDoFnRunner =
           DoFnRunners.defaultStatefulDoFnRunner(
@@ -144,10 +156,15 @@ public class SamzaDoFnRunners {
               new StatefulDoFnRunner.TimeInternalsCleanupTimer(timerInternals, windowingStrategy),
               createStateCleaner(doFn, windowingStrategy, keyedInternals.stateInternals()));
 
-      return new DoFnRunnerWithKeyedInternals<>(statefulDoFnRunner, keyedInternals);
+      doFnRunnerWithStates = new DoFnRunnerWithKeyedInternals<>(statefulDoFnRunner, keyedInternals);
     } else {
-      return doFnRunnerWithMetrics;
+      doFnRunnerWithStates = doFnRunnerWithMetrics;
     }
+
+    return pipelineOptions.getNumThreadsForProcessElement() > 1
+        ? AsyncDoFnRunner.create(
+            doFnRunnerWithStates, emitter, futureCollector, keyedInternals != null, pipelineOptions)
+        : doFnRunnerWithStates;
   }
 
   /** Creates a {@link StepContext} that allows accessing state and timer internals. */
@@ -194,7 +211,7 @@ public class SamzaDoFnRunners {
       SamzaStoreStateInternals.Factory<?> nonKeyedStateInternalsFactory,
       SamzaTimerInternalsFactory<?> timerInternalsFactory,
       SamzaPipelineOptions pipelineOptions,
-      DoFnRunners.OutputManager outputManager,
+      WindowedValueMultiReceiver outputManager,
       StageBundleFactory stageBundleFactory,
       SamzaExecutionContext samzaExecutionContext,
       TupleTag<FnOutT> mainOutputTag,
@@ -222,6 +239,7 @@ public class SamzaDoFnRunners {
         (SamzaExecutionContext) context.getApplicationContainerContext();
     final DoFnRunner<InT, FnOutT> underlyingRunner =
         new SdkHarnessDoFnRunner<>(
+            pipelineOptions,
             stepName,
             timerInternalsFactory,
             WindowUtils.getWindowStrategy(
@@ -231,20 +249,22 @@ public class SamzaDoFnRunners {
             idToTupleTagMap,
             bundledEventsBag,
             stateRequestHandler,
-            samzaExecutionContext);
+            samzaExecutionContext,
+            executableStage.getTransforms());
     return pipelineOptions.getEnableMetrics()
         ? DoFnRunnerWithMetrics.wrap(
             underlyingRunner, executionContext.getMetricsContainer(), transformFullName)
         : underlyingRunner;
   }
 
-  private static class SdkHarnessDoFnRunner<InT, FnOutT> implements DoFnRunner<InT, FnOutT> {
+  static class SdkHarnessDoFnRunner<InT, FnOutT> implements DoFnRunner<InT, FnOutT> {
 
     private static final int DEFAULT_METRIC_SAMPLE_RATE = 100;
 
+    private final SamzaPipelineOptions pipelineOptions;
     private final SamzaTimerInternalsFactory timerInternalsFactory;
     private final WindowingStrategy windowingStrategy;
-    private final DoFnRunners.OutputManager outputManager;
+    private final WindowedValueMultiReceiver outputManager;
     private final StageBundleFactory stageBundleFactory;
     private final Map<String, TupleTag<?>> idToTupleTagMap;
     private final LinkedBlockingQueue<KV<String, FnOutT>> outputQueue = new LinkedBlockingQueue<>();
@@ -254,18 +274,22 @@ public class SamzaDoFnRunners {
     private final StateRequestHandler stateRequestHandler;
     private final SamzaExecutionContext samzaExecutionContext;
     private long startBundleTime;
-    private final String metricName;
+    private final String stepName;
+    private final Collection<PipelineNode.PTransformNode> pTransformNodes;
 
     private SdkHarnessDoFnRunner(
+        SamzaPipelineOptions pipelineOptions,
         String stepName,
         SamzaTimerInternalsFactory<?> timerInternalsFactory,
         WindowingStrategy windowingStrategy,
-        DoFnRunners.OutputManager outputManager,
+        WindowedValueMultiReceiver outputManager,
         StageBundleFactory stageBundleFactory,
         Map<String, TupleTag<?>> idToTupleTagMap,
         BagState<WindowedValue<InT>> bundledEventsBag,
         StateRequestHandler stateRequestHandler,
-        SamzaExecutionContext samzaExecutionContext) {
+        SamzaExecutionContext samzaExecutionContext,
+        Collection<PipelineNode.PTransformNode> pTransformNodes) {
+      this.pipelineOptions = pipelineOptions;
       this.timerInternalsFactory = timerInternalsFactory;
       this.windowingStrategy = windowingStrategy;
       this.outputManager = outputManager;
@@ -274,7 +298,8 @@ public class SamzaDoFnRunners {
       this.bundledEventsBag = bundledEventsBag;
       this.stateRequestHandler = stateRequestHandler;
       this.samzaExecutionContext = samzaExecutionContext;
-      this.metricName = "ExecutableStage-" + stepName + "-process-ns";
+      this.stepName = stepName;
+      this.pTransformNodes = pTransformNodes;
     }
 
     @SuppressWarnings("unchecked")
@@ -306,12 +331,25 @@ public class SamzaDoFnRunners {
         final TimerReceiverFactory timerReceiverFactory =
             new TimerReceiverFactory(stageBundleFactory, this::timerDataConsumer, windowCoder);
 
+        Map<String, String> transformFullNameToUniqueName =
+            pTransformNodes.stream()
+                .collect(
+                    Collectors.toMap(
+                        pTransformNode -> pTransformNode.getId(),
+                        pTransformNode -> pTransformNode.getTransform().getUniqueName()));
+
+        SamzaMetricsBundleProgressHandler samzaMetricsBundleProgressHandler =
+            new SamzaMetricsBundleProgressHandler(
+                stepName,
+                samzaExecutionContext.getMetricsContainer(),
+                transformFullNameToUniqueName);
+
         remoteBundle =
             stageBundleFactory.getBundle(
                 receiverFactory,
                 timerReceiverFactory,
                 stateRequestHandler,
-                BundleProgressHandler.ignored());
+                samzaMetricsBundleProgressHandler);
 
         startBundleTime = getStartBundleTime();
 
@@ -378,6 +416,7 @@ public class SamzaDoFnRunners {
       final long finishBundleTime = System.nanoTime();
       final long averageProcessTime = (finishBundleTime - startBundleTime) / count;
 
+      String metricName = "ExecutableStage-" + stepName + "-process-ns";
       samzaExecutionContext
           .getMetricsContainer()
           .updateExecutableStageBundleMetric(metricName, averageProcessTime);
@@ -416,8 +455,16 @@ public class SamzaDoFnRunners {
     @Override
     public void finishBundle() {
       try {
-        // RemoteBundle close blocks until all results are received
-        remoteBundle.close();
+        runWithTimeout(
+            pipelineOptions.getBundleProcessingTimeout(),
+            () -> {
+              // RemoteBundle close blocks until all results are received
+              try {
+                remoteBundle.close();
+              } catch (Exception e) {
+                throw new RuntimeException(e);
+              }
+            });
         emitResults();
         emitMetrics();
         bundledEventsBag.clear();
@@ -426,6 +473,22 @@ public class SamzaDoFnRunners {
       } finally {
         remoteBundle = null;
         inputReceiver = null;
+      }
+    }
+
+    /**
+     * Run a function and wait for at most the given time (in milliseconds).
+     *
+     * @param timeoutInMs the time to wait for completing the function call. If the value of timeout
+     *     is negative, wait forever until the function call is completed
+     * @param runnable the main function
+     */
+    static void runWithTimeout(long timeoutInMs, Runnable runnable)
+        throws ExecutionException, InterruptedException, TimeoutException {
+      if (timeoutInMs < 0) {
+        runnable.run();
+      } else {
+        CompletableFuture.runAsync(runnable).get(timeoutInMs, TimeUnit.MILLISECONDS);
       }
     }
 

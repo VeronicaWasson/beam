@@ -24,9 +24,8 @@ import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
+import java.util.Collection;
 import org.apache.beam.sdk.Pipeline;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.state.State;
 import org.apache.beam.sdk.state.StateSpec;
@@ -188,6 +187,31 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
     public abstract void outputWithTimestamp(OutputT output, Instant timestamp);
 
     /**
+     * Adds the given element to the main output {@code PCollection}, with the given windowing
+     * metadata.
+     *
+     * <p>Once passed to {@code outputWindowedValue} the element should not be modified in any way.
+     *
+     * <p>If invoked from {@link ProcessElement}), the timestamp must not be older than the input
+     * element's timestamp minus {@link DoFn#getAllowedTimestampSkew}. The output element will be in
+     * the same windows as the input element.
+     *
+     * <p>If invoked from {@link StartBundle} or {@link FinishBundle}, this will attempt to use the
+     * {@link org.apache.beam.sdk.transforms.windowing.WindowFn} of the input {@code PCollection} to
+     * determine what windows the element should be in, throwing an exception if the {@code
+     * WindowFn} attempts to access any information about the input element except for the
+     * timestamp.
+     *
+     * <p><i>Note:</i> A splittable {@link DoFn} is not allowed to output from {@link StartBundle}
+     * or {@link FinishBundle} methods.
+     */
+    public abstract void outputWindowedValue(
+        OutputT output,
+        Instant timestamp,
+        Collection<? extends BoundedWindow> windows,
+        PaneInfo paneInfo);
+
+    /**
      * Adds the given element to the output {@code PCollection} with the given tag.
      *
      * <p>Once passed to {@code output} the element should not be modified in any way.
@@ -233,6 +257,32 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
      * @see ParDo.SingleOutput#withOutputTags
      */
     public abstract <T> void outputWithTimestamp(TupleTag<T> tag, T output, Instant timestamp);
+
+    /**
+     * Adds the given element to the main output {@code PCollection}, with the given windowing
+     * metadata.
+     *
+     * <p>Once passed to {@code outputWindowedValue} the element should not be modified in any way.
+     *
+     * <p>If invoked from {@link ProcessElement}), the timestamp must not be older than the input
+     * element's timestamp minus {@link DoFn#getAllowedTimestampSkew}. The output element will be in
+     * the same windows as the input element.
+     *
+     * <p>If invoked from {@link StartBundle} or {@link FinishBundle}, this will attempt to use the
+     * {@link org.apache.beam.sdk.transforms.windowing.WindowFn} of the input {@code PCollection} to
+     * determine what windows the element should be in, throwing an exception if the {@code
+     * WindowFn} attempts to access any information about the input element except for the
+     * timestamp.
+     *
+     * <p><i>Note:</i> A splittable {@link DoFn} is not allowed to output from {@link StartBundle}
+     * or {@link FinishBundle} methods.
+     */
+    public abstract <T> void outputWindowedValue(
+        TupleTag<T> tag,
+        T output,
+        Instant timestamp,
+        Collection<? extends BoundedWindow> windows,
+        PaneInfo paneInfo);
   }
 
   /** Information accessible when running a {@link DoFn.ProcessElement} method. */
@@ -276,7 +326,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
   }
 
   /** Information accessible when running a {@link DoFn.OnTimer} method. */
-  @Experimental(Kind.TIMERS)
   public abstract class OnTimerContext extends WindowedContext {
 
     /** Returns the output timestamp of the current timer. */
@@ -345,6 +394,15 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
     void output(T output);
 
     void outputWithTimestamp(T output, Instant timestamp);
+
+    default void outputWindowedValue(
+        T output,
+        Instant timestamp,
+        Collection<? extends BoundedWindow> windows,
+        PaneInfo paneInfo) {
+      throw new UnsupportedOperationException(
+          String.format("Not implemented: %s.outputWindowedValue", this.getClass().getName()));
+    }
   }
 
   /** Receives tagged output for a multi-output function. */
@@ -358,7 +416,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
      * <p>The {@link PCollection} representing this tag must have a schema registered in order to
      * call this function.
      */
-    @Experimental(Kind.SCHEMAS)
     <T> OutputReceiver<Row> getRowReceiver(TupleTag<T> tag);
   }
 
@@ -399,7 +456,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
   @Documented
   @Retention(RetentionPolicy.RUNTIME)
   @Target({ElementType.FIELD, ElementType.PARAMETER})
-  @Experimental(Kind.STATE)
   public @interface StateId {
     /** The state ID. */
     String value();
@@ -439,7 +495,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
   @Documented
   @Retention(RetentionPolicy.RUNTIME)
   @Target({ElementType.FIELD, ElementType.PARAMETER})
-  @Experimental(Kind.STATE)
   public @interface AlwaysFetched {}
 
   /**
@@ -480,7 +535,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
   @Documented
   @Retention(RetentionPolicy.RUNTIME)
   @Target({ElementType.FIELD, ElementType.PARAMETER})
-  @Experimental(Kind.TIMERS)
   public @interface TimerId {
     /** The timer ID. */
     String value() default "";
@@ -490,7 +544,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
   @Documented
   @Retention(RetentionPolicy.RUNTIME)
   @Target({ElementType.FIELD, ElementType.PARAMETER})
-  @Experimental(Kind.TIMERS)
   public @interface TimerFamily {
     /** The TimerMap tag ID. */
     String value();
@@ -508,7 +561,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
   /** Annotation for specifying specific fields that are accessed in a Schema PCollection. */
   @Retention(RetentionPolicy.RUNTIME)
   @Target({ElementType.FIELD, ElementType.PARAMETER})
-  @Experimental(Kind.SCHEMAS)
   public @interface FieldAccess {
     String value();
   }
@@ -526,7 +578,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
   @Documented
   @Retention(RetentionPolicy.RUNTIME)
   @Target(ElementType.METHOD)
-  @Experimental(Kind.TIMERS)
   public @interface OnTimer {
     /** The timer ID. */
     String value();
@@ -545,7 +596,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
   @Documented
   @Retention(RetentionPolicy.RUNTIME)
   @Target(ElementType.METHOD)
-  @Experimental(Kind.TIMERS)
   public @interface OnTimerFamily {
     /** The timer ID. */
     String value();
@@ -574,7 +624,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
   @Documented
   @Retention(RetentionPolicy.RUNTIME)
   @Target(ElementType.METHOD)
-  @Experimental(Kind.STATE)
   public @interface OnWindowExpiration {}
 
   /**
@@ -797,10 +846,7 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
     String value();
   }
   /**
-   * <b><i>Experimental - no backwards compatibility guarantees. The exact name or usage of this
-   * feature may change.</i></b>
-   *
-   * <p>Annotation that may be added to a {@link ProcessElement}, {@link OnTimer}, or {@link
+   * Annotation that may be added to a {@link ProcessElement}, {@link OnTimer}, or {@link
    * OnWindowExpiration} method to indicate that the runner must ensure that the observable contents
    * of the input {@link PCollection} or mutable state must be stable upon retries.
    *
@@ -814,16 +860,12 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
    * PCollection} is permitted to be recomputed in any manner.
    */
   @Documented
-  @Experimental
   @Retention(RetentionPolicy.RUNTIME)
   @Target(ElementType.METHOD)
   public @interface RequiresStableInput {}
 
   /**
-   * <b><i>Experimental - no backwards compatibility guarantees. The exact name or usage of this
-   * feature may change.</i></b>
-   *
-   * <p>Annotation that may be added to a {@link ProcessElement} method to indicate that the runner
+   * Annotation that may be added to a {@link ProcessElement} method to indicate that the runner
    * must ensure that the observable contents of the input {@link PCollection} is sorted by time, in
    * ascending order. The time ordering is defined by element's timestamp, ordering of elements with
    * equal timestamps is not defined.
@@ -840,7 +882,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
    * will have to be dropped. This might change in the future with introduction of retractions.
    */
   @Documented
-  @Experimental
   @Retention(RetentionPolicy.RUNTIME)
   @Target(ElementType.METHOD)
   public @interface RequiresTimeSortedInput {}
@@ -1001,6 +1042,9 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
    *       additional details such as the number of bytes for keys and values is known for the key
    *       range.
    * </ul>
+   *
+   * <p>Must be thread safe. Will be invoked concurrently during bundle processing due to runner
+   * initiated splitting and progress estimation.
    */
   @Documented
   @Retention(RetentionPolicy.RUNTIME)
@@ -1167,11 +1211,11 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
    *
    * <ul>
    *   <li>The return type {@code WatermarkEstimatorStateT} defines the watermark state type used
-   *       within this splittable DoFn. All other methods that use a {@link
-   *       WatermarkEstimatorState @WatermarkEstimatorState} parameter must use the same type that
-   *       is used here. It is suggested to use as narrow of a return type definition as possible
-   *       (for example prefer to use a square type over a shape type as a square is a type of a
-   *       shape).
+   *       within this splittable DoFn. The return type is allowed to be nullable. All other methods
+   *       that use a {@link WatermarkEstimatorState @WatermarkEstimatorState} parameter must use
+   *       the same type that is used here. It is suggested to use as narrow of a return type
+   *       definition as possible (for example prefer to use a square type over a shape type as a
+   *       square is a type of a shape).
    *   <li>If one of its arguments is tagged with the {@link Element} annotation, then it will be
    *       passed the current element being processed; the argument must be of type {@code InputT}.
    *       Note that automatic conversion of {@link Row}s and {@link FieldAccess} parameters are
@@ -1364,7 +1408,6 @@ public abstract class DoFn<InputT extends @Nullable Object, OutputT extends @Nul
    * consumers without waiting for finalization to succeed. For pipelines that are sensitive to
    * duplicate messages, they must perform output deduplication in the pipeline.
    */
-  @Experimental(Kind.PORTABILITY)
   public interface BundleFinalizer {
     /**
      * The provided function will be called after the runner successfully commits the output of a

@@ -19,19 +19,17 @@ package org.apache.beam.sdk.schemas.utils;
 
 import java.io.Serializable;
 import java.util.List;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.schemas.FieldValueTypeInformation;
 import org.apache.beam.sdk.schemas.Schema;
+import org.apache.beam.sdk.values.TypeDescriptor;
 
 /**
  * A naming policy for schema fields. This maps a name from the class (field name or getter name) to
  * the matching field name in the schema.
  */
-@Experimental(Kind.SCHEMAS)
 public interface FieldValueTypeSupplier extends Serializable {
   /** Return all the FieldValueTypeInformations. */
-  List<FieldValueTypeInformation> get(Class<?> clazz);
+  List<FieldValueTypeInformation> get(TypeDescriptor<?> typeDescriptor);
 
   /**
    * Return all the FieldValueTypeInformations.
@@ -39,7 +37,7 @@ public interface FieldValueTypeSupplier extends Serializable {
    * <p>If the schema parameter is not null, then the returned list must be in the same order as
    * fields in the schema.
    */
-  default List<FieldValueTypeInformation> get(Class<?> clazz, Schema schema) {
-    return StaticSchemaInference.sortBySchema(get(clazz), schema);
+  default List<FieldValueTypeInformation> get(TypeDescriptor<?> typeDescriptor, Schema schema) {
+    return StaticSchemaInference.sortBySchema(get(typeDescriptor), schema);
   }
 }

@@ -20,26 +20,29 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/apache/beam/sdks/v2/go/container/tools"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/artifact"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/runtime/xlangx/expansionx"
 	pipepb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/pipeline_v1"
-	"github.com/apache/beam/sdks/v2/go/pkg/beam/provision"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/util/execx"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/util/grpcx"
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
-	"github.com/nightlyone/lockfile"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -76,13 +79,11 @@ func main() {
 	flag.Parse()
 
 	if *setupOnly {
-		if err := processArtifactsInSetupOnlyMode(); err != nil {
-			log.Fatalf("Setup unsuccessful with error: %v", err)
-		}
-		return
+		processArtifactsInSetupOnlyMode()
+		os.Exit(0)
 	}
 
-	if *workerPool == true {
+	if *workerPool {
 		workerPoolId := fmt.Sprintf("%d", os.Getpid())
 		os.Setenv(workerPoolIdEnv, workerPoolId)
 		args := []string{
@@ -92,19 +93,33 @@ func main() {
 			"--container_executable=/opt/apache/beam/boot",
 		}
 		log.Printf("Starting worker pool %v: python %v", workerPoolId, strings.Join(args, " "))
-		log.Fatalf("Python SDK worker pool exited: %v", execx.Execute("python", args...))
+		pythonVersion, err := expansionx.GetPythonVersion()
+		if err != nil {
+			log.Fatalf("Python SDK worker pool exited with error: %v", err)
+		}
+		if err := execx.Execute(pythonVersion, args...); err != nil {
+			log.Fatalf("Python SDK worker pool exited with error: %v", err)
+		}
+		log.Print("Python SDK worker pool exited.")
+		os.Exit(0)
 	}
 
 	if *id == "" {
-		log.Fatal("No id provided.")
+		log.Fatalf("No id provided.")
 	}
 	if *provisionEndpoint == "" {
-		log.Fatal("No provision endpoint provided.")
+		log.Fatalf("No provision endpoint provided.")
 	}
 
+	if err := launchSDKProcess(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func launchSDKProcess() error {
 	ctx := grpcx.WriteWorkerID(context.Background(), *id)
 
-	info, err := provision.Info(ctx, *provisionEndpoint)
+	info, err := tools.ProvisionInfo(ctx, *provisionEndpoint)
 	if err != nil {
 		log.Fatalf("Failed to obtain provisioning information: %v", err)
 	}
@@ -122,73 +137,97 @@ func main() {
 	}
 
 	if *loggingEndpoint == "" {
-		log.Fatal("No logging endpoint provided.")
+		log.Fatalf("No logging endpoint provided.")
 	}
 	if *artifactEndpoint == "" {
-		log.Fatal("No artifact endpoint provided.")
+		log.Fatalf("No artifact endpoint provided.")
 	}
 	if *controlEndpoint == "" {
-		log.Fatal("No control endpoint provided.")
+		log.Fatalf("No control endpoint provided.")
 	}
-
-	log.Printf("Initializing python harness: %v", strings.Join(os.Args, " "))
+	logger := &tools.Logger{Endpoint: *loggingEndpoint}
+	logger.Printf(ctx, "Initializing python harness: %v", strings.Join(os.Args, " "))
 
 	// (1) Obtain the pipeline options
 
-	options, err := provision.ProtoToJSON(info.GetPipelineOptions())
+	options, err := tools.ProtoToJSON(info.GetPipelineOptions())
 	if err != nil {
-		log.Fatalf("Failed to convert pipeline options: %v", err)
+		logger.Fatalf(ctx, "Failed to convert pipeline options: %v", err)
 	}
 
 	// (2) Retrieve and install the staged packages.
 	//
-	// Guard from concurrent artifact retrieval and installation,
-	// when called by child processes in a worker pool.
+	// No log.Fatalf() from here on, otherwise deferred cleanups will not be called!
 
-	materializeArtifactsFunc := func() {
-		dir := filepath.Join(*semiPersistDir, "staged")
+	// Trap signals, so we can clean up properly.
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 
-		files, err := artifact.Materialize(ctx, *artifactEndpoint, info.GetDependencies(), info.GetRetrievalToken(), dir)
+	// Create a separate virtual environment (with access to globally installed packages), unless disabled by the user.
+	// This improves usability on runners that persist the execution environment for the boot entrypoint between multiple pipeline executions.
+	if os.Getenv("RUN_PYTHON_SDK_IN_DEFAULT_ENVIRONMENT") == "" {
+		venvDir, err := setupVenv(ctx, logger, "/opt/apache/beam-venv", *id)
 		if err != nil {
-			log.Fatalf("Failed to retrieve staged files: %v", err)
+			return errors.New(
+				"failed to create a virtual environment. If running on Ubuntu systems, " +
+					"you might need to install `python3-venv` package. " +
+					"To run the SDK process in default environment instead, " +
+					"set the environment variable `RUN_PYTHON_SDK_IN_DEFAULT_ENVIRONMENT=1`. " +
+					"In custom Docker images, you can do that with an `ENV` statement. " +
+					fmt.Sprintf("Encountered error: %v", err))
 		}
-
-		// TODO(herohde): the packages to install should be specified explicitly. It
-		// would also be possible to install the SDK in the Dockerfile.
-		fileNames := make([]string, len(files))
-		requirementsFiles := []string{requirementsFile}
-		for i, v := range files {
-			name, _ := artifact.MustExtractFilePayload(v)
-			log.Printf("Found artifact: %s", name)
-			fileNames[i] = name
-
-			if v.RoleUrn == artifact.URNPipRequirementsFile {
-				requirementsFiles = append(requirementsFiles, name)
-			}
+		cleanupFunc := func() {
+			os.RemoveAll(venvDir)
+			logger.Printf(ctx, "Cleaned up temporary venv for worker %v.", *id)
 		}
+		defer cleanupFunc()
+	}
 
-		if setupErr := installSetupPackages(fileNames, dir, requirementsFiles); setupErr != nil {
-			log.Fatalf("Failed to install required packages: %v", setupErr)
+	dir := filepath.Join(*semiPersistDir, "staged")
+	files, err := artifact.Materialize(ctx, *artifactEndpoint, info.GetDependencies(), info.GetRetrievalToken(), dir)
+	if err != nil {
+		fmtErr := fmt.Errorf("failed to retrieve staged files: %v", err)
+		// Send error message to logging service before returning up the call stack
+		logger.Errorf(ctx, fmtErr.Error())
+		// No need to fail the job if submission_environment_dependencies.txt cannot be loaded
+		if strings.Contains(fmtErr.Error(), "submission_environment_dependencies.txt") {
+			logger.Printf(ctx, "Ignore the error when loading submission_environment_dependencies.txt.")
+		} else {
+			return fmtErr
 		}
 	}
 
-	workerPoolId := os.Getenv(workerPoolIdEnv)
-	if workerPoolId != "" {
-		multiProcessExactlyOnce(materializeArtifactsFunc, "beam.install.complete."+workerPoolId)
-	} else {
-		materializeArtifactsFunc()
+	// TODO(herohde): the packages to install should be specified explicitly. It
+	// would also be possible to install the SDK in the Dockerfile.
+	fileNames := make([]string, len(files))
+	requirementsFiles := []string{requirementsFile}
+	for i, v := range files {
+		name, _ := artifact.MustExtractFilePayload(v)
+		logger.Printf(ctx, "Found artifact: %s", name)
+		fileNames[i] = name
+
+		if v.RoleUrn == artifact.URNPipRequirementsFile {
+			requirementsFiles = append(requirementsFiles, name)
+		}
+	}
+
+	if setupErr := installSetupPackages(ctx, logger, fileNames, dir, requirementsFiles); setupErr != nil {
+		fmtErr := fmt.Errorf("failed to install required packages: %v", setupErr)
+		// Send error message to logging service before returning up the call stack
+		logger.Errorf(ctx, fmtErr.Error())
+		return fmtErr
 	}
 
 	// (3) Invoke python
 
 	os.Setenv("PIPELINE_OPTIONS", options)
 	os.Setenv("SEMI_PERSISTENT_DIRECTORY", *semiPersistDir)
-	os.Setenv("LOGGING_API_SERVICE_DESCRIPTOR", proto.MarshalTextString(&pipepb.ApiServiceDescriptor{Url: *loggingEndpoint}))
-	os.Setenv("CONTROL_API_SERVICE_DESCRIPTOR", proto.MarshalTextString(&pipepb.ApiServiceDescriptor{Url: *controlEndpoint}))
+	os.Setenv("LOGGING_API_SERVICE_DESCRIPTOR", (&pipepb.ApiServiceDescriptor{Url: *loggingEndpoint}).String())
+	os.Setenv("CONTROL_API_SERVICE_DESCRIPTOR", (&pipepb.ApiServiceDescriptor{Url: *controlEndpoint}).String())
 	os.Setenv("RUNNER_CAPABILITIES", strings.Join(info.GetRunnerCapabilities(), " "))
 
 	if info.GetStatusEndpoint() != nil {
-		os.Setenv("STATUS_API_SERVICE_DESCRIPTOR", proto.MarshalTextString(info.GetStatusEndpoint()))
+		os.Setenv("STATUS_API_SERVICE_DESCRIPTOR", info.GetStatusEndpoint().String())
 	}
 
 	if metadata := info.GetMetadata(); metadata != nil {
@@ -200,128 +239,189 @@ func main() {
 		}
 	}
 
+	workerIds := append([]string{*id}, info.GetSiblingWorkerIds()...)
+
+	// Keep track of child PIDs for clean shutdown without zombies
+	childPids := struct {
+		v        []int
+		canceled bool
+		mu       sync.Mutex
+	}{v: make([]int, 0, len(workerIds))}
+
+	// Forward trapped signals to child process groups in order to terminate them gracefully and avoid zombies
+	go func() {
+		logger.Printf(ctx, "Received signal: %v", <-signalChannel)
+		childPids.mu.Lock()
+		childPids.canceled = true
+		for _, pid := range childPids.v {
+			go func(pid int) {
+				// This goroutine will be canceled if the main process exits before the 5 seconds
+				// have elapsed, i.e., as soon as all subprocesses have returned from Wait().
+				time.Sleep(5 * time.Second)
+				if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil {
+					logger.Warnf(ctx, "Worker process %v did not respond, killed it.", pid)
+				}
+			}(pid)
+			syscall.Kill(-pid, syscall.SIGTERM)
+		}
+		childPids.mu.Unlock()
+	}()
+
 	args := []string{
 		"-m",
 		sdkHarnessEntrypoint,
 	}
 
-	workerIds := append([]string{*id}, info.GetSiblingWorkerIds()...)
 	var wg sync.WaitGroup
 	wg.Add(len(workerIds))
 	for _, workerId := range workerIds {
 		go func(workerId string) {
-			log.Printf("Executing: python %v", strings.Join(args, " "))
-			log.Fatalf("Python exited: %v", execx.ExecuteEnv(map[string]string{"WORKER_ID": workerId}, "python", args...))
-			wg.Done()
+			defer wg.Done()
+
+			bufLogger := tools.NewBufferedLogger(logger)
+			errorCount := 0
+			for {
+				childPids.mu.Lock()
+				if childPids.canceled {
+					childPids.mu.Unlock()
+					return
+				}
+				logger.Printf(ctx, "Executing Python (worker %v): python %v", workerId, strings.Join(args, " "))
+				cmd := StartCommandEnv(map[string]string{"WORKER_ID": workerId}, os.Stdin, bufLogger, bufLogger, "python", args...)
+				childPids.v = append(childPids.v, cmd.Process.Pid)
+				childPids.mu.Unlock()
+
+				if err := cmd.Wait(); err != nil {
+					// Retry on fatal errors, like OOMs and segfaults, not just
+					// DoFns throwing exceptions.
+					errorCount += 1
+					bufLogger.FlushAtError(ctx)
+					if errorCount < 4 {
+						logger.Warnf(ctx, "Python (worker %v) exited %v times: %v\nrestarting SDK process",
+							workerId, errorCount, err)
+					} else {
+						logger.Fatalf(ctx, "Python (worker %v) exited %v times: %v\nout of retries, failing container",
+							workerId, errorCount, err)
+					}
+				} else {
+					bufLogger.FlushAtDebug(ctx)
+					logger.Printf(ctx, "Python (worker %v) exited.", workerId)
+					break
+				}
+			}
 		}(workerId)
 	}
 	wg.Wait()
+	return nil
 }
 
-// setup wheel specs according to installed python version
+// Start a command object in a new process group with the given arguments with
+// additional environment variables. It attaches stdio to the child process.
+// Returns the process handle.
+func StartCommandEnv(env map[string]string, stdin io.Reader, stdout, stderr io.Writer, prog string, args ...string) *exec.Cmd {
+	cmd := exec.Command(prog, args...)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if env != nil {
+		cmd.Env = os.Environ()
+		for k, v := range env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+	}
+
+	// Create process group so we can clean up the whole subtree later without creating zombies
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
+	cmd.Start()
+	return cmd
+}
+
+// setupVenv initializes a local Python venv and sets the corresponding env variables
+func setupVenv(ctx context.Context, logger *tools.Logger, baseDir, workerId string) (string, error) {
+	dir := filepath.Join(baseDir, "beam-venv-worker-"+workerId)
+	logger.Printf(ctx, "Initializing temporary Python venv in %v", dir)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		// Probably leftovers from a previous run
+		logger.Printf(ctx, "Cleaning up previous venv ...")
+		if err := os.RemoveAll(dir); err != nil {
+			return "", err
+		}
+	}
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return "", fmt.Errorf("failed to create Python venv directory: %s", err)
+	}
+	pythonVersion, err := expansionx.GetPythonVersion()
+	if err != nil {
+		return "", err
+	}
+	if err := execx.Execute(pythonVersion, "-m", "venv", "--system-site-packages", dir); err != nil {
+		return "", fmt.Errorf("python venv initialization failed: %s", err)
+	}
+
+	os.Setenv("VIRTUAL_ENV", dir)
+	os.Setenv("PATH", strings.Join([]string{filepath.Join(dir, "bin"), os.Getenv("PATH")}, ":"))
+	return dir, nil
+}
+
+// setupAcceptableWheelSpecs setup wheel specs according to installed python version
 func setupAcceptableWheelSpecs() error {
 	cmd := exec.Command("python", "-V")
 	stdoutStderr, err := cmd.CombinedOutput()
 	if err != nil {
 		return err
 	}
-	re := regexp.MustCompile(`Python (\d)\.(\d).*`)
+	re := regexp.MustCompile(`Python (\d)\.(\d+).*`)
 	pyVersions := re.FindStringSubmatch(string(stdoutStderr[:]))
 	if len(pyVersions) != 3 {
 		return fmt.Errorf("cannot get parse Python version from %s", stdoutStderr)
 	}
 	pyVersion := fmt.Sprintf("%s%s", pyVersions[1], pyVersions[2])
-	var wheelName string
-	switch pyVersion {
-	case "36", "37":
-		wheelName = fmt.Sprintf("cp%s-cp%sm-manylinux1_x86_64.whl", pyVersion, pyVersion)
-	default:
-		wheelName = fmt.Sprintf("cp%s-cp%s-manylinux1_x86_64.whl", pyVersion, pyVersion)
-	}
+	wheelName := fmt.Sprintf("cp%s-cp%s-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", pyVersion, pyVersion)
 	acceptableWhlSpecs = append(acceptableWhlSpecs, wheelName)
 	return nil
 }
 
 // installSetupPackages installs Beam SDK and user dependencies.
-func installSetupPackages(files []string, workDir string, requirementsFiles []string) error {
-	log.Printf("Installing setup packages ...")
+func installSetupPackages(ctx context.Context, logger *tools.Logger, files []string, workDir string, requirementsFiles []string) error {
+	bufLogger := tools.NewBufferedLogger(logger)
+	bufLogger.Printf(ctx, "Installing setup packages ...")
 
 	if err := setupAcceptableWheelSpecs(); err != nil {
-		log.Printf("Failed to setup acceptable wheel specs, leave it as empty: %v", err)
+		bufLogger.Printf(ctx, "Failed to setup acceptable wheel specs, leave it as empty: %v", err)
 	}
 
-	// Install the Dataflow Python SDK and worker packages.
-	// We install the extra requirements in case of using the beam sdk. These are ignored by pip
-	// if the user is using an SDK that does not provide these.
-	if err := installSdk(files, workDir, sdkSrcFile, acceptableWhlSpecs, false); err != nil {
+	// Install the Dataflow Python SDK if one was staged. In released
+	// container images, SDK is already installed, but can be overriden
+	// using the --sdk_location pipeline option.
+	if err := installSdk(ctx, logger, files, workDir, sdkSrcFile, acceptableWhlSpecs, false); err != nil {
 		return fmt.Errorf("failed to install SDK: %v", err)
+	}
+	pkgName := "apache-beam"
+	isSdkInstalled := isPackageInstalled(pkgName)
+	if !isSdkInstalled {
+		return fmt.Errorf("Apache Beam is not installed in the runtime environment. If you use a custom container image, you must install apache-beam package in the custom image using same version of Beam as in the pipeline submission environment. For more information, see: the https://beam.apache.org/documentation/runtime/environments/")
 	}
 	// The staged files will not disappear due to restarts because workDir is a
 	// folder that is mapped to the host (and therefore survives restarts).
 	for _, f := range requirementsFiles {
-		if err := pipInstallRequirements(files, workDir, f); err != nil {
+		if err := pipInstallRequirements(ctx, logger, files, workDir, f); err != nil {
 			return fmt.Errorf("failed to install requirements: %v", err)
 		}
 	}
-	if err := installExtraPackages(files, extraPackagesFile, workDir); err != nil {
+	if err := installExtraPackages(ctx, logger, files, extraPackagesFile, workDir); err != nil {
 		return fmt.Errorf("failed to install extra packages: %v", err)
 	}
-	if err := pipInstallPackage(files, workDir, workflowFile, false, true, nil); err != nil {
+	if err := pipInstallPackage(ctx, logger, files, workDir, workflowFile, false, true, nil); err != nil {
 		return fmt.Errorf("failed to install workflow: %v", err)
+	}
+	if err := logRuntimeDependencies(ctx, bufLogger); err != nil {
+		bufLogger.Printf(ctx, "couldn't fetch the runtime python dependencies: %v", err)
+	}
+	if err := logSubmissionEnvDependencies(ctx, bufLogger, workDir); err != nil {
+		bufLogger.Printf(ctx, "couldn't fetch the submission environment dependencies: %v", err)
 	}
 
 	return nil
-}
-
-// joinPaths joins the dir to every artifact path. Each / in the path is
-// interpreted as a directory separator.
-func joinPaths(dir string, paths ...string) []string {
-	var ret []string
-	for _, p := range paths {
-		ret = append(ret, filepath.Join(dir, filepath.FromSlash(p)))
-	}
-	return ret
-}
-
-// Call the given function exactly once across multiple worker processes.
-// The need for multiple processes is specific to the Python SDK due to the GIL.
-// Should another SDK require it, this could be separated out as shared utility.
-func multiProcessExactlyOnce(actionFunc func(), completeFileName string) {
-	installCompleteFile := filepath.Join(os.TempDir(), completeFileName)
-
-	// skip if install already complete, no need to lock
-	_, err := os.Stat(installCompleteFile)
-	if err == nil {
-		return
-	}
-
-	lock, err := lockfile.New(filepath.Join(os.TempDir(), completeFileName+".lck"))
-	if err != nil {
-		log.Fatalf("Cannot init artifact retrieval lock: %v", err)
-	}
-
-	for err = lock.TryLock(); err != nil; err = lock.TryLock() {
-		if _, ok := err.(lockfile.TemporaryError); ok {
-			time.Sleep(5 * time.Second)
-			log.Printf("Worker %v waiting for artifact retrieval lock: %v", *id, lock)
-		} else {
-			log.Fatalf("Worker %v could not obtain artifact retrieval lock: %v", *id, err)
-		}
-	}
-	defer lock.Unlock()
-
-	// skip if install already complete
-	_, err = os.Stat(installCompleteFile)
-	if err == nil {
-		return
-	}
-
-	// do the real work
-	actionFunc()
-
-	// mark install complete
-	os.OpenFile(installCompleteFile, os.O_RDONLY|os.O_CREATE, 0666)
-
 }
 
 // processArtifactsInSetupOnlyMode installs the dependencies found in artifacts
@@ -329,12 +429,12 @@ func multiProcessExactlyOnce(actionFunc func(), completeFileName string) {
 // process the provided artifacts and skip the actual worker program start up.
 // The mode is useful for building new images with dependencies pre-installed so
 // that the installation can be skipped at the pipeline runtime.
-func processArtifactsInSetupOnlyMode() error {
+func processArtifactsInSetupOnlyMode() {
 	if *artifacts == "" {
 		log.Fatal("No --artifacts provided along with --setup_only flag.")
 	}
 	workDir := filepath.Dir(*artifacts)
-	metadata, err := ioutil.ReadFile(*artifacts)
+	metadata, err := os.ReadFile(*artifacts)
 	if err != nil {
 		log.Fatalf("Unable to open artifacts metadata file %v with error %v", *artifacts, err)
 	}
@@ -346,7 +446,7 @@ func processArtifactsInSetupOnlyMode() error {
 	files := make([]string, len(infoJsons))
 	for i, info := range infoJsons {
 		var artifactInformation pipepb.ArtifactInformation
-		if err := jsonpb.UnmarshalString(info, &artifactInformation); err != nil {
+		if err := protojson.Unmarshal([]byte(info), &artifactInformation); err != nil {
 			log.Fatalf("Unable to unmarshal artifact information from json string %v", info)
 		}
 
@@ -360,8 +460,46 @@ func processArtifactsInSetupOnlyMode() error {
 		}
 		files[i] = filePayload.GetPath()
 	}
-	if setupErr := installSetupPackages(files, workDir, []string{requirementsFile}); setupErr != nil {
+	if setupErr := installSetupPackages(context.Background(), nil, files, workDir, []string{requirementsFile}); setupErr != nil {
 		log.Fatalf("Failed to install required packages: %v", setupErr)
 	}
+}
+
+// logRuntimeDependencies logs the python dependencies
+// installed in the runtime environment.
+func logRuntimeDependencies(ctx context.Context, bufLogger *tools.BufferedLogger) error {
+	pythonVersion, err := expansionx.GetPythonVersion()
+	if err != nil {
+		return err
+	}
+	bufLogger.Printf(ctx, "Using Python version:")
+	args := []string{"--version"}
+	if err := execx.ExecuteEnvWithIO(nil, os.Stdin, bufLogger, bufLogger, pythonVersion, args...); err != nil {
+		bufLogger.FlushAtError(ctx)
+	} else {
+		bufLogger.FlushAtDebug(ctx)
+	}
+	bufLogger.Printf(ctx, "Logging runtime dependencies:")
+	args = []string{"-m", "pip", "freeze"}
+	if err := execx.ExecuteEnvWithIO(nil, os.Stdin, bufLogger, bufLogger, pythonVersion, args...); err != nil {
+		bufLogger.FlushAtError(ctx)
+	} else {
+		bufLogger.FlushAtDebug(ctx)
+	}
+	return nil
+}
+
+// logSubmissionEnvDependencies logs the python dependencies
+// installed in the submission environment.
+func logSubmissionEnvDependencies(ctx context.Context, bufLogger *tools.BufferedLogger, dir string) error {
+	bufLogger.Printf(ctx, "Logging submission environment dependencies:")
+	// path for submission environment dependencies should match with the
+	// one defined in apache_beam/runners/portability/stager.py.
+	filename := filepath.Join(dir, "submission_environment_dependencies.txt")
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+	bufLogger.Printf(ctx, string(content))
 	return nil
 }

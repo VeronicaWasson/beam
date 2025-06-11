@@ -16,16 +16,18 @@
  * limitations under the License.
  */
 
+/** @internal */
 export function camelToSnake(camelString) {
   return camelString.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
 }
 
+/** @internal */
 export function camelToSnakeOptions(options: { [key: string]: any }): {
   [key: string]: any;
 } {
   return Object.fromEntries(
     Object.entries(options)
       .filter(([k, v]) => v != undefined)
-      .map(([k, v]) => [camelToSnake(k), v])
+      .map(([k, v]) => [camelToSnake(k), v]),
   );
 }

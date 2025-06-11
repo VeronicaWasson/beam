@@ -23,8 +23,6 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 import javax.annotation.Nonnull;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 
 /**
  * When used on a {@link org.apache.beam.sdk.schemas.JavaFieldSchema POJO} field, a {@link
@@ -33,16 +31,19 @@ import org.apache.beam.sdk.annotations.Experimental.Kind;
  * specified index. There cannot be "gaps" in field numbers, or schema inference will fail. If used,
  * all fields (or getters in the case of a bean) must be annotated.
  *
+ * <p>The annotation takes a String as an argument, but this has to be an Integer-parsable String.
+ * Otherwise the pipeline will throw a RuntimeException.
+ *
  * <p>For example, say we have a Java POJO with a field that we want in our schema but under a
  * different name:
  *
  * <pre><code>
  *  {@literal @}DefaultSchema(JavaFieldSchema.class)
  *   class MyClass {
- *     {@literal @}SchemaFieldNumber(1)
+ *     {@literal @}SchemaFieldNumber("1")
  *     public String user;
  *
- *    {@literal @}SchemaFieldNumber(0)
+ *    {@literal @}SchemaFieldNumber("0")
  *     public int ageInYears;
  *   }
  * </code></pre>
@@ -55,7 +56,6 @@ import org.apache.beam.sdk.annotations.Experimental.Kind;
 @SuppressWarnings({
   "rawtypes" // TODO(https://github.com/apache/beam/issues/20447)
 })
-@Experimental(Kind.SCHEMAS)
 public @interface SchemaFieldNumber {
 
   /** The name to use for the generated schema field. */

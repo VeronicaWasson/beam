@@ -17,27 +17,16 @@
  */
 package org.apache.beam.examples.cookbook;
 
-// beam-playground:
-//   name: DistinctExampleTest
-//   description: Unit-test for the DistinctExample example.
-//   multifile: false
-//   context_line: 45
-//   categories:
-//     - Core Transforms
-//     - Filtering
-
 import java.util.Arrays;
 import java.util.List;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
-import org.apache.beam.sdk.testing.ValidatesRunner;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.transforms.Distinct;
 import org.apache.beam.sdk.values.PCollection;
 import org.junit.Rule;
 import org.junit.Test;
-import org.junit.experimental.categories.Category;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
@@ -48,7 +37,6 @@ public class DistinctExampleTest {
   @Rule public TestPipeline p = TestPipeline.create();
 
   @Test
-  @Category(ValidatesRunner.class)
   public void testDistinct() {
     List<String> strings = Arrays.asList("k1", "k5", "k5", "k2", "k1", "k2", "k3");
 
@@ -61,7 +49,6 @@ public class DistinctExampleTest {
   }
 
   @Test
-  @Category(ValidatesRunner.class)
   public void testDistinctEmpty() {
     List<String> strings = Arrays.asList();
 

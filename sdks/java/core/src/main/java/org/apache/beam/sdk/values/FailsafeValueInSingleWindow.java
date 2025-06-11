@@ -27,7 +27,7 @@ import org.apache.beam.sdk.coders.InstantCoder;
 import org.apache.beam.sdk.coders.StructuredCoder;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.joda.time.Instant;
 
 /**
@@ -48,7 +48,7 @@ public abstract class FailsafeValueInSingleWindow<T, ErrorT> {
   public abstract BoundedWindow getWindow();
 
   /** Returns the pane of this {@code FailsafeValueInSingleWindow} in its window. */
-  public abstract PaneInfo getPane();
+  public abstract PaneInfo getPaneInfo();
 
   /** Returns the failsafe value of this {@code FailsafeValueInSingleWindow}. */
   public abstract ErrorT getFailsafeValue();
@@ -97,7 +97,7 @@ public abstract class FailsafeValueInSingleWindow<T, ErrorT> {
         throws IOException {
       InstantCoder.of().encode(windowedElem.getTimestamp(), outStream);
       windowCoder.encode(windowedElem.getWindow(), outStream);
-      PaneInfo.PaneInfoCoder.INSTANCE.encode(windowedElem.getPane(), outStream);
+      PaneInfo.PaneInfoCoder.INSTANCE.encode(windowedElem.getPaneInfo(), outStream);
       valueCoder.encode(windowedElem.getValue(), outStream);
       failsafeValueCoder.encode(windowedElem.getFailsafeValue(), outStream);
     }

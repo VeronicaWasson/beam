@@ -19,9 +19,9 @@
 
 # pytype: skip-file
 
-import sys
 import typing
 import unittest
+from typing import Tuple
 
 import apache_beam as beam
 from apache_beam import pvalue
@@ -64,10 +64,6 @@ class MainInputTest(unittest.TestCase):
     result = ['1', '10', '100'] | beam.Map(int, 16)
     self.assertEqual([1, 16, 256], sorted(result))
 
-  @unittest.skipIf(
-      sys.version_info < (3, 7, 0),
-      'Function signatures for builtins are not available in Python 3 before '
-      'version 3.7.')
   def test_non_function_fails(self):
     with self.assertRaises(typehints.TypeCheckError):
       [1, 2, 3] | beam.Map(str.upper)
@@ -92,11 +88,11 @@ class MainInputTest(unittest.TestCase):
     self.assertEqual(['1', '2', '3'], sorted(result))
 
     with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'requires.*int.*got.*str'):
+                                r'requires.*int.*applied.*str'):
       ['a', 'b', 'c'] | beam.ParDo(MyDoFn())
 
     with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'requires.*int.*got.*str'):
+                                r'requires.*int.*applied.*str'):
       [1, 2, 3] | (beam.ParDo(MyDoFn()) | 'again' >> beam.ParDo(MyDoFn()))
 
   def test_typed_dofn_method(self):
@@ -108,11 +104,11 @@ class MainInputTest(unittest.TestCase):
     self.assertEqual(['1', '2', '3'], sorted(result))
 
     with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'requires.*int.*got.*str'):
+                                r'requires.*int.*applied.*str'):
       _ = ['a', 'b', 'c'] | beam.ParDo(MyDoFn())
 
     with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'requires.*int.*got.*str'):
+                                r'requires.*int.*applied.*str'):
       _ = [1, 2, 3] | (beam.ParDo(MyDoFn()) | 'again' >> beam.ParDo(MyDoFn()))
 
   def test_typed_dofn_method_with_class_decorators(self):
@@ -126,12 +122,14 @@ class MainInputTest(unittest.TestCase):
     result = [(1, 2)] | beam.ParDo(MyDoFn())
     self.assertEqual([1], sorted(result))
 
-    with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'requires.*Tuple\[int, int\].*got.*str'):
+    with self.assertRaisesRegex(
+        typehints.TypeCheckError,
+        r'requires.*Tuple\[<class \'int\'>, <class \'int\'>\].*applied.*str'):
       _ = ['a', 'b', 'c'] | beam.ParDo(MyDoFn())
 
-    with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'requires.*Tuple\[int, int\].*got.*int'):
+    with self.assertRaisesRegex(
+        typehints.TypeCheckError,
+        r'requires.*Tuple\[<class \'int\'>, <class \'int\'>\].*applied.*int'):
       _ = [1, 2, 3] | (beam.ParDo(MyDoFn()) | 'again' >> beam.ParDo(MyDoFn()))
 
   def test_typed_callable_iterable_output(self):
@@ -158,11 +156,11 @@ class MainInputTest(unittest.TestCase):
     self.assertEqual(['1', '2', '3'], sorted(result))
 
     with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'requires.*int.*got.*str'):
+                                r'requires.*int.*applied.*str'):
       _ = ['a', 'b', 'c'] | beam.ParDo(my_do_fn)
 
     with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'requires.*int.*got.*str'):
+                                r'requires.*int.*applied.*str'):
       _ = [1, 2, 3] | (beam.ParDo(my_do_fn) | 'again' >> beam.ParDo(my_do_fn))
 
   def test_typed_callable_instance(self):
@@ -179,11 +177,11 @@ class MainInputTest(unittest.TestCase):
     self.assertEqual(['1', '2', '3'], sorted(result))
 
     with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'requires.*int.*got.*str'):
+                                r'requires.*int.*applied.*str'):
       _ = ['a', 'b', 'c'] | pardo
 
     with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'requires.*int.*got.*str'):
+                                r'requires.*int.*applied.*str'):
       _ = [1, 2, 3] | (pardo | 'again' >> pardo)
 
   def test_filter_type_hint(self):
@@ -424,7 +422,7 @@ class MainInputTest(unittest.TestCase):
     # In this case, both MyMap and its contained ParDo have separate type
     # checks (that disagree with each other).
     @beam.ptransform_fn
-    @typehints.with_input_types(int)
+    @typehints.with_input_types(str)
     def MyMap(pcoll):
       def fn(element: float):
         yield element
@@ -432,11 +430,11 @@ class MainInputTest(unittest.TestCase):
       return pcoll | beam.ParDo(fn)
 
     with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'ParDo.*requires.*float.*got.*int'):
-      _ = [1, 2, 3] | MyMap()
+                                r'ParDo.*requires.*float.*applied.*str'):
+      _ = ['1', '2', '3'] | MyMap()
     with self.assertRaisesRegex(typehints.TypeCheckError,
-                                r'MyMap.*expected.*int.*got.*str'):
-      _ = ['a'] | MyMap()
+                                r'MyMap.*expected.*str.*got.*bytes'):
+      _ = [b'a'] | MyMap()
 
   def test_typed_dofn_string_literals(self):
     class MyDoFn(beam.DoFn):
@@ -634,14 +632,14 @@ class MainInputTest(unittest.TestCase):
       return e
 
     @typehints.with_input_types(int)
-    def requires_int(e):
+    def accepts_int(e):
       return e
 
     class MyPTransform(beam.PTransform):
       def expand(self, pcoll):
         unknowns = pcoll | beam.Map(produces_unkown)
         ints = pcoll | beam.Map(int)
-        return (unknowns, ints) | beam.Flatten() | beam.Map(requires_int)
+        return (unknowns, ints) | beam.Flatten() | beam.Map(accepts_int)
 
     _ = [1, 2, 3] | MyPTransform()
 
@@ -745,7 +743,8 @@ class SideInputTest(unittest.TestCase):
 
     with self.assertRaisesRegex(
         typehints.TypeCheckError,
-        r'requires Tuple\[int, ...\] but got Tuple\[str, ...\]'):
+        (r'requires Tuple\[<class \'int\'>, ...\] but got '
+         r'Tuple\[<class \'str\'>, ...\]')):
       ['a', 'bb', 'c'] | beam.Map(repeat, 'z')
 
   def test_var_positional_only_side_input_hint(self):
@@ -762,8 +761,8 @@ class SideInputTest(unittest.TestCase):
 
     with self.assertRaisesRegex(
         typehints.TypeCheckError,
-        r'requires Tuple\[Union\[int, str\], ...\] but got '
-        r'Tuple\[Union\[float, int\], ...\]'):
+        r'requires.*Tuple\[Union\[<class \'int\'>, <class \'str\'>\], ...\].*'
+        r'applied.*Tuple\[Union\[<class \'float\'>, <class \'int\'>\], ...\]'):
       _ = [1.2] | beam.Map(lambda *_: 'a', 5).with_input_types(int, str)
 
   def test_var_keyword_side_input_hint(self):
@@ -783,7 +782,8 @@ class SideInputTest(unittest.TestCase):
 
     with self.assertRaisesRegex(
         typehints.TypeCheckError,
-        r'requires Dict\[str, str\] but got Dict\[str, int\]'):
+        r'requires Dict\[<class \'str\'>, <class \'str\'>\] but got '
+        r'Dict\[<class \'str\'>, <class \'int\'>\]'):
       _ = (['a', 'b', 'c']
            | beam.Map(lambda e, **_: 'a', kw=5).with_input_types(
                str, ignored=str))
@@ -874,25 +874,12 @@ class CustomTransformTest(unittest.TestCase):
 class AnnotationsTest(unittest.TestCase):
   def test_pardo_wrapper_builtin_method(self):
     th = beam.ParDo(str.strip).get_type_hints()
-    if sys.version_info < (3, 7):
-      self.assertEqual(th.input_types, ((str, ), {}))
-    else:
-      # Python 3.7+ has annotations for CPython builtins
-      # (_MethodDescriptorType).
-      self.assertEqual(th.input_types, ((str, typehints.Any), {}))
+    self.assertEqual(th.input_types, ((str, typehints.Any), {}))
     self.assertEqual(th.output_types, ((typehints.Any, ), {}))
 
   def test_pardo_wrapper_builtin_type(self):
     th = beam.ParDo(list).get_type_hints()
-    if sys.version_info < (3, 7):
-      self.assertEqual(
-          th.input_types,
-          ((typehints.Any, typehints.decorators._ANY_VAR_POSITIONAL), {
-              '__unknown__keywords': typehints.decorators._ANY_VAR_KEYWORD
-          }))
-    else:
-      # Python 3.7+ supports signatures for builtins like 'list'.
-      self.assertEqual(th.input_types, ((typehints.Any, ), {}))
+    self.assertEqual(th.input_types, ((typehints.Any, ), {}))
 
     self.assertEqual(th.output_types, ((typehints.Any, ), {}))
 
@@ -1011,6 +998,23 @@ class AnnotationsTest(unittest.TestCase):
     th = beam.Filter(filter_fn).get_type_hints()
     self.assertEqual(th.input_types, ((int, ), {}))
     self.assertEqual(th.output_types, ((int, ), {}))
+
+
+class TestFlatMapTuple(unittest.TestCase):
+  def test_flatmaptuple(self):
+    # Regression test. See
+    # https://github.com/apache/beam/issues/33014
+
+    def identity(x: Tuple[str, int]) -> Tuple[str, int]:
+      return x
+
+    with beam.Pipeline() as p:
+      # Just checking that this doesn't raise an exception.
+      (
+          p
+          | "Generate input" >> beam.Create([('P1', [2])])
+          | "Flat" >> beam.FlatMapTuple(lambda k, vs: [(k, v) for v in vs])
+          | "Identity" >> beam.Map(identity))
 
 
 if __name__ == '__main__':

@@ -21,7 +21,7 @@
 
 import logging
 import os
-import random
+import secrets
 import time
 import unittest
 
@@ -38,14 +38,14 @@ from apache_beam.io.filebasedsink_test import _TestCaseWithTempDirCleanUp
 from apache_beam.io.gcp import bigquery_file_loads as bqfl
 from apache_beam.io.gcp import bigquery
 from apache_beam.io.gcp import bigquery_tools
+from apache_beam.io.gcp.bigquery import BigQueryDisposition
 from apache_beam.io.gcp.internal.clients import bigquery as bigquery_api
 from apache_beam.io.gcp.tests.bigquery_matcher import BigqueryFullResultMatcher
 from apache_beam.io.gcp.tests.bigquery_matcher import BigqueryFullResultStreamingMatcher
+from apache_beam.metrics.metric import Lineage
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import StandardOptions
 from apache_beam.runners.dataflow.test_dataflow_runner import TestDataflowRunner
-from apache_beam.runners.runner import PipelineState
-from apache_beam.testing.pipeline_verifiers import PipelineStateMatcher
 from apache_beam.testing.test_pipeline import TestPipeline
 from apache_beam.testing.test_stream import TestStream
 from apache_beam.testing.util import assert_that
@@ -350,9 +350,9 @@ class TestPartitionFiles(unittest.TestCase):
 
   def test_partition_files_dofn_file_split(self):
     """Force partitions to split based on max_files"""
-    multiple_partitions_result = [('destination0', ['file0', 'file1']),
-                                  ('destination0', ['file2', 'file3'])]
-    single_partition_result = [('destination1', ['file0', 'file1'])]
+    multiple_partitions_result = [('destination0', (0, ['file0', 'file1'])),
+                                  ('destination0', (1, ['file2', 'file3']))]
+    single_partition_result = [('destination1', (0, ['file0', 'file1']))]
     with TestPipeline() as p:
       destination_file_pairs = p | beam.Create(self._ELEMENTS, reshuffle=False)
       partitioned_files = (
@@ -365,20 +365,22 @@ class TestPartitionFiles(unittest.TestCase):
       single_partition = partitioned_files[bqfl.PartitionFiles\
                                            .SINGLE_PARTITION_TAG]
 
-    assert_that(
-        multiple_partitions,
-        equal_to(multiple_partitions_result),
-        label='CheckMultiplePartitions')
-    assert_that(
-        single_partition,
-        equal_to(single_partition_result),
-        label='CheckSinglePartition')
+      assert_that(
+          multiple_partitions,
+          equal_to(multiple_partitions_result),
+          label='CheckMultiplePartitions')
+      assert_that(
+          single_partition,
+          equal_to(single_partition_result),
+          label='CheckSinglePartition')
 
   def test_partition_files_dofn_size_split(self):
     """Force partitions to split based on max_partition_size"""
-    multiple_partitions_result = [('destination0', ['file0', 'file1', 'file2']),
-                                  ('destination0', ['file3'])]
-    single_partition_result = [('destination1', ['file0', 'file1'])]
+    multiple_partitions_result = [
+        ('destination0', (0, ['file0', 'file1',
+                              'file2'])), ('destination0', (1, ['file3']))
+    ]
+    single_partition_result = [('destination1', (0, ['file0', 'file1']))]
     with TestPipeline() as p:
       destination_file_pairs = p | beam.Create(self._ELEMENTS, reshuffle=False)
       partitioned_files = (
@@ -391,17 +393,34 @@ class TestPartitionFiles(unittest.TestCase):
       single_partition = partitioned_files[bqfl.PartitionFiles\
                                            .SINGLE_PARTITION_TAG]
 
-    assert_that(
-        multiple_partitions,
-        equal_to(multiple_partitions_result),
-        label='CheckMultiplePartitions')
-    assert_that(
-        single_partition,
-        equal_to(single_partition_result),
-        label='CheckSinglePartition')
+      assert_that(
+          multiple_partitions,
+          equal_to(multiple_partitions_result),
+          label='CheckMultiplePartitions')
+      assert_that(
+          single_partition,
+          equal_to(single_partition_result),
+          label='CheckSinglePartition')
 
 
 class TestBigQueryFileLoads(_TestCaseWithTempDirCleanUp):
+  def test_trigger_load_jobs_with_empty_files(self):
+    destination = "project:dataset.table"
+    empty_files = []
+    load_job_prefix = "test_prefix"
+
+    with beam.Pipeline() as p:
+      partitions = (
+          p
+          | beam.Create([(destination, empty_files)])
+          | beam.ParDo(bqfl.PartitionFiles(1000, 10)).with_outputs(
+              bqfl.PartitionFiles.MULTIPLE_PARTITIONS_TAG,
+              bqfl.PartitionFiles.SINGLE_PARTITION_TAG))
+
+      _ = (
+          partitions[bqfl.PartitionFiles.SINGLE_PARTITION_TAG]
+          | beam.ParDo(bqfl.TriggerLoadJobs(), load_job_prefix))
+
   def test_records_traverse_transform_with_mocks(self):
     destination = 'project1:dataset1.table1'
 
@@ -459,6 +478,44 @@ class TestBigQueryFileLoads(_TestCaseWithTempDirCleanUp):
 
       assert_that(jobs, equal_to([job_reference]), label='CheckJobs')
 
+  @parameterized.expand([
+      param(compat_version=None),
+      param(compat_version="2.64.0"),
+  ])
+  def test_reshuffle_before_load(self, compat_version):
+    destination = 'project1:dataset1.table1'
+
+    job_reference = bigquery_api.JobReference()
+    job_reference.projectId = 'project1'
+    job_reference.jobId = 'job_name1'
+    result_job = bigquery_api.Job()
+    result_job.jobReference = job_reference
+
+    mock_job = mock.Mock()
+    mock_job.status.state = 'DONE'
+    mock_job.status.errorResult = None
+    mock_job.jobReference = job_reference
+
+    bq_client = mock.Mock()
+    bq_client.jobs.Get.return_value = mock_job
+
+    bq_client.jobs.Insert.return_value = result_job
+
+    transform = bqfl.BigQueryBatchFileLoads(
+        destination,
+        custom_gcs_temp_location=self._new_tempdir(),
+        test_client=bq_client,
+        validate=False,
+        temp_file_format=bigquery_tools.FileFormat.JSON)
+
+    options = PipelineOptions(update_compatibility_version=compat_version)
+    # Need to test this with the DirectRunner to avoid serializing mocks
+    with TestPipeline('DirectRunner', options=options) as p:
+      _ = p | beam.Create(_ELEMENTS) | transform
+
+    reshuffle_before_load = compat_version is None
+    assert transform.reshuffle_before_load == reshuffle_before_load
+
   def test_load_job_id_used(self):
     job_reference = bigquery_api.JobReference()
     job_reference.projectId = 'loadJobProject'
@@ -484,12 +541,18 @@ class TestBigQueryFileLoads(_TestCaseWithTempDirCleanUp):
         validate=False,
         load_job_project_id='loadJobProject')
 
-    with TestPipeline('DirectRunner') as p:
+    # TODO(https://github.com/apache/beam/issues/34549): This test relies on
+    # lineage metrics which Prism doesn't seem to handle correctly. Defaulting
+    # to FnApiRunner instead.
+    with TestPipeline('FnApiRunner') as p:
       outputs = p | beam.Create(_ELEMENTS) | transform
       jobs = outputs[bqfl.BigQueryBatchFileLoads.DESTINATION_JOBID_PAIRS] \
              | "GetJobs" >> beam.Map(lambda x: x[1])
 
       assert_that(jobs, equal_to([job_reference]), label='CheckJobProjectIds')
+    self.assertSetEqual(
+        Lineage.query(p.result.metrics(), Lineage.SINK),
+        set(["bigquery:project1.dataset1.table1"]))
 
   def test_load_job_id_use_for_copy_job(self):
     destination = 'project1:dataset1.table1'
@@ -511,7 +574,10 @@ class TestBigQueryFileLoads(_TestCaseWithTempDirCleanUp):
     bq_client.jobs.Insert.return_value = result_job
     bq_client.tables.Delete.return_value = None
 
-    with TestPipeline('DirectRunner') as p:
+    # TODO(https://github.com/apache/beam/issues/34549): This test relies on
+    # lineage metrics which Prism doesn't seem to handle correctly. Defaulting
+    # to FnApiRunner instead.
+    with TestPipeline('FnApiRunner') as p:
       outputs = (
           p
           | beam.Create(_ELEMENTS, reshuffle=False)
@@ -542,14 +608,20 @@ class TestBigQueryFileLoads(_TestCaseWithTempDirCleanUp):
               job_reference
           ]),
           label='CheckCopyJobProjectIds')
+    self.assertSetEqual(
+        Lineage.query(p.result.metrics(), Lineage.SINK),
+        set(["bigquery:project1.dataset1.table1"]))
 
   @mock.patch('time.sleep')
-  def test_wait_for_job_completion(self, sleep_mock):
-    job_references = [bigquery_api.JobReference(), bigquery_api.JobReference()]
-    job_references[0].projectId = 'project1'
-    job_references[0].jobId = 'jobId1'
-    job_references[1].projectId = 'project1'
-    job_references[1].jobId = 'jobId2'
+  def test_wait_for_load_job_completion(self, sleep_mock):
+    job_1 = bigquery_api.Job()
+    job_1.jobReference = bigquery_api.JobReference()
+    job_1.jobReference.projectId = 'project1'
+    job_1.jobReference.jobId = 'jobId1'
+    job_2 = bigquery_api.Job()
+    job_2.jobReference = bigquery_api.JobReference()
+    job_2.jobReference.projectId = 'project1'
+    job_2.jobReference.jobId = 'jobId2'
 
     job_1_waiting = mock.Mock()
     job_1_waiting.status.state = 'RUNNING'
@@ -565,26 +637,34 @@ class TestBigQueryFileLoads(_TestCaseWithTempDirCleanUp):
     bq_client.jobs.Get.side_effect = [
         job_1_waiting, job_2_done, job_1_done, job_2_done
     ]
+    partition_1 = ('project:dataset.table0', (0, ['file0']))
+    partition_2 = ('project:dataset.table1', (1, ['file1']))
+    bq_client.jobs.Insert.side_effect = [job_1, job_2]
+    test_job_prefix = "test_job"
 
-    waiting_dofn = bqfl.WaitForBQJobs(bq_client)
-
-    dest_list = [(i, job) for i, job in enumerate(job_references)]
-
+    expected_dest_jobref_list = [(partition_1[0], job_1.jobReference),
+                                 (partition_2[0], job_2.jobReference)]
     with TestPipeline('DirectRunner') as p:
-      references = beam.pvalue.AsList(p | 'job_ref' >> beam.Create(dest_list))
-      outputs = (p | beam.Create(['']) | beam.ParDo(waiting_dofn, references))
+      partitions = p | beam.Create([partition_1, partition_2])
+      outputs = (
+          partitions
+          | beam.ParDo(
+              bqfl.TriggerLoadJobs(test_client=bq_client), test_job_prefix))
 
-      assert_that(outputs, equal_to(dest_list))
+      assert_that(outputs, equal_to(expected_dest_jobref_list))
 
     sleep_mock.assert_called_once()
 
   @mock.patch('time.sleep')
-  def test_one_job_failed_after_waiting(self, sleep_mock):
-    job_references = [bigquery_api.JobReference(), bigquery_api.JobReference()]
-    job_references[0].projectId = 'project1'
-    job_references[0].jobId = 'jobId1'
-    job_references[1].projectId = 'project1'
-    job_references[1].jobId = 'jobId2'
+  def test_one_load_job_failed_after_waiting(self, sleep_mock):
+    job_1 = bigquery_api.Job()
+    job_1.jobReference = bigquery_api.JobReference()
+    job_1.jobReference.projectId = 'project1'
+    job_1.jobReference.jobId = 'jobId1'
+    job_2 = bigquery_api.Job()
+    job_2.jobReference = bigquery_api.JobReference()
+    job_2.jobReference.projectId = 'project1'
+    job_2.jobReference.jobId = 'jobId2'
 
     job_1_waiting = mock.Mock()
     job_1_waiting.status.state = 'RUNNING'
@@ -600,15 +680,18 @@ class TestBigQueryFileLoads(_TestCaseWithTempDirCleanUp):
     bq_client.jobs.Get.side_effect = [
         job_1_waiting, job_2_done, job_1_error, job_2_done
     ]
-
-    waiting_dofn = bqfl.WaitForBQJobs(bq_client)
-
-    dest_list = [(i, job) for i, job in enumerate(job_references)]
+    partition_1 = ('project:dataset.table0', (0, ['file0']))
+    partition_2 = ('project:dataset.table1', (1, ['file1']))
+    bq_client.jobs.Insert.side_effect = [job_1, job_2]
+    test_job_prefix = "test_job"
 
     with self.assertRaises(Exception):
       with TestPipeline('DirectRunner') as p:
-        references = beam.pvalue.AsList(p | 'job_ref' >> beam.Create(dest_list))
-        _ = (p | beam.Create(['']) | beam.ParDo(waiting_dofn, references))
+        partitions = p | beam.Create([partition_1, partition_2])
+        _ = (
+            partitions
+            | beam.ParDo(
+                bqfl.TriggerLoadJobs(test_client=bq_client), test_job_prefix))
 
     sleep_mock.assert_called_once()
 
@@ -632,7 +715,10 @@ class TestBigQueryFileLoads(_TestCaseWithTempDirCleanUp):
     bq_client.jobs.Insert.return_value = result_job
     bq_client.tables.Delete.return_value = None
 
-    with TestPipeline('DirectRunner') as p:
+    # TODO(https://github.com/apache/beam/issues/34549): This test relies on
+    # lineage metrics which Prism doesn't seem to handle correctly. Defaulting
+    # to FnApiRunner instead.
+    with TestPipeline('FnApiRunner') as p:
       outputs = (
           p
           | beam.Create(_ELEMENTS, reshuffle=False)
@@ -685,13 +771,66 @@ class TestBigQueryFileLoads(_TestCaseWithTempDirCleanUp):
           copy_jobs | "CountCopyJobs" >> combiners.Count.Globally(),
           equal_to([6]),
           label='CheckCopyJobCount')
+    self.assertSetEqual(
+        Lineage.query(p.result.metrics(), Lineage.SINK),
+        set(["bigquery:project1.dataset1.table1"]))
 
   @parameterized.expand([
-      param(is_streaming=False, with_auto_sharding=False),
-      param(is_streaming=True, with_auto_sharding=False),
-      param(is_streaming=True, with_auto_sharding=True),
+      param(write_disposition=BigQueryDisposition.WRITE_TRUNCATE),
+      param(write_disposition=BigQueryDisposition.WRITE_EMPTY)
   ])
-  def test_triggering_frequency(self, is_streaming, with_auto_sharding):
+  @mock.patch(
+      'apache_beam.io.gcp.bigquery_file_loads.TriggerCopyJobs.process',
+      wraps=lambda *x: None)
+  def test_multiple_partition_files_write_dispositions(
+      self, mock_call_process, write_disposition):
+    destination = 'project1:dataset1.table1'
+
+    job_reference = bigquery_api.JobReference()
+    job_reference.projectId = 'project1'
+    job_reference.jobId = 'job_name1'
+    result_job = mock.Mock()
+    result_job.jobReference = job_reference
+
+    mock_job = mock.Mock()
+    mock_job.status.state = 'DONE'
+    mock_job.status.errorResult = None
+    mock_job.jobReference = job_reference
+
+    bq_client = mock.Mock()
+    bq_client.jobs.Get.return_value = mock_job
+
+    bq_client.jobs.Insert.return_value = result_job
+    bq_client.tables.Delete.return_value = None
+
+    with TestPipeline('DirectRunner') as p:
+      _ = (
+          p
+          | beam.Create(_ELEMENTS, reshuffle=False)
+          | bqfl.BigQueryBatchFileLoads(
+              destination,
+              custom_gcs_temp_location=self._new_tempdir(),
+              test_client=bq_client,
+              validate=False,
+              temp_file_format=bigquery_tools.FileFormat.JSON,
+              max_file_size=45,
+              max_partition_size=80,
+              max_files_per_partition=2,
+              write_disposition=write_disposition))
+    # TriggerCopyJob only processes once
+    self.assertEqual(mock_call_process.call_count, 1)
+
+  @parameterized.expand([
+      param(is_streaming=False, with_auto_sharding=False, compat_version=None),
+      param(is_streaming=True, with_auto_sharding=False, compat_version=None),
+      param(is_streaming=True, with_auto_sharding=True, compat_version=None),
+      param(
+          is_streaming=True, with_auto_sharding=False, compat_version="2.64.0"),
+      param(
+          is_streaming=True, with_auto_sharding=True, compat_version="2.64.0"),
+  ])
+  def test_triggering_frequency(
+      self, is_streaming, with_auto_sharding, compat_version):
     destination = 'project1:dataset1.table1'
 
     job_reference = bigquery_api.JobReference()
@@ -733,19 +872,21 @@ class TestBigQueryFileLoads(_TestCaseWithTempDirCleanUp):
         with_auto_sharding=with_auto_sharding)
 
     # Need to test this with the DirectRunner to avoid serializing mocks
-    test_options = PipelineOptions(flags=['--allow_unsafe_triggers'])
+    test_options = PipelineOptions(
+        flags=['--allow_unsafe_triggers'],
+        update_compatibility_version=compat_version)
     test_options.view_as(StandardOptions).streaming = is_streaming
     with TestPipeline(runner='BundleBasedDirectRunner',
                       options=test_options) as p:
       if is_streaming:
         _SIZE = len(_ELEMENTS)
         fisrt_batch = [
-            TimestampedValue(value, start_time + i + 1) for i,
-            value in enumerate(_ELEMENTS[:_SIZE // 2])
+            TimestampedValue(value, start_time + i + 1)
+            for i, value in enumerate(_ELEMENTS[:_SIZE // 2])
         ]
         second_batch = [
-            TimestampedValue(value, start_time + _SIZE // 2 + i + 1) for i,
-            value in enumerate(_ELEMENTS[_SIZE // 2:])
+            TimestampedValue(value, start_time + _SIZE // 2 + i + 1)
+            for i, value in enumerate(_ELEMENTS[_SIZE // 2:])
         ]
         # Advance processing time between batches of input elements to fire the
         # user triggers. Intentionally advance the processing time twice for the
@@ -818,15 +959,74 @@ class BigQueryFileLoadsIT(unittest.TestCase):
     self.runner_name = type(self.test_pipeline.runner).__name__
     self.project = self.test_pipeline.get_option('project')
 
-    self.dataset_id = '%s%s%d' % (
-        self.BIG_QUERY_DATASET_ID,
-        str(int(time.time())),
-        random.randint(0, 10000))
+    self.dataset_id = '%s%d%s' % (
+        self.BIG_QUERY_DATASET_ID, int(time.time()), secrets.token_hex(3))
     self.bigquery_client = bigquery_tools.BigQueryWrapper()
     self.bigquery_client.get_or_create_dataset(self.project, self.dataset_id)
     self.output_table = "%s.output_table" % (self.dataset_id)
     _LOGGER.info(
         "Created dataset %s in project %s", self.dataset_id, self.project)
+
+  @pytest.mark.it_postcommit
+  def test_batch_copy_jobs_with_no_input_schema(self):
+    schema_1 = "col_1:INTEGER"
+    schema_2 = "col_2:INTEGER"
+
+    # create two tables with different schemas
+    # test to make sure this works with dynamic destinations too
+    self.bigquery_client.get_or_create_table(
+        project_id=self.project,
+        dataset_id=self.dataset_id,
+        table_id="output_table_1",
+        schema=bigquery_tools.get_table_schema_from_string(schema_1),
+        create_disposition='CREATE_IF_NEEDED',
+        write_disposition='WRITE_APPEND')
+    self.bigquery_client.get_or_create_table(
+        project_id=self.project,
+        dataset_id=self.dataset_id,
+        table_id="output_table_2",
+        schema=bigquery_tools.get_table_schema_from_string(schema_2),
+        create_disposition='CREATE_IF_NEEDED',
+        write_disposition='WRITE_APPEND')
+
+    verifiers = [
+        BigqueryFullResultMatcher(
+            project=self.project,
+            query="SELECT * FROM %s" % (self.output_table + "_1"),
+            data=[(i, ) for i in range(5)]),
+        BigqueryFullResultMatcher(
+            project=self.project,
+            query="SELECT * FROM %s" % (self.output_table + "_2"),
+            data=[(i, ) for i in range(5, 10)])
+    ]
+
+    output = self.output_table
+
+    def callable_table(el: dict):
+      dest = output
+      if "col_1" in el:
+        dest += "_1"
+      elif "col_2" in el:
+        dest += "_2"
+      return dest
+
+    args = self.test_pipeline.get_full_options_as_args()
+
+    with beam.Pipeline(argv=args) as p:
+      # 0...4 going to table 1
+      # 5...9 going to table 2
+      items = [{"col_1": i} for i in range(5)]
+      items.extend([{"col_2": i} for i in range(5, 10)])
+      _ = (
+          p | beam.Create(items) | bigquery.WriteToBigQuery(
+              table=callable_table,
+              create_disposition="CREATE_NEVER",
+              write_disposition="WRITE_APPEND",
+              # reduce load job size to induce copy jobs
+              max_file_size=10,
+              max_partition_size=20))
+
+    hamcrest_assert(p, all_of(*verifiers))
 
   @pytest.mark.it_postcommit
   def test_multiple_destinations_transform(self):
@@ -864,8 +1064,7 @@ class BigQueryFileLoadsIT(unittest.TestCase):
                   if 'foundation' in d])
     ]
 
-    args = self.test_pipeline.get_full_options_as_args(
-        on_success_matcher=all_of(*pipeline_verifiers))
+    args = self.test_pipeline.get_full_options_as_args()
 
     with beam.Pipeline(argv=args) as p:
       input = p | beam.Create(_ELEMENTS, reshuffle=False)
@@ -886,12 +1085,10 @@ class BigQueryFileLoadsIT(unittest.TestCase):
 
       _ = (
           input | "WriteWithMultipleDestsFreely" >> bigquery.WriteToBigQuery(
-              table=lambda x,
-              tables:
+              table=lambda x, tables:
               (tables['table1'] if 'language' in x else tables['table2']),
               table_side_inputs=(table_record_pcv, ),
-              schema=lambda dest,
-              schema_map: schema_map.get(dest, None),
+              schema=lambda dest, schema_map: schema_map.get(dest, None),
               schema_side_inputs=(schema_map_pcv, ),
               create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED,
               write_disposition=beam.io.BigQueryDisposition.WRITE_EMPTY))
@@ -900,13 +1097,13 @@ class BigQueryFileLoadsIT(unittest.TestCase):
           input | "WriteWithMultipleDests" >> bigquery.WriteToBigQuery(
               table=lambda x:
               (output_table_3 if 'language' in x else output_table_4),
-              schema=lambda dest,
-              schema_map: schema_map.get(dest, None),
+              schema=lambda dest, schema_map: schema_map.get(dest, None),
               schema_side_inputs=(schema_map_pcv, ),
               create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED,
               write_disposition=beam.io.BigQueryDisposition.WRITE_EMPTY,
               max_file_size=20,
               max_files_per_bundle=-1))
+    hamcrest_assert(p, all_of(*pipeline_verifiers))
 
   @pytest.mark.it_postcommit
   def test_bqfl_streaming(self):
@@ -917,14 +1114,13 @@ class BigQueryFileLoadsIT(unittest.TestCase):
     schema = self.BIG_QUERY_STREAMING_SCHEMA
     l = [{'Integr': i} for i in range(_SIZE)]
 
-    state_matcher = PipelineStateMatcher(PipelineState.RUNNING)
     bq_matcher = BigqueryFullResultStreamingMatcher(
         project=self.project,
         query="SELECT Integr FROM %s" % output_table,
         data=[(i, ) for i in range(100)])
 
     args = self.test_pipeline.get_full_options_as_args(
-        on_success_matcher=all_of(state_matcher, bq_matcher),
+        on_success_matcher=bq_matcher,
         streaming=True,
         allow_unsafe_triggers=True)
     with beam.Pipeline(argv=args) as p:
@@ -945,6 +1141,102 @@ class BigQueryFileLoadsIT(unittest.TestCase):
                                       method=bigquery.WriteToBigQuery \
                                         .Method.FILE_LOADS,
                                       triggering_frequency=100))
+
+    hamcrest_assert(p, bq_matcher)
+
+  @pytest.mark.it_postcommit
+  def test_bqfl_streaming_with_copy_jobs(self):
+    if isinstance(self.test_pipeline.runner, TestDataflowRunner):
+      self.skipTest("TestStream is not supported on TestDataflowRunner")
+    output_table = '%s_%s' % (self.output_table, 'with_copy_jobs')
+    _SIZE = 100
+    schema = self.BIG_QUERY_STREAMING_SCHEMA
+    l = [{'Integr': i} for i in range(_SIZE)]
+
+    bq_matcher = BigqueryFullResultStreamingMatcher(
+        project=self.project,
+        query="SELECT Integr FROM %s" % output_table,
+        data=[(i, ) for i in range(100)])
+
+    args = self.test_pipeline.get_full_options_as_args(
+        on_success_matcher=bq_matcher,
+        streaming=True,
+        allow_unsafe_triggers=True)
+
+    # Override these parameters to induce copy jobs
+    bqfl._DEFAULT_MAX_FILE_SIZE = 100
+    bqfl._MAXIMUM_LOAD_SIZE = 200
+
+    with beam.Pipeline(argv=args) as p:
+      stream_source = (
+          TestStream().advance_watermark_to(0).advance_processing_time(
+              100).add_elements(l[:_SIZE // 4]).
+          advance_processing_time(100).advance_watermark_to(100).add_elements(
+              l[_SIZE // 4:2 * _SIZE // 4]).advance_processing_time(
+                  100).advance_watermark_to(200).add_elements(
+                      l[2 * _SIZE // 4:3 * _SIZE // 4]).advance_processing_time(
+                          100).advance_watermark_to(300).add_elements(
+                              l[3 * _SIZE // 4:]).advance_processing_time(100).
+          advance_watermark_to_infinity().advance_processing_time(100))
+
+      _ = (p
+           | stream_source
+           | bigquery.WriteToBigQuery(output_table,
+                                      schema=schema,
+                                      method=bigquery.WriteToBigQuery \
+                                      .Method.FILE_LOADS,
+                                      triggering_frequency=100))
+
+    hamcrest_assert(p, bq_matcher)
+
+  @pytest.mark.it_postcommit
+  def test_bqfl_streaming_with_dynamic_destinations(self):
+    if isinstance(self.test_pipeline.runner, TestDataflowRunner):
+      self.skipTest("TestStream is not supported on TestDataflowRunner")
+    even_table = '%s_%s' % (self.output_table, "dynamic_dest_0")
+    odd_table = '%s_%s' % (self.output_table, "dynamic_dest_1")
+    output_table = lambda row: even_table if (
+        row['Integr'] % 2 == 0) else odd_table
+    _SIZE = 100
+    schema = self.BIG_QUERY_STREAMING_SCHEMA
+    l = [{'Integr': i} for i in range(_SIZE)]
+
+    pipeline_verifiers = [
+        BigqueryFullResultStreamingMatcher(
+            project=self.project,
+            query="SELECT Integr FROM %s" % even_table,
+            data=[(i, ) for i in range(0, 100, 2)]),
+        BigqueryFullResultStreamingMatcher(
+            project=self.project,
+            query="SELECT Integr FROM %s" % odd_table,
+            data=[(i, ) for i in range(1, 100, 2)])
+    ]
+
+    args = self.test_pipeline.get_full_options_as_args(
+        on_success_matcher=all_of(*pipeline_verifiers),
+        streaming=True,
+        allow_unsafe_triggers=True)
+
+    with beam.Pipeline(argv=args) as p:
+      stream_source = (
+          TestStream().advance_watermark_to(0).advance_processing_time(
+              100).add_elements(l[:_SIZE // 4]).
+          advance_processing_time(100).advance_watermark_to(100).add_elements(
+              l[_SIZE // 4:2 * _SIZE // 4]).advance_processing_time(
+                  100).advance_watermark_to(200).add_elements(
+                      l[2 * _SIZE // 4:3 * _SIZE // 4]).advance_processing_time(
+                          100).advance_watermark_to(300).add_elements(
+                              l[3 * _SIZE // 4:]).advance_processing_time(100).
+          advance_watermark_to_infinity().advance_processing_time(100))
+
+      _ = (p
+           | stream_source
+           | bigquery.WriteToBigQuery(output_table,
+                                      schema=schema,
+                                      method=bigquery.WriteToBigQuery \
+                                      .Method.FILE_LOADS,
+                                      triggering_frequency=100))
+    hamcrest_assert(p, all_of(*pipeline_verifiers))
 
   @pytest.mark.it_postcommit
   def test_one_job_fails_all_jobs_fail(self):

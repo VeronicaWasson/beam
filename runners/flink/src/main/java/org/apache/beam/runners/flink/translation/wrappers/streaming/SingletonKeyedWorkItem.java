@@ -20,7 +20,7 @@ package org.apache.beam.runners.flink.translation.wrappers.streaming;
 import java.util.Collections;
 import org.apache.beam.runners.core.KeyedWorkItem;
 import org.apache.beam.runners.core.TimerInternals;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValue;
 
 /** Singleton keyed word item. */
 public class SingletonKeyedWorkItem<K, ElemT> implements KeyedWorkItem<K, ElemT> {
@@ -50,5 +50,10 @@ public class SingletonKeyedWorkItem<K, ElemT> implements KeyedWorkItem<K, ElemT>
   @Override
   public Iterable<WindowedValue<ElemT>> elementsIterable() {
     return Collections.singletonList(value);
+  }
+
+  @Override
+  public String toString() {
+    return String.format("{%s, [%s]}", key, value);
   }
 }

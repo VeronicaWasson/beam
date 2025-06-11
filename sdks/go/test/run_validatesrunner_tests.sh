@@ -65,9 +65,6 @@
 #        example in the format "us.gcr.io/<project>".
 #    --region -> GCP region to run Dataflow jobs on.
 #    --gcs_location -> GCS URL for storing temporary files for Dataflow jobs.
-#    --dataflow_worker_jar -> The Dataflow worker jar to use when running jobs.
-#        If not specified, the script attempts to retrieve a previously built
-#        jar from the appropriate gradle module, which may not succeed.
 
 set -e
 trap '! [[ "$BASH_COMMAND" =~ ^(echo|read|if|ARGS|shift|SOCKET_SCRIPT|\[\[) ]] && \
@@ -84,7 +81,7 @@ RUNNER=portable
 
 # Default timeout. This timeout is applied per-package, as tests in different
 # packages are executed in parallel.
-TIMEOUT=2h
+TIMEOUT=3h
 
 # Default limit on simultaneous test binaries/packages being executed.
 SIMULTANEOUS=3
@@ -162,11 +159,6 @@ case $key in
         shift # past argument
         shift # past value
         ;;
-    --dataflow_worker_jar)
-        DATAFLOW_WORKER_JAR="$2"
-        shift # past argument
-        shift # past value
-        ;;
     --flink_job_server_jar)
         FLINK_JOB_SERVER_JAR="$2"
         shift # past argument
@@ -237,6 +229,11 @@ case $key in
         shift # past argument
         shift # past value
         ;;
+    --java11_home)
+        JAVA11_HOME="$2"
+        shift # past argument
+        shift # past value
+        ;;
     *)    # unknown option
         echo "Unknown option: $1"
         exit 1
@@ -260,13 +257,10 @@ print(s.getsockname()[1])
 s.close()
 "
 
+TMPDIR=$(mktemp -d)
+
 # Set up environment based on runner.
-if [[ "$RUNNER" == "dataflow" ]]; then
-  if [[ -z "$DATAFLOW_WORKER_JAR" ]]; then
-    DATAFLOW_WORKER_JAR=$(find $(pwd)/runners/google-cloud-dataflow-java/worker/build/libs/beam-runners-google-cloud-dataflow-java-fn-api-worker-*.jar)
-  fi
-  echo "Using Dataflow worker jar: $DATAFLOW_WORKER_JAR"
-elif [[ "$RUNNER" == "flink" || "$RUNNER" == "spark" || "$RUNNER" == "samza" || "$RUNNER" == "portable" ]]; then
+if [[ "$RUNNER" == "flink" || "$RUNNER" == "spark" || "$RUNNER" == "samza" || "$RUNNER" == "portable" || "$RUNNER" == "prism" ]]; then
   if [[ -z "$ENDPOINT" ]]; then
     JOB_PORT=$(python3 -c "$SOCKET_SCRIPT")
     ENDPOINT="localhost:$JOB_PORT"
@@ -296,6 +290,14 @@ elif [[ "$RUNNER" == "flink" || "$RUNNER" == "spark" || "$RUNNER" == "samza" || 
       python3 \
           -m apache_beam.runners.portability.local_job_service_main \
           --port $JOB_PORT &
+    elif [[ "$RUNNER" == "prism" ]]; then
+      PRISMBIN=$TMPDIR/prismbin
+      cd sdks
+      ./go/run_with_go_version.sh build -o $PRISMBIN go/cmd/prism/*.go
+      $PRISMBIN \
+      --serve_http=false \
+      --job_port $JOB_PORT &
+      cd ..
     else
       echo "Unknown runner: $RUNNER"
       exit 1;
@@ -348,7 +350,6 @@ if [[ "$RUNNER" == "dataflow" ]]; then
   gcloud --version
 
   # ensure gcloud is version 186 or above
-  TMPDIR=$(mktemp -d)
   gcloud_ver=$(gcloud -v | head -1 | awk '{print $4}')
   if [[ "$gcloud_ver" < "186" ]]
   then
@@ -366,13 +367,19 @@ if [[ "$RUNNER" == "dataflow" ]]; then
   TAG=$(date +%Y%m%d-%H%M%S)
   CONTAINER=us.gcr.io/$PROJECT/$USER/beam_go_sdk
   echo "Using container $CONTAINER"
-  ./gradlew :sdks:go:container:docker -Pdocker-repository-root=us.gcr.io/$PROJECT/$USER -Pdocker-tag=$TAG
 
-  # Verify it exists
-  docker images | grep $TAG
+  # TODO(https://github.com/apache/beam/issues/27674): remove this branch once the jenkins VM can build multiarch, or jenkins is deprecated.
+  if [[ "$USER" == "jenkins" ]]; then
+    ./gradlew :sdks:go:container:docker -Pdocker-repository-root=us.gcr.io/$PROJECT/$USER -Pdocker-tag=$TAG
 
-  # Push the container
-  gcloud docker -- push $CONTAINER:$TAG
+    # Verify it exists
+    docker images | grep $TAG
+
+    # Push the container
+    gcloud docker -- push $CONTAINER:$TAG
+  else 
+    ./gradlew :sdks:go:container:docker -Pdocker-repository-root=us.gcr.io/$PROJECT/$USER -Pdocker-tag=$TAG -Pcontainer-architecture-list=arm64,amd64 -Ppush-containers
+  fi
 
   if [[ -n "$TEST_EXPANSION_ADDR" || -n "$IO_EXPANSION_ADDR" || -n "$SCHEMAIO_EXPANSION_ADDR" || -n "$DEBEZIUMIO_EXPANSION_ADDR" ]]; then
     ARGS="$ARGS --experiments=use_portable_job_submission"
@@ -382,7 +389,7 @@ if [[ "$RUNNER" == "dataflow" ]]; then
       JAVA_TAG=$(date +%Y%m%d-%H%M%S)
       JAVA_CONTAINER=us.gcr.io/$PROJECT/$USER/beam_java11_sdk
       echo "Using container $JAVA_CONTAINER for cross-language java transforms"
-      ./gradlew :sdks:java:container:java11:docker -Pdocker-repository-root=us.gcr.io/$PROJECT/$USER -Pdocker-tag=$JAVA_TAG
+      ./gradlew :sdks:java:container:java11:docker -Pdocker-repository-root=us.gcr.io/$PROJECT/$USER -Pdocker-tag=$JAVA_TAG -Pjava11Home=$JAVA11_HOME
 
       # Verify it exists
       docker images | grep $JAVA_TAG
@@ -404,6 +411,7 @@ fi
 ARGS="$ARGS -p $SIMULTANEOUS"
 
 # Assemble test arguments and pipeline options.
+ARGS="$ARGS -v"
 ARGS="$ARGS -timeout $TIMEOUT"
 ARGS="$ARGS --runner=$RUNNER"
 ARGS="$ARGS --project=$DATAFLOW_PROJECT"
@@ -412,7 +420,6 @@ ARGS="$ARGS --environment_type=DOCKER"
 ARGS="$ARGS --environment_config=$CONTAINER:$TAG"
 ARGS="$ARGS --staging_location=$GCS_LOCATION/staging-validatesrunner-test/$GCS_SUBFOLDER"
 ARGS="$ARGS --temp_location=$GCS_LOCATION/temp-validatesrunner-test/$GCS_SUBFOLDER"
-ARGS="$ARGS --dataflow_worker_jar=$DATAFLOW_WORKER_JAR"
 ARGS="$ARGS --endpoint=$ENDPOINT"
 if [[ -n "$TEST_EXPANSION_ADDR" ]]; then
   ARGS="$ARGS --test_expansion_addr=$TEST_EXPANSION_ADDR"
@@ -440,17 +447,21 @@ cd ../..
 
 if [[ "$RUNNER" == "dataflow" ]]; then
   # Delete the container locally and remotely
-  docker rmi $CONTAINER:$TAG || echo "Failed to remove container"
-  gcloud --quiet container images delete $CONTAINER:$TAG || echo "Failed to delete container"
-
+  docker rmi $CONTAINER:$TAG || echo "Built container image was not removed. Possibly, it was not not saved locally."
+  # Note: we don't delete the multi-arch containers here because this command only deletes the manifest list with the tag,
+  # the associated container images can't be deleted because they are not tagged. However, multi-arch containers that are
+  # older than 6 weeks old are deleted by stale_dataflow_prebuilt_image_cleaner.sh that runs daily.
+  if [[ "$USER" == "jenkins" ]]; then
+    gcloud --quiet container images delete $CONTAINER:$TAG || echo "Failed to delete container"
+  fi
   if [[ -n "$TEST_EXPANSION_ADDR" || -n "$IO_EXPANSION_ADDR" || -n "$SCHEMAIO_EXPANSION_ADDR" || -n "$DEBEZIUMIO_EXPANSION_ADDR" ]]; then
     # Delete the java cross-language container locally and remotely
     docker rmi $JAVA_CONTAINER:$JAVA_TAG || echo "Failed to remove container"
     gcloud --quiet container images delete $JAVA_CONTAINER:$JAVA_TAG || echo "Failed to delete container"
   fi
-
-  # Clean up tempdir
-  rm -rf $TMPDIR
 fi
+
+# Clean up tempdir
+rm -rf $TMPDIR
 
 exit $TEST_EXIT_CODE

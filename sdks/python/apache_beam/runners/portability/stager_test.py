@@ -42,6 +42,11 @@ from apache_beam.runners.portability import stager
 
 _LOGGER = logging.getLogger(__name__)
 
+try:
+  import setuptools
+except ImportError:
+  setuptools = None
+
 
 class StagerTest(unittest.TestCase):
   def setUp(self):
@@ -75,7 +80,7 @@ class StagerTest(unittest.TestCase):
   def is_remote_path(self, path):
     return path.startswith('/tmp/remote/')
 
-  remote_copied_files = []  # type: List[str]
+  remote_copied_files: List[str] = []
 
   def file_copy(self, from_path, to_path):
     if self.is_remote_path(from_path):
@@ -95,62 +100,6 @@ class StagerTest(unittest.TestCase):
     _ = requirements_file
     self.create_temp_file(os.path.join(cache_dir, 'abc.txt'), 'nothing')
     self.create_temp_file(os.path.join(cache_dir, 'def.txt'), 'nothing')
-
-  def build_fake_pip_download_command_handler(self, has_wheels):
-    """A stub for apache_beam.utils.processes.check_output that imitates pip.
-
-      Args:
-        has_wheels: Whether pip fake should have a whl distribution of packages.
-      """
-    def pip_fake(args):
-      """Fakes fetching a package from pip by creating a temporary file.
-
-          Args:
-            args: a complete list of command line arguments to invoke pip.
-              The fake is sensitive to the order of the arguments.
-              Supported commands:
-
-              1) Download SDK sources file:
-              python pip -m download --dest /tmp/dir apache-beam==2.0.0 \
-                  --no-deps --no-binary :all:
-
-              2) Download SDK binary wheel file:
-              python pip -m download --dest /tmp/dir apache-beam==2.0.0 \
-                  --no-deps --no-binary :all: --python-version 27 \
-                  --implementation cp --abi cp27mu --platform manylinux1_x86_64
-          """
-      package_file = None
-      if len(args) >= 8:
-        # package_name==x.y.z
-        if '==' in args[6]:
-          distribution_name = args[6][0:args[6].find('==')]
-          distribution_version = args[6][args[6].find('==') + 2:]
-
-          if args[8] == '--no-binary':
-            package_file = '%s-%s.zip' % (
-                distribution_name, distribution_version)
-          elif args[8] == '--only-binary' and len(args) >= 18:
-            if not has_wheels:
-              # Imitate the case when desired wheel distribution is not in PyPI.
-              raise RuntimeError('No matching distribution.')
-
-            # Per PEP-0427 in wheel filenames non-alphanumeric characters
-            # in distribution name are replaced with underscore.
-            distribution_name = distribution_name.replace('-', '_')
-            package_file = '%s-%s-%s%s-%s-%s.whl' % (
-                distribution_name,
-                distribution_version,
-                args[13],  # implementation
-                args[11],  # python version
-                args[15],  # abi tag
-                args[17]  # platform
-            )
-
-      assert package_file, 'Pip fake does not support the command: ' + str(args)
-      self.create_temp_file(
-          FileSystems.join(args[5], package_file), 'Package content.')
-
-    return pip_fake
 
   @mock.patch('apache_beam.runners.portability.stager.open')
   @mock.patch('apache_beam.runners.portability.stager.get_new_http')
@@ -218,7 +167,7 @@ class StagerTest(unittest.TestCase):
     options.view_as(SetupOptions).save_main_session = False
     self.update_options(options)
 
-    self.assertEqual([],
+    self.assertEqual([stager.SUBMISSION_ENV_DEPENDENCIES_FILE],
                      self.stager.create_and_stage_job_resources(
                          options, staging_location=staging_dir)[1])
 
@@ -236,7 +185,10 @@ class StagerTest(unittest.TestCase):
     options.view_as(SetupOptions).pickle_library = pickler.USE_DILL
     self.update_options(options)
 
-    self.assertEqual([names.PICKLED_MAIN_SESSION_FILE],
+    self.assertEqual([
+        names.PICKLED_MAIN_SESSION_FILE,
+        stager.SUBMISSION_ENV_DEPENDENCIES_FILE
+    ],
                      self.stager.create_and_stage_job_resources(
                          options, staging_location=staging_dir)[1])
     self.assertTrue(
@@ -255,7 +207,7 @@ class StagerTest(unittest.TestCase):
     # session is saved when pickle_library==cloudpickle.
     options.view_as(SetupOptions).pickle_library = pickler.USE_CLOUDPICKLE
     self.update_options(options)
-    self.assertEqual([],
+    self.assertEqual([stager.SUBMISSION_ENV_DEPENDENCIES_FILE],
                      self.stager.create_and_stage_job_resources(
                          options, staging_location=staging_dir)[1])
 
@@ -264,9 +216,18 @@ class StagerTest(unittest.TestCase):
     options = PipelineOptions()
     self.update_options(options)
 
-    self.assertEqual([],
+    self.assertEqual([stager.SUBMISSION_ENV_DEPENDENCIES_FILE],
                      self.stager.create_and_stage_job_resources(
                          options, staging_location=staging_dir)[1])
+
+  def test_no_submission_env_staging(self):
+    staging_dir = self.make_temp_dir()
+    options = PipelineOptions()
+    self.update_options(options)
+
+    resources = self.stager.create_job_resources(
+        options, staging_dir, log_submission_env_dependencies=False)
+    self.assertEqual([], resources)
 
   def test_with_requirements_file(self):
     staging_dir = self.make_temp_dir()
@@ -281,7 +242,12 @@ class StagerTest(unittest.TestCase):
     self.create_temp_file(
         os.path.join(source_dir, stager.REQUIREMENTS_FILE), 'nothing')
     self.assertEqual(
-        sorted([stager.REQUIREMENTS_FILE, 'abc.txt', 'def.txt']),
+        sorted([
+            stager.REQUIREMENTS_FILE,
+            'abc.txt',
+            'def.txt',
+            stager.SUBMISSION_ENV_DEPENDENCIES_FILE
+        ]),
         sorted(
             self.stager.create_and_stage_job_resources(
                 options,
@@ -302,9 +268,11 @@ class StagerTest(unittest.TestCase):
         pypi_requirements=['nothing>=1.0,<2.0'],
         populate_requirements_cache=self.populate_requirements_cache,
         staging_location=staging_dir)[1]
-    self.assertEqual(3, len(resources))
+    self.assertEqual(4, len(resources))
     self.assertTrue({'abc.txt', 'def.txt'} <= set(resources))
-    generated_requirements = (set(resources) - {'abc.txt', 'def.txt'}).pop()
+    generated_requirements = (
+        set(resources) -
+        {'abc.txt', 'def.txt', stager.SUBMISSION_ENV_DEPENDENCIES_FILE}).pop()
     with open(os.path.join(staging_dir, generated_requirements)) as f:
       data = f.read()
     self.assertEqual('nothing>=1.0,<2.0', data)
@@ -338,7 +306,12 @@ class StagerTest(unittest.TestCase):
     self.create_temp_file(
         os.path.join(source_dir, stager.REQUIREMENTS_FILE), 'nothing')
     self.assertEqual(
-        sorted([stager.REQUIREMENTS_FILE, 'abc.txt', 'def.txt']),
+        sorted([
+            stager.REQUIREMENTS_FILE,
+            'abc.txt',
+            'def.txt',
+            stager.SUBMISSION_ENV_DEPENDENCIES_FILE
+        ]),
         sorted(
             self.stager.create_and_stage_job_resources(
                 options,
@@ -369,7 +342,9 @@ class StagerTest(unittest.TestCase):
           populate_requirements_cache=self.populate_requirements_cache,
           staging_location=staging_dir)[1]
       assert not populate_requirements_cache.called
-      self.assertEqual([stager.REQUIREMENTS_FILE], resources)
+      self.assertEqual(
+          [stager.REQUIREMENTS_FILE, stager.SUBMISSION_ENV_DEPENDENCIES_FILE],
+          resources)
       self.assertTrue(not os.path.isfile(os.path.join(staging_dir, 'abc.txt')))
       self.assertTrue(not os.path.isfile(os.path.join(staging_dir, 'def.txt')))
 
@@ -423,7 +398,46 @@ class StagerTest(unittest.TestCase):
     self.assertTrue(
         cm.exception.args[0].startswith(
             'The --setup_file option expects the full path to a file named '
-            'setup.py instead of '))
+            'setup.py or pyproject.toml instead of '))
+
+  def test_setup_file_supplies_unexpected_filename(self):
+    staging_dir = self.make_temp_dir()
+    source_dir = self.make_temp_dir()
+
+    options = PipelineOptions()
+    self.update_options(options)
+    options.view_as(SetupOptions).setup_file = (
+        os.path.join(source_dir, 'xyz-pyproject.toml'))
+
+    self.create_temp_file(
+        os.path.join(source_dir, 'xyz-pyproject.toml'), 'notused')
+    with self.assertRaises(RuntimeError) as cm:
+      self.stager.create_and_stage_job_resources(
+          options, staging_location=staging_dir)
+    self.assertTrue(
+        cm.exception.args[0].startswith(
+            'The --setup_file option expects the full path to a file named '
+            'setup.py or pyproject.toml instead of '))
+
+  @unittest.skipIf(setuptools is None, "setuptools not available in this env")
+  def test_setup_file_as_setup_dot_py_file(self):
+    source_dir = self.make_temp_dir()
+
+    options = PipelineOptions()
+    self.update_options(options)
+    options.view_as(SetupOptions).setup_file = (
+        os.path.join(source_dir, 'setup.py'))
+
+    self.create_temp_file(
+        os.path.join(source_dir, 'setup.py'),
+        "from setuptools import setup; setup(name='my_package')")
+    temp_dir = tempfile.mkdtemp()
+    resources = self.stager.create_job_resources(
+        options=options, temp_dir=temp_dir)
+    file_path = list(self.stager.extract_staging_tuple_iter(resources))[0][0]
+
+    self.assertEqual(
+        os.path.join(temp_dir, 'my_package-0.0.0.tar.gz'), file_path)
 
   def test_sdk_location_default(self):
     staging_dir = self.make_temp_dir()
@@ -431,38 +445,11 @@ class StagerTest(unittest.TestCase):
     self.update_options(options)
     options.view_as(SetupOptions).sdk_location = 'default'
 
-    with mock.patch(
-        'apache_beam.utils.processes.check_output',
-        self.build_fake_pip_download_command_handler(has_wheels=False)):
-      _, staged_resources = self.stager.create_and_stage_job_resources(
-          options, temp_dir=self.make_temp_dir(), staging_location=staging_dir)
+    _, staged_resources = self.stager.create_and_stage_job_resources(
+        options, temp_dir=self.make_temp_dir(), staging_location=staging_dir)
 
-    self.assertEqual([names.STAGED_SDK_SOURCES_FILENAME], staged_resources)
-
-    with open(os.path.join(staging_dir,
-                           names.STAGED_SDK_SOURCES_FILENAME)) as f:
-      self.assertEqual(f.read(), 'Package content.')
-
-  def test_sdk_location_default_with_wheels(self):
-    staging_dir = self.make_temp_dir()
-
-    options = PipelineOptions()
-    self.update_options(options)
-    options.view_as(SetupOptions).sdk_location = 'default'
-
-    with mock.patch(
-        'apache_beam.utils.processes.check_output',
-        self.build_fake_pip_download_command_handler(has_wheels=True)):
-      _, staged_resources = self.stager.create_and_stage_job_resources(
-          options, temp_dir=self.make_temp_dir(), staging_location=staging_dir)
-
-      self.assertEqual(len(staged_resources), 2)
-      self.assertEqual(staged_resources[0], names.STAGED_SDK_SOURCES_FILENAME)
-      # Exact name depends on the version of the SDK.
-      self.assertTrue(staged_resources[1].endswith('whl'))
-      for name in staged_resources:
-        with open(os.path.join(staging_dir, name)) as f:
-          self.assertEqual(f.read(), 'Package content.')
+    self.assertEqual([stager.SUBMISSION_ENV_DEPENDENCIES_FILE],
+                     staged_resources)
 
   def test_sdk_location_local_directory(self):
     staging_dir = self.make_temp_dir()
@@ -475,12 +462,39 @@ class StagerTest(unittest.TestCase):
     self.update_options(options)
     options.view_as(SetupOptions).sdk_location = sdk_location
 
-    self.assertEqual([names.STAGED_SDK_SOURCES_FILENAME],
+    self.assertEqual([
+        names.STAGED_SDK_SOURCES_FILENAME,
+        stager.SUBMISSION_ENV_DEPENDENCIES_FILE
+    ],
                      self.stager.create_and_stage_job_resources(
                          options, staging_location=staging_dir)[1])
     tarball_path = os.path.join(staging_dir, names.STAGED_SDK_SOURCES_FILENAME)
     with open(tarball_path) as f:
       self.assertEqual(f.read(), 'Package content.')
+
+  def test_files_to_stage(self):
+    staging_dir = self.make_temp_dir()
+    source_dir = self.make_temp_dir()
+
+    foo_ca = os.path.join(source_dir, 'foo.ca')
+    self.create_temp_file(foo_ca, 'ca content')
+    test_txt = os.path.join(source_dir, 'test.txt')
+    self.create_temp_file(test_txt, 'test content')
+    files_to_stage = [foo_ca, test_txt]
+    options = PipelineOptions()
+    self.update_options(options)
+    options.view_as(SetupOptions).files_to_stage = files_to_stage
+
+    self.assertEqual(
+        ['foo.ca', 'test.txt', stager.SUBMISSION_ENV_DEPENDENCIES_FILE],
+        self.stager.create_and_stage_job_resources(
+            options, staging_location=staging_dir)[1])
+    foo = os.path.join(staging_dir, 'foo.ca')
+    with open(foo) as f:
+      self.assertEqual(f.read(), 'ca content')
+    txt = os.path.join(staging_dir, 'test.txt')
+    with open(txt) as f:
+      self.assertEqual(f.read(), 'test content')
 
   def test_sdk_location_local_source_file(self):
     staging_dir = self.make_temp_dir()
@@ -493,7 +507,10 @@ class StagerTest(unittest.TestCase):
     self.update_options(options)
     options.view_as(SetupOptions).sdk_location = sdk_location
 
-    self.assertEqual([names.STAGED_SDK_SOURCES_FILENAME],
+    self.assertEqual([
+        names.STAGED_SDK_SOURCES_FILENAME,
+        stager.SUBMISSION_ENV_DEPENDENCIES_FILE
+    ],
                      self.stager.create_and_stage_job_resources(
                          options, staging_location=staging_dir)[1])
     tarball_path = os.path.join(staging_dir, names.STAGED_SDK_SOURCES_FILENAME)
@@ -511,7 +528,7 @@ class StagerTest(unittest.TestCase):
     self.update_options(options)
     options.view_as(SetupOptions).sdk_location = sdk_location
 
-    self.assertEqual([sdk_filename],
+    self.assertEqual([sdk_filename, stager.SUBMISSION_ENV_DEPENDENCIES_FILE],
                      self.stager.create_and_stage_job_resources(
                          options, staging_location=staging_dir)[1])
     tarball_path = os.path.join(staging_dir, sdk_filename)
@@ -547,7 +564,10 @@ class StagerTest(unittest.TestCase):
     self.update_options(options)
     options.view_as(SetupOptions).sdk_location = sdk_location
 
-    self.assertEqual([names.STAGED_SDK_SOURCES_FILENAME],
+    self.assertEqual([
+        names.STAGED_SDK_SOURCES_FILENAME,
+        stager.SUBMISSION_ENV_DEPENDENCIES_FILE
+    ],
                      self.stager.create_and_stage_job_resources(
                          options, staging_location=staging_dir)[1])
 
@@ -569,7 +589,7 @@ class StagerTest(unittest.TestCase):
     with mock.patch('apache_beam.runners.portability.stager_test'
                     '.stager.Stager._download_file',
                     staticmethod(file_download)):
-      self.assertEqual([sdk_filename],
+      self.assertEqual([sdk_filename, stager.SUBMISSION_ENV_DEPENDENCIES_FILE],
                        self.stager.create_and_stage_job_resources(
                            options, staging_location=staging_dir)[1])
 
@@ -593,7 +613,10 @@ class StagerTest(unittest.TestCase):
     with mock.patch('apache_beam.runners.portability.stager_test'
                     '.stager.Stager._download_file',
                     staticmethod(file_download)):
-      self.assertEqual([names.STAGED_SDK_SOURCES_FILENAME],
+      self.assertEqual([
+          names.STAGED_SDK_SOURCES_FILENAME,
+          stager.SUBMISSION_ENV_DEPENDENCIES_FILE
+      ],
                        self.stager.create_and_stage_job_resources(
                            options, staging_location=staging_dir)[1])
 
@@ -635,7 +658,8 @@ class StagerTest(unittest.TestCase):
             'xyz2.tar',
             'whl.whl',
             'remote_file.tar.gz',
-            stager.EXTRA_PACKAGES_FILE
+            stager.EXTRA_PACKAGES_FILE,
+            stager.SUBMISSION_ENV_DEPENDENCIES_FILE
         ],
                          self.stager.create_and_stage_job_resources(
                              options, staging_location=staging_dir)[1])
@@ -743,7 +767,13 @@ class StagerTest(unittest.TestCase):
       with mock.patch('apache_beam.runners.portability.stager_test'
                       '.stager.Stager._is_remote_path',
                       staticmethod(self.is_remote_path)):
-        self.assertEqual(['abc.jar', 'xyz.jar', 'ijk.jar', 'remote.jar'],
+        self.assertEqual([
+            'abc.jar',
+            'xyz.jar',
+            'ijk.jar',
+            'remote.jar',
+            stager.SUBMISSION_ENV_DEPENDENCIES_FILE
+        ],
                          self.stager.create_and_stage_job_resources(
                              options, staging_location=staging_dir)[1])
     self.assertEqual(['/tmp/remote/remote.jar'], self.remote_copied_files)
@@ -803,7 +833,8 @@ class StagerTest(unittest.TestCase):
       resources = self.stager.create_and_stage_job_resources(
           options, staging_location=staging_dir)[1]
       for f in resources:
-        if f != stager.REQUIREMENTS_FILE:
+        if (f != stager.REQUIREMENTS_FILE and
+            f != stager.SUBMISSION_ENV_DEPENDENCIES_FILE):
           self.assertTrue(('.tar.gz' in f) or ('.whl' in f))
 
   # requirements cache will populated only with sdists/sources
@@ -828,9 +859,54 @@ class StagerTest(unittest.TestCase):
           options, staging_location=staging_dir)[1]
 
       for f in resources:
-        if f != stager.REQUIREMENTS_FILE:
+        if (f != stager.REQUIREMENTS_FILE and
+            f != stager.SUBMISSION_ENV_DEPENDENCIES_FILE):
           self.assertTrue('.tar.gz' in f)
           self.assertTrue('.whl' not in f)
+
+  def test_populate_requirements_cache_with_local_files(self):
+    staging_dir = self.make_temp_dir()
+    requirements_cache_dir = self.make_temp_dir()
+    source_dir = self.make_temp_dir()
+    pkg_dir = self.make_temp_dir()
+
+    options = PipelineOptions()
+    self.update_options(options)
+
+    options.view_as(SetupOptions).requirements_cache = requirements_cache_dir
+    options.view_as(SetupOptions).requirements_file = os.path.join(
+        source_dir, stager.REQUIREMENTS_FILE)
+    local_package = os.path.join(pkg_dir, 'local_package.tar.gz')
+    self.create_temp_file(local_package, 'local-package-content')
+    self.create_temp_file(
+        os.path.join(source_dir, stager.REQUIREMENTS_FILE),
+        '\n'.join(['fake_pypi', local_package]))
+    with mock.patch('apache_beam.runners.portability.stager_test'
+                    '.stager.Stager._populate_requirements_cache',
+                    staticmethod(self._populate_requitements_cache_fake)):
+      options.view_as(SetupOptions).requirements_cache_only_sources = True
+      resources = self.stager.create_and_stage_job_resources(
+          options, staging_location=staging_dir)[1]
+
+      self.assertEqual(
+          sorted([
+              stager.REQUIREMENTS_FILE,
+              stager.EXTRA_PACKAGES_FILE,
+              'nothing.tar.gz',
+              'local_package.tar.gz',
+              stager.SUBMISSION_ENV_DEPENDENCIES_FILE
+          ]),
+          sorted(resources))
+
+      with open(os.path.join(staging_dir, stager.REQUIREMENTS_FILE)) as fin:
+        requirements_contents = fin.read()
+      self.assertIn('fake_pypi', requirements_contents)
+      self.assertNotIn('local_package', requirements_contents)
+
+      with open(os.path.join(staging_dir, stager.EXTRA_PACKAGES_FILE)) as fin:
+        extra_packages_contents = fin.read()
+      self.assertNotIn('fake_pypi', extra_packages_contents)
+      self.assertIn('local_package', extra_packages_contents)
 
 
 class TestStager(stager.Stager):

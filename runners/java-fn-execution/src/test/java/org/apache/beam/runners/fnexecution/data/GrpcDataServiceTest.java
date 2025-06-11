@@ -24,7 +24,9 @@ import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.empty;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -38,29 +40,34 @@ import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.CoderException;
 import org.apache.beam.sdk.coders.LengthPrefixCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
-import org.apache.beam.sdk.fn.data.CloseableFnDataReceiver;
-import org.apache.beam.sdk.fn.data.InboundDataClient;
-import org.apache.beam.sdk.fn.data.LogicalEndpoint;
+import org.apache.beam.sdk.fn.data.BeamFnDataInboundObserver;
+import org.apache.beam.sdk.fn.data.BeamFnDataOutboundAggregator;
+import org.apache.beam.sdk.fn.data.DataEndpoint;
+import org.apache.beam.sdk.fn.data.FnDataReceiver;
 import org.apache.beam.sdk.fn.server.GrpcFnServer;
 import org.apache.beam.sdk.fn.server.InProcessServerFactory;
 import org.apache.beam.sdk.fn.stream.OutboundObserverFactory;
 import org.apache.beam.sdk.fn.test.TestStreams;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.sdk.util.WindowedValue;
-import org.apache.beam.vendor.grpc.v1p43p2.com.google.protobuf.ByteString;
-import org.apache.beam.vendor.grpc.v1p43p2.io.grpc.ManagedChannel;
-import org.apache.beam.vendor.grpc.v1p43p2.io.grpc.inprocess.InProcessChannelBuilder;
-import org.apache.beam.vendor.grpc.v1p43p2.io.grpc.stub.StreamObserver;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.ByteString;
+import org.apache.beam.vendor.grpc.v1p69p0.io.grpc.ManagedChannel;
+import org.apache.beam.vendor.grpc.v1p69p0.io.grpc.inprocess.InProcessChannelBuilder;
+import org.apache.beam.vendor.grpc.v1p69p0.io.grpc.stub.StreamObserver;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
 /** Tests for {@link GrpcDataService}. */
 @RunWith(JUnit4.class)
 public class GrpcDataServiceTest {
+  @Rule public transient Timeout globalTimeout = Timeout.seconds(600);
   private static final String TRANSFORM_ID = "888";
   private static final Coder<WindowedValue<String>> CODER =
-      LengthPrefixCoder.of(WindowedValue.getValueOnlyCoder(StringUtf8Coder.of()));
+      LengthPrefixCoder.of(WindowedValues.getValueOnlyCoder(StringUtf8Coder.of()));
 
   @Test
   public void testMessageReceivedBySingleClientWhenThereAreMultipleClients() throws Exception {
@@ -93,13 +100,16 @@ public class GrpcDataServiceTest {
       }
 
       for (int i = 0; i < 3; ++i) {
-        CloseableFnDataReceiver<WindowedValue<String>> consumer =
-            service.send(LogicalEndpoint.data(Integer.toString(i), TRANSFORM_ID), CODER);
-
-        consumer.accept(WindowedValue.valueInGlobalWindow("A" + i));
-        consumer.accept(WindowedValue.valueInGlobalWindow("B" + i));
-        consumer.accept(WindowedValue.valueInGlobalWindow("C" + i));
-        consumer.close();
+        final String instructionId = Integer.toString(i);
+        BeamFnDataOutboundAggregator aggregator =
+            service.createOutboundAggregator(() -> instructionId, false);
+        aggregator.start();
+        FnDataReceiver<WindowedValue<String>> consumer =
+            aggregator.registerOutputDataLocation(TRANSFORM_ID, CODER);
+        consumer.accept(WindowedValues.valueInGlobalWindow("A" + i));
+        consumer.accept(WindowedValues.valueInGlobalWindow("B" + i));
+        consumer.accept(WindowedValues.valueInGlobalWindow("C" + i));
+        aggregator.sendOrCollectBufferedDataAndFinishOutboundStreams();
       }
       waitForInboundElements.countDown();
       for (Future<Void> clientFuture : clientFutures) {
@@ -144,18 +154,19 @@ public class GrpcDataServiceTest {
       }
 
       List<Collection<WindowedValue<String>>> serverInboundValues = new ArrayList<>();
-      Collection<InboundDataClient> readFutures = new ArrayList<>();
+      Collection<BeamFnDataInboundObserver> inboundObservers = new ArrayList<>();
       for (int i = 0; i < 3; ++i) {
         final Collection<WindowedValue<String>> serverInboundValue = new ArrayList<>();
         serverInboundValues.add(serverInboundValue);
-        readFutures.add(
-            service.receive(
-                LogicalEndpoint.data(Integer.toString(i), TRANSFORM_ID),
-                CODER,
-                serverInboundValue::add));
+        BeamFnDataInboundObserver inboundObserver =
+            BeamFnDataInboundObserver.forConsumers(
+                Arrays.asList(DataEndpoint.create(TRANSFORM_ID, CODER, serverInboundValue::add)),
+                Collections.emptyList());
+        service.registerReceiver(Integer.toString(i), inboundObserver);
+        inboundObservers.add(inboundObserver);
       }
-      for (InboundDataClient readFuture : readFutures) {
-        readFuture.awaitCompletion();
+      for (BeamFnDataInboundObserver inboundObserver : inboundObservers) {
+        inboundObserver.awaitCompletion();
       }
       waitForInboundElements.countDown();
       for (Future<Void> clientFuture : clientFutures) {
@@ -165,9 +176,9 @@ public class GrpcDataServiceTest {
         assertThat(
             serverInboundValues.get(i),
             contains(
-                WindowedValue.valueInGlobalWindow("A" + i),
-                WindowedValue.valueInGlobalWindow("B" + i),
-                WindowedValue.valueInGlobalWindow("C" + i)));
+                WindowedValues.valueInGlobalWindow("A" + i),
+                WindowedValues.valueInGlobalWindow("B" + i),
+                WindowedValues.valueInGlobalWindow("C" + i)));
       }
       assertThat(clientInboundElements, empty());
     }
@@ -181,15 +192,15 @@ public class GrpcDataServiceTest {
                 .setTransformId(TRANSFORM_ID)
                 .setData(
                     ByteString.copyFrom(
-                            encodeToByteArray(CODER, WindowedValue.valueInGlobalWindow("A" + id)))
+                            encodeToByteArray(CODER, WindowedValues.valueInGlobalWindow("A" + id)))
                         .concat(
                             ByteString.copyFrom(
                                 encodeToByteArray(
-                                    CODER, WindowedValue.valueInGlobalWindow("B" + id))))
+                                    CODER, WindowedValues.valueInGlobalWindow("B" + id))))
                         .concat(
                             ByteString.copyFrom(
                                 encodeToByteArray(
-                                    CODER, WindowedValue.valueInGlobalWindow("C" + id))))))
+                                    CODER, WindowedValues.valueInGlobalWindow("C" + id))))))
         .addData(
             BeamFnApi.Elements.Data.newBuilder()
                 .setInstructionId(id)

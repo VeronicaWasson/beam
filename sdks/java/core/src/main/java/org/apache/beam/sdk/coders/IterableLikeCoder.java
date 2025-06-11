@@ -17,9 +17,8 @@
  */
 package org.apache.beam.sdk.coders;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -103,30 +102,27 @@ public abstract class IterableLikeCoder<T, IterableT extends Iterable<T>>
     if (iterable == null) {
       throw new CoderException("cannot encode a null " + iterableName);
     }
-    DataOutputStream dataOutStream = new DataOutputStream(outStream);
     if (iterable instanceof Collection) {
       // We can know the size of the Iterable.  Use an encoding with a
       // leading size field, followed by that many elements.
       Collection<T> collection = (Collection<T>) iterable;
-      dataOutStream.writeInt(collection.size());
+      BitConverters.writeBigEndianInt(collection.size(), outStream);
       for (T elem : collection) {
-        elementCoder.encode(elem, dataOutStream);
+        elementCoder.encode(elem, outStream);
       }
     } else {
       // We don't know the size without traversing it so use a fixed size buffer
       // and encode as many elements as possible into it before outputting the size followed
       // by the elements.
-      dataOutStream.writeInt(-1);
+      BitConverters.writeBigEndianInt(-1, outStream);
       BufferedElementCountingOutputStream countingOutputStream =
-          new BufferedElementCountingOutputStream(dataOutStream);
+          new BufferedElementCountingOutputStream(outStream);
       for (T elem : iterable) {
         countingOutputStream.markElementStart();
         elementCoder.encode(elem, countingOutputStream);
       }
       countingOutputStream.finish();
     }
-    // Make sure all our output gets pushed to the underlying outStream.
-    dataOutStream.flush();
   }
 
   @Override
@@ -212,7 +208,7 @@ public abstract class IterableLikeCoder<T, IterableT extends Iterable<T>>
         // TODO: (https://github.com/apache/beam/issues/18169) Update to use an accurate count
         // depending on size and count,
         // currently we are under estimating the size by up to 10 bytes per block of data since we
-        // are not encoding the count prefix which occurs at most once per 64k of data and is upto
+        // are not encoding the count prefix which occurs at most once per 64k of data and is up to
         // 10 bytes long. Since we include the total count we can upper bound the underestimate
         // to be 10 / 65536 ~= 0.0153% of the actual size.
         observer.update(4L);

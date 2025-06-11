@@ -56,7 +56,7 @@ public class ElasticsearchIOTest implements Serializable {
 
     // Start the container. This step might take some time...
     container.start();
-    client = ElasticsearchIOTestUtils.clientFromContainer(container);
+    client = ElasticsearchIOTestUtils.clientFromContainer(container, true);
     setDefaultTemplate(client);
   }
 
@@ -84,6 +84,14 @@ public class ElasticsearchIOTest implements Serializable {
     // need to create the index using the helper method (not create it at first insertion)
     // for the indexSettings() to be run
     createIndex(elasticsearchIOTestCommon.restClient, getEsIndex());
+    elasticsearchIOTestCommon.testSizes();
+  }
+
+  @Test
+  public void testSizesWithAlias() throws Exception {
+    // need to create the index using the helper method (not create it at first insertion)
+    // for the indexSettings() to be run
+    createIndex(elasticsearchIOTestCommon.restClient, getEsIndex(), true);
     elasticsearchIOTestCommon.testSizes();
   }
 

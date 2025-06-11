@@ -21,44 +21,18 @@ import groovy.json.JsonOutput
 plugins {
   id 'org.apache.beam.module'
 }
-javaVersion="1.11"
+
 applyJavaNature(
   exportJavadoc: false,
   publish: false,
-  disableLintWarnings: ['requires-transitive-automatic', 'requires-automatic']
+  disableLintWarnings: ['requires-transitive-automatic', 'requires-automatic'],
+  requireJavaVersion: JavaVersion.VERSION_11
 )
 provideIntegrationTestingDependencies()
 enableJavaPerformanceTesting()
 
 description = "Apache Beam :: SDKs :: Java :: Testing :: JPMS Tests"
 ext.summary = "E2E test for Java 9 modules"
-
-// Java 17 needs compileJava to add-exports and add-opens for error prone
-if (project.hasProperty("compileAndRunTestsWithJava17")) {
-  def java17Home = project.findProperty("java17Home")
-  project.tasks.withType(JavaCompile) {
-    options.fork = true
-    options.forkOptions.javaHome = java17Home as File
-    options.compilerArgs += ['-Xlint:-path']
-    options.compilerArgs.addAll(['--release', '17'])
-    // Error prone requires some packages to be exported/opened for Java 17
-    // Disabling checks since this property is only used for Jenkins tests
-    // https://github.com/tbroyer/gradle-errorprone-plugin#jdk-16-support
-    options.errorprone.errorproneArgs.add("-XepDisableAllChecks")
-    options.forkOptions.jvmArgs += [
-            "-J--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
-            "-J--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
-            "-J--add-exports=jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED",
-            "-J--add-exports=jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED",
-            "-J--add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED",
-            "-J--add-exports=jdk.compiler/com.sun.tools.javac.processing=ALL-UNNAMED",
-            "-J--add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED",
-            "-J--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED",
-            "-J--add-opens=jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED",
-            "-J--add-opens=jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED"
-    ]
-  }
-}
 
 /*
  * List of runners to run integration tests on.
@@ -78,12 +52,10 @@ configurations {
   sparkRunnerIntegrationTest.extendsFrom(baseIntegrationTest)
 }
 
-def spark_version = '3.1.1'
-def spark_scala_version = '2.12'
-
 dependencies {
   implementation project(path: ":sdks:java:core", configuration: "shadow")
   implementation project(path: ":sdks:java:extensions:google-cloud-platform-core")
+  permitUnusedDeclared project(":sdks:java:extensions:google-cloud-platform-core") // for autoservice filesystems
 
   testImplementation library.java.junit
   testImplementation library.java.hamcrest
@@ -92,9 +64,8 @@ dependencies {
   directRunnerIntegrationTest project(":runners:direct-java")
   flinkRunnerIntegrationTest project(":runners:flink:${project.ext.latestFlinkVersion}")
   dataflowRunnerIntegrationTest project(":runners:google-cloud-dataflow-java")
+  dataflowRunnerIntegrationTest project(":sdks:java:harness") // for staging locally built harness jar
   sparkRunnerIntegrationTest project(":runners:spark:3")
-  sparkRunnerIntegrationTest "org.apache.spark:spark-sql_$spark_scala_version:$spark_version"
-  sparkRunnerIntegrationTest "org.apache.spark:spark-streaming_$spark_scala_version:$spark_version"
 }
 
 /*
@@ -114,6 +85,7 @@ for (String runner : testRunnerClass.keySet()) {
     ]
     if ("dataflowRunnerIntegrationTest".equals(runner)) {
       testPipelineOptions.add("--region=${gcpRegion}")
+      testPipelineOptions.add("--experiments=use_staged_dataflow_worker_jar")
     }
     classpath = configurations."${runner}"
     include "**/*IT.class"
@@ -127,13 +99,5 @@ for (String runner : testRunnerClass.keySet()) {
 plugins.withType(JavaPlugin).configureEach{
   java {
     modularity.inferModulePath = true
-  }
-}
-
-// JPMS requires JDK > 8
-project.tasks.each {
-  it.onlyIf {
-    project.hasProperty("compileAndRunTestsWithJava17")
-            || JavaVersion.VERSION_1_8.compareTo(JavaVersion.current()) < 0
   }
 }

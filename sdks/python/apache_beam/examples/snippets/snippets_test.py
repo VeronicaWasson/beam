@@ -33,6 +33,7 @@ import uuid
 
 import mock
 import parameterized
+import pytest
 
 import apache_beam as beam
 from apache_beam import WindowInto
@@ -41,6 +42,9 @@ from apache_beam import pvalue
 from apache_beam import typehints
 from apache_beam.coders.coders import ToBytesCoder
 from apache_beam.examples.snippets import snippets
+from apache_beam.examples.snippets import snippets_examples_wordcount_debugging
+from apache_beam.examples.snippets import snippets_examples_wordcount_minimal
+from apache_beam.examples.snippets import snippets_examples_wordcount_wordcount
 from apache_beam.metrics import Metrics
 from apache_beam.metrics.metric import MetricsFilter
 from apache_beam.options.pipeline_options import GoogleCloudOptions
@@ -610,7 +614,7 @@ class SnippetsTest(unittest.TestCase):
       snippets.model_pipelines()
     self.assertEqual(
         self.get_output(result_path),
-        [str(s) for s in [(u'aa', 1), (u'bb', 2), (u'cc', 3)]])
+        [str(s) for s in [('aa', 1), ('bb', 2), ('cc', 3)]])
 
   def test_model_pcollection(self):
     temp_path = self.create_temp_file()
@@ -754,6 +758,15 @@ class SnippetsTest(unittest.TestCase):
       p.options.view_as(GoogleCloudOptions).temp_location = 'gs://mylocation'
       snippets.model_bigqueryio(p)
 
+  @pytest.mark.uses_gcp_java_expansion_service
+  @unittest.skipUnless(
+      os.environ.get('EXPANSION_PORT'),
+      "EXPANSION_PORT environment var is not provided.")
+  def test_model_bigqueryio_xlang(self):
+    p = TestPipeline()
+    p.options.view_as(GoogleCloudOptions).temp_location = 'gs://mylocation'
+    snippets.model_bigqueryio_xlang(p)
+
   def _run_test_pipeline_for_options(self, fn):
     temp_path = self.create_temp_file('aa\nbb\ncc')
     result_path = temp_path + '.result'
@@ -787,8 +800,8 @@ class SnippetsTest(unittest.TestCase):
         sorted(' '.join(lines).split(' ')), self.get_output(result_path))
 
   @parameterized.parameterized.expand([
-      [snippets.examples_wordcount_minimal],
-      [snippets.examples_wordcount_wordcount],
+      [snippets_examples_wordcount_minimal.examples_wordcount_minimal],
+      [snippets_examples_wordcount_wordcount.examples_wordcount_wordcount],
       [snippets.pipeline_monitoring],
       [snippets.examples_wordcount_templated],
   ])
@@ -818,7 +831,7 @@ class SnippetsTest(unittest.TestCase):
     temp_path = self.create_temp_file(
         'Flourish Flourish Flourish stomach abc def')
     result_path = self.create_temp_file()
-    snippets.examples_wordcount_debugging({
+    snippets_examples_wordcount_debugging.examples_wordcount_debugging({
         'read': temp_path, 'write': result_path
     })
     self.assertEqual(
@@ -859,7 +872,7 @@ class SnippetsTest(unittest.TestCase):
     input_topic = 'projects/fake-beam-test-project/topic/intopic'
     input_values = [
         TimestampedValue(b'a a b', 1),
-        TimestampedValue(u'🤷 ¯\\_(ツ)_/¯ b b '.encode('utf-8'), 12),
+        TimestampedValue('🤷 ¯\\_(ツ)_/¯ b b '.encode('utf-8'), 12),
         TimestampedValue(b'a b c c c', 20)
     ]
     output_topic = 'projects/fake-beam-test-project/topic/outtopic'
@@ -903,6 +916,19 @@ class SnippetsTest(unittest.TestCase):
     result_path = self.create_temp_file()
     snippets.model_multiple_pcollections_flatten(contents, result_path)
     self.assertEqual(contents, self.get_output(result_path))
+
+  def test_model_multiple_pcollections_flatten_with(self):
+    contents = ['a', 'b', 'c', 'd', 'e', 'f']
+    result_path = self.create_temp_file()
+    snippets.model_multiple_pcollections_flatten_with(contents, result_path)
+    self.assertEqual(contents, self.get_output(result_path))
+
+  def test_model_multiple_pcollections_flatten_with_transform(self):
+    contents = ['a', 'b', 'c', 'd', 'e', 'f']
+    result_path = self.create_temp_file()
+    snippets.model_multiple_pcollections_flatten_with_transform(
+        contents, result_path)
+    self.assertEqual(contents + ['x', 'y', 'z'], self.get_output(result_path))
 
   def test_model_multiple_pcollections_partition(self):
     contents = [17, 42, 64, 32, 0, 99, 53, 89]
@@ -972,8 +998,8 @@ class SnippetsTest(unittest.TestCase):
     ]
     # [END model_group_by_key_cogroupbykey_tuple_formatted_outputs]
     expected_results = [
-        '%s; %s; %s' % (name, info['emails'], info['phones']) for name,
-        info in results
+        '%s; %s; %s' % (name, info['emails'], info['phones'])
+        for name, info in results
     ]
     self.assertEqual(expected_results, formatted_results)
     self.assertEqual(formatted_results, self.get_output(result_path))
@@ -1127,7 +1153,7 @@ class SnippetsTest(unittest.TestCase):
           pcollection | WindowInto(
               FixedWindows(1 * 60),
               trigger=AfterWatermark(late=AfterProcessingTime(10 * 60)),
-              allowed_lateness=10,
+              allowed_lateness=2 * 24 * 60 * 60,
               accumulation_mode=AccumulationMode.DISCARDING)
           # [END model_composite_triggers]
           | 'group' >> beam.GroupByKey()
@@ -1247,6 +1273,10 @@ class CombineTest(unittest.TestCase):
       def extract_output(self, sum_count):
         (sum, count) = sum_count
         return sum / count if count else float('NaN')
+
+      def compact(self, accumulator):
+        # No-op
+        return accumulator
 
     # [END combine_custom_average_define]
     # [START combine_custom_average_execute]
@@ -1411,12 +1441,13 @@ class SlowlyChangingSideInputsTest(unittest.TestCase):
         for j in range(count):
           f.write('f' + idstr + 'a' + str(j) + '\n')
 
-    sample_main_input_elements = ([first_ts - 2, # no output due to no SI
-                                   first_ts + 1,  # First window
-                                   first_ts + 8,  # Second window
-                                   first_ts + 15,  # Third window
-                                   first_ts + 22,  # Fourth window
-                                   ])
+    sample_main_input_elements = ([
+        first_ts - 2,  # no output due to no SI
+        first_ts + 1,  # First window
+        first_ts + 8,  # Second window
+        first_ts + 15,  # Third window
+        first_ts + 22,  # Fourth window
+    ])
 
     pipeline, pipeline_result = snippets.side_input_slow_update(
       src_file_pattern, first_ts, last_ts, interval,
@@ -1435,6 +1466,18 @@ class SlowlyChangingSideInputsTest(unittest.TestCase):
     finally:
       for i in range(-1, 10, 1):
         os.unlink(src_file_pattern + str(first_ts + interval * i))
+
+
+class ValueProviderInfoTest(unittest.TestCase):
+  """Tests for accessing value provider info after run."""
+  def test_accessing_valueprovider_info_after_run(self):
+    with self.assertLogs(level='INFO') as log_capture:
+      snippets.accessing_valueprovider_info_after_run()
+    expected_log_message = "The string value is"
+    self.assertTrue(
+        any(expected_log_message in log for log in log_capture.output),
+        f"Expected log message '{expected_log_message}' not found in logs: "
+        f"{log_capture.output}")
 
 
 if __name__ == '__main__':

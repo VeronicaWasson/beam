@@ -15,18 +15,12 @@
 # limitations under the License.
 #
 
-"""Core windowing data structures.
-
-This module is experimental. No backwards-compatibility guarantees.
-"""
+"""Core windowing data structures."""
 
 # This module is carefully crafted to have optimal performance when
 # compiled while still being valid Python.  Care needs to be taken when
 # editing this file as WindowedValues are created for every element for
 # every step in a Beam pipeline.
-
-# cython: profile=True
-# cython: language_level=3
 
 # pytype: skip-file
 

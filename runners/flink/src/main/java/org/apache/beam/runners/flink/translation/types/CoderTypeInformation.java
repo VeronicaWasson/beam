@@ -17,7 +17,7 @@
  */
 package org.apache.beam.runners.flink.translation.types;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
 
 import org.apache.beam.runners.core.construction.SerializablePipelineOptions;
 import org.apache.beam.sdk.coders.Coder;
@@ -42,10 +42,14 @@ public class CoderTypeInformation<T> extends TypeInformation<T> implements Atomi
   private final SerializablePipelineOptions pipelineOptions;
 
   public CoderTypeInformation(Coder<T> coder, PipelineOptions pipelineOptions) {
+    this(coder, new SerializablePipelineOptions(pipelineOptions));
+  }
+
+  public CoderTypeInformation(Coder<T> coder, SerializablePipelineOptions pipelineOptions) {
     checkNotNull(coder);
     checkNotNull(pipelineOptions);
     this.coder = coder;
-    this.pipelineOptions = new SerializablePipelineOptions(pipelineOptions);
+    this.pipelineOptions = pipelineOptions;
   }
 
   public Coder<T> getCoder() {

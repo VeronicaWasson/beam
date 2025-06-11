@@ -16,17 +16,20 @@
 package redis
 
 import (
-	pb "beam.apache.org/playground/backend/internal/api/v1"
-	"beam.apache.org/playground/backend/internal/cache"
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/go-redis/redis/v8"
-	"github.com/go-redis/redismock/v8"
-	"github.com/google/uuid"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/go-redis/redis/v8"
+	"github.com/go-redis/redismock/v8"
+	"github.com/google/uuid"
+
+	pb "beam.apache.org/playground/backend/internal/api/v1"
+	"beam.apache.org/playground/backend/internal/cache"
+	"beam.apache.org/playground/backend/internal/db/entity"
 )
 
 func TestRedisCache_GetValue(t *testing.T) {
@@ -433,7 +436,7 @@ func TestCache_SetCatalog(t *testing.T) {
 		{
 			name: "Set catalog",
 			mocks: func() {
-				mock.ExpectSet(cache.ExamplesCatalog, catalogMarsh, 0).SetVal("")
+				mock.ExpectSet(cache.ExamplesCatalog, catalogMarsh, catalogExpire).SetVal("")
 			},
 			fields: fields{client},
 			args: args{
@@ -445,7 +448,7 @@ func TestCache_SetCatalog(t *testing.T) {
 		{
 			name: "Error during Set operation",
 			mocks: func() {
-				mock.ExpectSet(cache.ExamplesCatalog, catalogMarsh, 0).SetErr(fmt.Errorf("MOCK_ERROR"))
+				mock.ExpectSet(cache.ExamplesCatalog, catalogMarsh, catalogExpire).SetErr(fmt.Errorf("MOCK_ERROR"))
 			},
 			fields: fields{client},
 			args: args{
@@ -463,6 +466,83 @@ func TestCache_SetCatalog(t *testing.T) {
 			}
 			if err := rc.SetCatalog(tt.args.ctx, tt.args.catalog); (err != nil) != tt.wantErr {
 				t.Errorf("SetCatalog() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCache_SetSdkCatalog(t *testing.T) {
+	client, mock := redismock.NewClientMock()
+	sdks := getSDKs()
+	sdksMarsh, _ := json.Marshal(sdks)
+	type args struct {
+		ctx  context.Context
+		sdks []*entity.SDKEntity
+	}
+	tests := []struct {
+		name    string
+		mocks   func()
+		args    args
+		wantErr bool
+	}{
+		{
+			name: "Setting sdk catalog in the usual case",
+			mocks: func() {
+				mock.ExpectSet(cache.SdksCatalog, sdksMarsh, 0).SetVal("")
+			},
+			args: args{
+				ctx:  context.Background(),
+				sdks: sdks,
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.mocks()
+			rc := &Cache{Client: client}
+			if err := rc.SetSdkCatalog(tt.args.ctx, tt.args.sdks); (err != nil) != tt.wantErr {
+				t.Errorf("SetSdkCatalog() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCache_GetSdkCatalog(t *testing.T) {
+	client, mock := redismock.NewClientMock()
+	sdks := getSDKs()
+	sdksMarsh, _ := json.Marshal(sdks)
+	type args struct {
+		ctx context.Context
+	}
+	tests := []struct {
+		name    string
+		mocks   func()
+		args    args
+		wantErr bool
+	}{
+		{
+			name: "Getting sdk catalog in the usual case",
+			mocks: func() {
+				mock.ExpectGet(cache.SdksCatalog).SetVal(string(sdksMarsh))
+			},
+			args:    args{ctx: context.Background()},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.mocks()
+			rc := &Cache{Client: client}
+			got, err := rc.GetSdkCatalog(tt.args.ctx)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetSdkCatalog() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, sdks) {
+				t.Errorf("GetSdkCatalog() got = %v, want %v", got, sdks)
 			}
 		})
 	}
@@ -587,4 +667,18 @@ func Test_unmarshalBySubKey(t *testing.T) {
 			}
 		})
 	}
+}
+
+func getSDKs() []*entity.SDKEntity {
+	var sdkEntities []*entity.SDKEntity
+	for _, sdk := range pb.Sdk_name {
+		if sdk == pb.Sdk_SDK_UNSPECIFIED.String() {
+			continue
+		}
+		sdkEntities = append(sdkEntities, &entity.SDKEntity{
+			Name:           sdk,
+			DefaultExample: "MOCK_DEFAULT_EXAMPLE",
+		})
+	}
+	return sdkEntities
 }

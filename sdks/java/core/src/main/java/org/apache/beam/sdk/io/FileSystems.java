@@ -17,9 +17,9 @@
  */
 package org.apache.beam.sdk.io;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Verify.verify;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Verify.verify;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.io.FileNotFoundException;
@@ -38,9 +38,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.annotation.Nonnull;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.annotations.Internal;
+import org.apache.beam.sdk.io.FileSystem.LineageLevel;
 import org.apache.beam.sdk.io.fs.CreateOptions;
 import org.apache.beam.sdk.io.fs.CreateOptions.StandardCreateOptions;
 import org.apache.beam.sdk.io.fs.EmptyMatchTreatment;
@@ -49,23 +48,26 @@ import org.apache.beam.sdk.io.fs.MatchResult.Metadata;
 import org.apache.beam.sdk.io.fs.MatchResult.Status;
 import org.apache.beam.sdk.io.fs.MoveOptions;
 import org.apache.beam.sdk.io.fs.MoveOptions.StandardMoveOptions;
+import org.apache.beam.sdk.io.fs.ResolveOptions.StandardResolveOptions;
 import org.apache.beam.sdk.io.fs.ResourceId;
+import org.apache.beam.sdk.metrics.Lineage;
+import org.apache.beam.sdk.metrics.Metrics;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.util.common.ReflectHelpers;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Function;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Joiner;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.FluentIterable;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Multimap;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Ordering;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Sets;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.TreeMultimap;
+import org.apache.beam.sdk.values.KV;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Function;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Joiner;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.FluentIterable;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Multimap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Ordering;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Sets;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.TreeMultimap;
 
 /** Clients facing {@link FileSystem} utility. */
-@Experimental(Kind.FILESYSTEM)
 @SuppressWarnings({
   "nullness", // TODO(https://github.com/apache/beam/issues/20497)
   "rawtypes"
@@ -76,6 +78,9 @@ public class FileSystems {
   private static final Pattern FILE_SCHEME_PATTERN =
       Pattern.compile("(?<scheme>[a-zA-Z][-a-zA-Z0-9+.]*):/.*");
   private static final Pattern GLOB_PATTERN = Pattern.compile("[*?{}]");
+
+  private static final AtomicReference<KV<Long, Integer>> FILESYSTEM_REVISION =
+      new AtomicReference<>();
 
   private static final AtomicReference<Map<String, FileSystem>> SCHEME_TO_FILESYSTEM =
       new AtomicReference<>(ImmutableMap.of(DEFAULT_SCHEME, new LocalFileSystem()));
@@ -393,6 +398,40 @@ public class FileSystems {
         .delete(resourceIdsToDelete);
   }
 
+  /** Report source {@link Lineage} metrics for resource id. */
+  public static void reportSourceLineage(ResourceId resourceId) {
+    reportSourceLineage(resourceId, LineageLevel.FILE);
+  }
+
+  /** Report sink {@link Lineage} metrics for resource id. */
+  public static void reportSinkLineage(ResourceId resourceId) {
+    reportSinkLineage(resourceId, LineageLevel.FILE);
+  }
+
+  /**
+   * Report source {@link Lineage} metrics for resource id at given level.
+   *
+   * <p>Internal API, no backward compatibility guaranteed.
+   */
+  public static void reportSourceLineage(ResourceId resourceId, LineageLevel level) {
+    reportLineage(resourceId, Lineage.getSources(), level);
+  }
+
+  /**
+   * Report source {@link Lineage} metrics for resource id at given level.
+   *
+   * <p>Internal API, no backward compatibility guaranteed.
+   */
+  public static void reportSinkLineage(ResourceId resourceId, LineageLevel level) {
+    reportLineage(resourceId, Lineage.getSinks(), level);
+  }
+
+  /** Report {@link Lineage} metrics for resource id at given level to given Lineage container. */
+  private static void reportLineage(ResourceId resourceId, Lineage lineage, LineageLevel level) {
+    FileSystem fileSystem = getFileSystemInternal(resourceId.getScheme());
+    fileSystem.reportLineage(resourceId, lineage, level);
+  }
+
   private static class FilterResult {
     public List<ResourceId> resultSources = new ArrayList();
     public List<ResourceId> resultDestinations = new ArrayList();
@@ -442,6 +481,7 @@ public class FileSystems {
         continue;
       }
       if (matchDestResults != null
+          && matchSrcResults != null
           && matchDestResults.get(i).status().equals(Status.OK)
           && checksumMatch(
               matchDestResults.get(i).metadata().get(0),
@@ -526,18 +566,54 @@ public class FileSystems {
    *
    * <p>It will be used in {@link FileSystemRegistrar FileSystemRegistrars} for all schemes.
    *
-   * <p>This is expected only to be used by runners after {@code Pipeline.run}, or in tests.
+   * <p>Outside of workers where Beam FileSystem API is used (e.g. test methods, user code executed
+   * during pipeline submission), consider use {@link #registerFileSystemsOnce} if initialize
+   * FileSystem of supported schema is the main goal.
    */
   @Internal
   public static void setDefaultPipelineOptions(PipelineOptions options) {
-    checkNotNull(options, "options");
-    Set<FileSystemRegistrar> registrars =
-        Sets.newTreeSet(ReflectHelpers.ObjectsClassComparator.INSTANCE);
-    registrars.addAll(
-        Lists.newArrayList(
-            ServiceLoader.load(FileSystemRegistrar.class, ReflectHelpers.findClassLoader())));
+    checkNotNull(options, "options cannot be null");
+    long id = options.getOptionsId();
+    int nextRevision = options.revision();
 
-    SCHEME_TO_FILESYSTEM.set(verifySchemesAreUnique(options, registrars));
+    // entry to set other PipelineOption determined flags
+    Metrics.setDefaultPipelineOptions(options);
+
+    while (true) {
+      KV<Long, Integer> revision = FILESYSTEM_REVISION.get();
+      // only update file systems if the pipeline changed or the options revision increased
+      if (revision != null && revision.getKey().equals(id) && revision.getValue() >= nextRevision) {
+        return;
+      }
+
+      if (FILESYSTEM_REVISION.compareAndSet(revision, KV.of(id, nextRevision))) {
+        Set<FileSystemRegistrar> registrars =
+            Sets.newTreeSet(ReflectHelpers.ObjectsClassComparator.INSTANCE);
+        registrars.addAll(
+            Lists.newArrayList(
+                ServiceLoader.load(FileSystemRegistrar.class, ReflectHelpers.findClassLoader())));
+
+        SCHEME_TO_FILESYSTEM.set(verifySchemesAreUnique(options, registrars));
+        return;
+      }
+    }
+  }
+
+  /**
+   * Register file systems once if never done before.
+   *
+   * <p>This method executes {@link #setDefaultPipelineOptions} only if it has never been run,
+   * otherwise it returns immediately.
+   *
+   * <p>It is internally used by test setup to avoid repeated filesystem registrations (involves
+   * expensive ServiceLoader calls) when there are multiple pipeline and PipelineOptions object
+   * initialized, which is commonly seen in test execution.
+   */
+  @Internal
+  public static synchronized void registerFileSystemsOnce(PipelineOptions options) {
+    if (FILESYSTEM_REVISION.get() == null) {
+      setDefaultPipelineOptions(options);
+    }
   }
 
   @VisibleForTesting
@@ -586,5 +662,21 @@ public class FileSystems {
   public static ResourceId matchNewResource(String singleResourceSpec, boolean isDirectory) {
     return getFileSystemInternal(parseScheme(singleResourceSpec))
         .matchNewResource(singleResourceSpec, isDirectory);
+  }
+
+  /**
+   * Returns a new {@link ResourceId} that represents the named directory resource.
+   *
+   * @param singleResourceSpec the root directory, for example "/abc"
+   * @param baseNames a list of named directory, for example ["d", "e", "f"]
+   * @return the ResourceId for the resolved directory. In same example as above, it corresponds to
+   *     "/abc/d/e/f".
+   */
+  public static ResourceId matchNewDirectory(String singleResourceSpec, String... baseNames) {
+    ResourceId currentDir = matchNewResource(singleResourceSpec, true);
+    for (String dir : baseNames) {
+      currentDir = currentDir.resolve(dir, StandardResolveOptions.RESOLVE_DIRECTORY);
+    }
+    return currentDir;
   }
 }

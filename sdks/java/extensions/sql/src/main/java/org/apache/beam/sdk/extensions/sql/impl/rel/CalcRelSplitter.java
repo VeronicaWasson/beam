@@ -50,8 +50,8 @@ import org.apache.beam.vendor.calcite.v1_28_0.org.apache.calcite.util.graph.Defa
 import org.apache.beam.vendor.calcite.v1_28_0.org.apache.calcite.util.graph.DefaultEdge;
 import org.apache.beam.vendor.calcite.v1_28_0.org.apache.calcite.util.graph.DirectedGraph;
 import org.apache.beam.vendor.calcite.v1_28_0.org.apache.calcite.util.graph.TopologicalOrderIterator;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.primitives.Ints;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.primitives.Ints;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 
@@ -879,7 +879,7 @@ public class CalcRelSplitter {
           continue;
         }
         currentLevel = exprLevels[i];
-        @SuppressWarnings("argument.type.incompatible")
+        @SuppressWarnings("argument")
         final Void unused = exprs[i].accept(this);
       }
     }

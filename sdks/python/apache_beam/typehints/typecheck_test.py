@@ -84,7 +84,9 @@ class MyDoFnBadAnnotation(MyDoFn):
 
 class RuntimeTypeCheckTest(unittest.TestCase):
   def setUp(self):
+    # Use FnApiRunner since it guarantees all lifecycle methods will be called.
     self.p = TestPipeline(
+        'FnApiRunner',
         options=PipelineOptions(
             runtime_type_check=True, performance_runtime_type_check=False))
 
@@ -263,9 +265,9 @@ class PerformanceRuntimeTypeCheckTest(unittest.TestCase):
         e.exception.args[0],
         "Runtime type violation detected within ParDo(IsEven): "
         "Type-hint for return type violated: "
-        "Tuple[bool, int] hint type-constraint violated. "
-        "The type of element #0 in the passed tuple is incorrect. "
-        "Expected an instance of type bool, "
+        "Tuple[<class \'bool\'>, <class \'int\'>] hint type-constraint "
+        "violated. The type of element #0 in the passed tuple is incorrect. "
+        "Expected an instance of type <class \'bool\'>, "
         "instead received an instance of type int. ")
 
   def test_pipeline_runtime_checking_violation_composite_type_output(self):

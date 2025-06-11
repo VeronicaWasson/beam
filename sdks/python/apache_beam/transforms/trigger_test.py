@@ -197,8 +197,10 @@ class TriggerTest(unittest.TestCase):
         AfterWatermark(),
         AccumulationMode.ACCUMULATING,
         [(1, 'a'), (2, 'b'), (13, 'c')],
-        {IntervalWindow(0, 10): [set('ab')],
-         IntervalWindow(10, 20): [set('c')]},
+        {
+            IntervalWindow(0, 10): [set('ab')],
+            IntervalWindow(10, 20): [set('c')]
+        },
         1,
         2,
         3,
@@ -225,36 +227,38 @@ class TriggerTest(unittest.TestCase):
   def test_fixed_watermark_with_early_late(self):
     self.run_trigger_simple(
         FixedWindows(100),  # pyformat break
-        AfterWatermark(early=AfterCount(3),
-                       late=AfterCount(2)),
+        AfterWatermark(early=AfterCount(3), late=AfterCount(2)),
         AccumulationMode.DISCARDING,
         zip(range(9), 'abcdefghi'),
-        {IntervalWindow(0, 100): [
-            set('abcd'), set('efgh'),  # early
-            set('i'),                  # on time
-            set('vw'), set('xy')       # late
-            ]},
+        {
+            IntervalWindow(0, 100): [
+                set('abcd'),
+                set('efgh'),  # early
+                set('i'),  # on time
+                set('vw'),
+                set('xy')  # late
+            ]
+        },
         2,
         late_data=zip(range(5), 'vwxyz'))
 
   def test_sessions_watermark_with_early_late(self):
     self.run_trigger_simple(
         Sessions(10),  # pyformat break
-        AfterWatermark(early=AfterCount(2),
-                       late=AfterCount(1)),
+        AfterWatermark(early=AfterCount(2), late=AfterCount(1)),
         AccumulationMode.ACCUMULATING,
         [(1, 'a'), (15, 'b'), (7, 'c'), (30, 'd')],
         {
             IntervalWindow(1, 25): [
-                set('abc'),                # early
-                set('abc'),                # on time
-                set('abcxy')               # late
+                set('abc'),  # early
+                set('abc'),  # on time
+                set('abcxy')  # late
             ],
             IntervalWindow(30, 40): [
-                set('d'),                  # on time
+                set('d'),  # on time
             ],
             IntervalWindow(1, 40): [
-                set('abcdxyz')             # late
+                set('abcdxyz')  # late
             ],
         },
         2,
@@ -303,13 +307,16 @@ class TriggerTest(unittest.TestCase):
         Repeatedly(AfterAny(AfterCount(3), AfterWatermark())),
         AccumulationMode.ACCUMULATING,
         zip(range(7), 'abcdefg'),
-        {IntervalWindow(0, 100): [
-            set('abc'),
-            set('abcdef'),
-            set('abcdefg'),
-            set('abcdefgx'),
-            set('abcdefgxy'),
-            set('abcdefgxyz')]},
+        {
+            IntervalWindow(0, 100): [
+                set('abc'),
+                set('abcdef'),
+                set('abcdefg'),
+                set('abcdefgx'),
+                set('abcdefgxy'),
+                set('abcdefgxyz')
+            ]
+        },
         1,
         late_data=zip(range(3), 'xyz'))
 
@@ -350,8 +357,10 @@ class TriggerTest(unittest.TestCase):
         AccumulationMode.ACCUMULATING,
         [(1, 'a'), (2, 'b'), (15, 'c'), (16, 'd'), (30, 'z'), (9, 'e'),
          (10, 'f'), (30, 'y')],
-        {IntervalWindow(1, 26): [set('abcdef')],
-         IntervalWindow(30, 40): [set('yz')]},
+        {
+            IntervalWindow(1, 26): [set('abcdef')],
+            IntervalWindow(30, 40): [set('yz')]
+        },
         1,
         2,
         3,
@@ -381,9 +390,11 @@ class TriggerTest(unittest.TestCase):
         AccumulationMode.ACCUMULATING,
         [(1, 'a'), (15, 'b'), (6, 'c'), (30, 's'), (31, 't'), (50, 'z'),
          (50, 'y')],
-        {IntervalWindow(1, 25): [set('abc')],
-         IntervalWindow(30, 41): [set('st')],
-         IntervalWindow(50, 60): [set('yz')]},
+        {
+            IntervalWindow(1, 25): [set('abc')],
+            IntervalWindow(30, 41): [set('st')],
+            IntervalWindow(50, 60): [set('yz')]
+        },
         1,
         2,
         3)
@@ -412,8 +423,10 @@ class TriggerTest(unittest.TestCase):
         AfterEach(AfterCount(2), AfterCount(3)),
         AccumulationMode.ACCUMULATING,
         zip(range(10), 'abcdefghij'),
-        {IntervalWindow(0, 11): [set('ab')],
-         IntervalWindow(0, 15): [set('abcdef')]},
+        {
+            IntervalWindow(0, 11): [set('ab')],
+            IntervalWindow(0, 15): [set('abcdef')]
+        },
         2)
 
     self.run_trigger_simple(
@@ -421,9 +434,11 @@ class TriggerTest(unittest.TestCase):
         Repeatedly(AfterEach(AfterCount(2), AfterCount(3))),
         AccumulationMode.ACCUMULATING,
         zip(range(10), 'abcdefghij'),
-        {IntervalWindow(0, 11): [set('ab')],
-         IntervalWindow(0, 15): [set('abcdef')],
-         IntervalWindow(0, 17): [set('abcdefgh')]},
+        {
+            IntervalWindow(0, 11): [set('ab')],
+            IntervalWindow(0, 15): [set('abcdef')],
+            IntervalWindow(0, 17): [set('abcdefgh')]
+        },
         2)
 
   def test_picklable_output(self):
@@ -540,6 +555,88 @@ class RunnerApiTest(unittest.TestCase):
 
 
 class TriggerPipelineTest(unittest.TestCase):
+  def test_after_processing_time(self):
+    test_options = PipelineOptions(
+        flags=['--allow_unsafe_triggers', '--streaming'])
+    with TestPipeline(options=test_options) as p:
+
+      total_elements_in_trigger = 4
+      processing_time_delay = 2
+      window_size = 10
+
+      # yapf: disable
+      test_stream = TestStream()
+      for i in range(total_elements_in_trigger):
+        (test_stream
+         .advance_processing_time(
+            processing_time_delay / total_elements_in_trigger)
+         .add_elements([('key', i)])
+         )
+
+      test_stream.advance_processing_time(processing_time_delay)
+
+      # Add dropped elements
+      (test_stream
+         .advance_processing_time(0.1)
+         .add_elements([('key', "dropped-1")])
+         .advance_processing_time(0.1)
+         .add_elements([('key', "dropped-2")])
+      )
+
+      (test_stream
+       .advance_processing_time(processing_time_delay)
+       .advance_watermark_to_infinity()
+       )
+      # yapf: enable
+
+      results = (
+          p
+          | test_stream
+          | beam.WindowInto(
+              FixedWindows(window_size),
+              trigger=AfterProcessingTime(processing_time_delay),
+              accumulation_mode=AccumulationMode.DISCARDING)
+          | beam.GroupByKey()
+          | beam.Map(lambda x: x[1]))
+      assert_that(results, equal_to([list(range(total_elements_in_trigger))]))
+
+  def test_repeatedly_after_processing_time(self):
+    test_options = PipelineOptions(flags=['--streaming'])
+    with TestPipeline(options=test_options) as p:
+      total_elements = 7
+      processing_time_delay = 2
+      window_size = 10
+      # yapf: disable
+      test_stream = TestStream()
+      for i in range(total_elements):
+        (test_stream
+         .advance_processing_time(processing_time_delay - 0.01)
+         .add_elements([('key', i)])
+         )
+
+      (test_stream
+       .advance_processing_time(processing_time_delay)
+       .advance_watermark_to_infinity()
+       )
+      # yapf: enable
+
+      results = (
+          p
+          | test_stream
+          | beam.WindowInto(
+              FixedWindows(window_size),
+              trigger=Repeatedly(AfterProcessingTime(processing_time_delay)),
+              accumulation_mode=AccumulationMode.DISCARDING)
+          | beam.GroupByKey()
+          | beam.Map(lambda x: x[1]))
+
+      expected = [[i, i + 1]
+                  for i in range(total_elements - total_elements % 2)
+                  if i % 2 == 0]
+      expected += [] if total_elements % 2 == 0 else [[total_elements - 1]]
+
+      assert_that(results, equal_to(expected))
+
   def test_after_count(self):
     test_options = PipelineOptions(flags=['--allow_unsafe_triggers'])
     with TestPipeline(options=test_options) as p:
@@ -596,12 +693,16 @@ class TriggerPipelineTest(unittest.TestCase):
 
       assert_that(
           results,
-          equal_to(list({
-            'A': [1, 2, 3], # 4 - 6 discarded because trigger finished
-            'B': [1, 2, 3]}.items())))
+          equal_to(
+              list({
+                  'A': [1, 2, 3],  # 4 - 6 discarded because trigger finished
+                  'B': [1, 2, 3]
+              }.items())))
 
   def test_always(self):
-    with TestPipeline() as p:
+    # Pin to FnApiRunner since portable runner could trigger differently if
+    # using bundle sizes of greater than 1.
+    with TestPipeline('FnApiRunner') as p:
 
       def construct_timestamped(k, t):
         return TimestampedValue((k, t), t)
@@ -624,12 +725,9 @@ class TriggerPipelineTest(unittest.TestCase):
           result,
           equal_to(
               list({
-                  'A-2': {10, 11},
-                  # Elements out of windows are also emitted.
-                  'A-6': {1, 2, 3, 4, 5},
-                  # A,1 is emitted twice.
-                  'B-5': {6, 7, 8, 9},
-                  # B,6 is emitted twice.
+                  'A-2': {10, 11},  # Elements out of windows are also emitted.
+                  'A-6': {1, 2, 3, 4, 5},  # A,1 is emitted twice.
+                  'B-5': {6, 7, 8, 9},  # B,6 is emitted twice.
                   'B-3': {10, 15, 16},
               }.items())))
 
@@ -689,11 +787,11 @@ class TriggerPipelineTest(unittest.TestCase):
           | beam.GroupByKey()
           | beam.FlatMap(lambda x: x[1]))
 
-    # The trigger should fire twice. Once after 5 seconds, and once after 10.
-    # The firings should accumulate the output.
-    first_firing = [str(i) for i in elements if i <= 5]
-    second_firing = [str(i) for i in elements]
-    assert_that(records, equal_to(first_firing + second_firing))
+      # The trigger should fire twice. Once after 5 seconds, and once after 10.
+      # The firings should accumulate the output.
+      first_firing = [str(i) for i in elements if i <= 5]
+      second_firing = [str(i) for i in elements]
+      assert_that(records, equal_to(first_firing + second_firing))
 
   def test_on_pane_watermark_hold_no_pipeline_stall(self):
     """A regression test added for
@@ -1031,15 +1129,15 @@ class BaseTestStreamTranscriptTest(TranscriptTest):
     if is_order_agnostic:
       reshuffle_seed = random.randrange(1 << 20)
       keys = [
-          u'original',
-          u'reversed',
-          u'reshuffled(%s)' % reshuffle_seed,
-          u'one-element-bundles',
-          u'one-element-bundles-reversed',
-          u'two-element-bundles'
+          'original',
+          'reversed',
+          'reshuffled(%s)' % reshuffle_seed,
+          'one-element-bundles',
+          'one-element-bundles-reversed',
+          'two-element-bundles'
       ]
     else:
-      keys = [u'key1', u'key2']
+      keys = ['key1', 'key2']
 
     # Elements are encoded as a json strings to allow other languages to
     # decode elements while executing the test stream.

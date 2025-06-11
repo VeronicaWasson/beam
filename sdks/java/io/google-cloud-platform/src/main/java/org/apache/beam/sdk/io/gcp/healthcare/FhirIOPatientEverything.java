@@ -46,8 +46,8 @@ import org.apache.beam.sdk.values.POutput;
 import org.apache.beam.sdk.values.PValue;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TupleTagList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Throwables;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Throwables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -183,11 +183,11 @@ public class FhirIOPatientEverything
             GetPatientEverythingFn.class, BASE_METRIC_PREFIX + "get_patient_everything_latency_ms");
     private static final Logger LOG = LoggerFactory.getLogger(GetPatientEverythingFn.class);
 
-    @SuppressWarnings("initialization.fields.uninitialized")
+    @SuppressWarnings("initialization.field.uninitialized")
     private HealthcareApiClient client;
 
     /**
-     * Instantiate healthcare client.
+     * Instantiate healthcare client (version v1).
      *
      * @throws IOException the io exception
      */

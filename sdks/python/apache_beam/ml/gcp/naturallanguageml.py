@@ -26,8 +26,7 @@ from apache_beam.metrics import Metrics
 
 try:
   from google.cloud import language
-  from google.cloud.language import enums  # pylint: disable=unused-import
-  from google.cloud.language import types
+  from google.cloud import language_v1
 except ImportError:
   raise ImportError(
       'Google Cloud Natural Language API not supported for this execution '
@@ -42,7 +41,7 @@ class Document(object):
   Args:
     content (str): The content of the input or the Google Cloud Storage URI
       where the file is stored.
-    type (`Union[str, google.cloud.language.enums.Document.Type]`): Text type.
+    type (`Union[str, google.cloud.language_v1.Document.Type]`): Text type.
       Possible values are `HTML`, `PLAIN_TEXT`. The default value is
       `PLAIN_TEXT`.
     language_hint (`Optional[str]`): The language of the text. If not specified,
@@ -53,15 +52,13 @@ class Document(object):
     from_gcs (bool): Whether the content should be interpret as a Google Cloud
       Storage URI. The default value is :data:`False`.
   """
-
   def __init__(
       self,
-      content,  # type: str
-      type='PLAIN_TEXT',  # type: Union[str, enums.Document.Type]
-      language_hint=None,  # type: Optional[str]
-      encoding='UTF8',  # type: Optional[str]
-      from_gcs=False  # type: bool
-  ):
+      content: str,
+      type: Union[str, language_v1.Document.Type] = 'PLAIN_TEXT',
+      language_hint: Optional[str] = None,
+      encoding: Optional[str] = 'UTF8',
+      from_gcs: bool = False):
     self.content = content
     self.type = type
     self.encoding = encoding
@@ -69,8 +66,7 @@ class Document(object):
     self.from_gcs = from_gcs
 
   @staticmethod
-  def to_dict(document):
-    # type: (Document) -> Mapping[str, Optional[str]]
+  def to_dict(document: 'Document') -> Mapping[str, Optional[str]]:
     if document.from_gcs:
       dict_repr = {'gcs_content_uri': document.content}
     else:
@@ -83,11 +79,11 @@ class Document(object):
 
 @beam.ptransform_fn
 def AnnotateText(
-    pcoll,  # type: beam.pvalue.PCollection
-    features,  # type: Union[Mapping[str, bool], types.AnnotateTextRequest.Features]
-    timeout=None,  # type: Optional[float]
-    metadata=None  # type: Optional[Sequence[Tuple[str, str]]]
-):
+    pcoll: beam.pvalue.PCollection,
+    features: Union[Mapping[str, bool],
+                    language_v1.AnnotateTextRequest.Features],
+    timeout: Optional[float] = None,
+    metadata: Optional[Sequence[Tuple[str, str]]] = None):
   """A :class:`~apache_beam.transforms.ptransform.PTransform`
   for annotating text using the Google Cloud Natural Language API:
   https://cloud.google.com/natural-language/docs.
@@ -98,7 +94,6 @@ def AnnotateText(
     features (`Union[Mapping[str, bool], types.AnnotateTextRequest.Features]`):
       A dictionary of natural language operations to be performed on given
       text in the following format::
-
       {'extact_syntax'=True, 'extract_entities'=True}
 
     timeout (`Optional[float]`): The amount of time, in seconds, to wait
@@ -111,14 +106,14 @@ def AnnotateText(
 
 
 @beam.typehints.with_input_types(Document)
-@beam.typehints.with_output_types(types.AnnotateTextResponse)
+@beam.typehints.with_output_types(language_v1.AnnotateTextResponse)
 class _AnnotateTextFn(beam.DoFn):
   def __init__(
       self,
-      features,  # type: Union[Mapping[str, bool], types.AnnotateTextRequest.Features]
-      timeout,  # type: Optional[float]
-      metadata=None  # type: Optional[Sequence[Tuple[str, str]]]
-  ):
+      features: Union[Mapping[str, bool],
+                      language_v1.AnnotateTextRequest.Features],
+      timeout: Optional[float],
+      metadata: Optional[Sequence[Tuple[str, str]]] = None):
     self.features = features
     self.timeout = timeout
     self.metadata = metadata
@@ -129,8 +124,7 @@ class _AnnotateTextFn(beam.DoFn):
     self.client = self._get_api_client()
 
   @staticmethod
-  def _get_api_client():
-    # type: () -> language.LanguageServiceClient
+  def _get_api_client() -> language.LanguageServiceClient:
     return language.LanguageServiceClient()
 
   def process(self, element):

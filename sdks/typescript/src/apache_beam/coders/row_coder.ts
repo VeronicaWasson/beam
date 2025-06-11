@@ -23,7 +23,13 @@ import * as runnerApi from "../proto/beam_runner_api";
 import { Writer, Reader } from "protobufjs";
 import { Coder, Context, ProtoContext, globalRegistry } from "./coders";
 
-import { Schema, Field, FieldType, AtomicType } from "../proto/schema";
+import {
+  Schema,
+  Field,
+  FieldType,
+  AtomicType,
+  LogicalType,
+} from "../proto/schema";
 import {
   BoolCoder,
   BytesCoder,
@@ -33,12 +39,65 @@ import {
   VarIntCoder,
 } from "./standard_coders";
 
+interface LogicalTypeInfo<T, R> {
+  urn: string;
+  reprType: FieldType;
+  toRepr(obj: T): R;
+  fromRepr(repr: R): T;
+}
+
+const logicalTypes: Map<string, LogicalTypeInfo<unknown, unknown>> = new Map();
+
+export function registerLogicalType(logicalType: LogicalTypeInfo<any, any>) {
+  logicalTypes.set(logicalType.urn, logicalType);
+}
+
+function getLogicalFieldType(urn: string, nullable: boolean = true): FieldType {
+  const info = logicalTypes.get(urn)!;
+  return {
+    nullable: nullable,
+    typeInfo: {
+      oneofKind: "logicalType",
+      logicalType: LogicalType.create({
+        urn,
+        representation: info.reprType,
+      }),
+    },
+  };
+}
+
+class TypePlaceholder {
+  constructor(public fieldType: FieldType) {}
+}
+
+class LogicalTypePlaceholder extends TypePlaceholder {
+  constructor(public urn: string) {
+    super(getLogicalFieldType(urn));
+  }
+}
+
 const argsort = (x) =>
   x
     .map((v, i) => [v, i])
     .sort()
     .map((y) => y[1]);
 
+/**
+ * A coder for encoding Objects as row objects with a given schema.
+ *
+ * This is particularly useful for cross-language interoperability,
+ * and is more efficient than the general object encoding scheme as the
+ * fields (and their types) are fixed and do not have to be encoded along
+ * with each individual element.
+ *
+ * While RowCoders can be instantiated directly from a schema object,
+ * there is also the convenience method `RowCoder.fromJSON()` method that
+ * can infer a RowCoder from a prototypical example, e.g.
+ *
+ *```js
+ * const my_row_coder = RowCoder.fromJSON({int_field: 0, str_field: ""});
+ *```
+ */
 export class RowCoder implements Coder<any> {
   public static URN: string = "beam:coder:row:v1";
 
@@ -58,6 +117,8 @@ export class RowCoder implements Coder<any> {
       let typeInfo = f.type?.typeInfo;
       switch (typeInfo.oneofKind) {
         case "atomicType":
+        case "rowType":
+        case "logicalType":
           obj[f.name] = value;
           break;
         case "arrayType":
@@ -65,19 +126,11 @@ export class RowCoder implements Coder<any> {
           break;
         // case "iterableType":
         // case "mapType":
-        case "rowType":
-          if (typeInfo.rowType.schema !== undefined) {
-            obj[f.name] = value;
-          } else {
-            throw new Error("Schema missing on RowType");
-          }
-          break;
-        // case "logicalType":
         default:
           throw new Error(
             `Encountered a type that is not currently supported by RowCoder: ${JSON.stringify(
-              f.type
-            )}`
+              f.type,
+            )}`,
           );
       }
       return obj;
@@ -85,6 +138,10 @@ export class RowCoder implements Coder<any> {
   }
 
   static inferTypeFromJSON(obj: any, nullable: boolean = true): FieldType {
+    if (obj instanceof TypePlaceholder) {
+      return obj.fieldType;
+    }
+
     let fieldType: FieldType = {
       nullable: nullable,
       typeInfo: {
@@ -132,6 +189,16 @@ export class RowCoder implements Coder<any> {
           fieldType.typeInfo = {
             oneofKind: "atomicType",
             atomicType: AtomicType.BYTES,
+          };
+        } else if (obj.beamLogicalType) {
+          const logicalTypeInfo = logicalTypes.get(obj.beamLogicalType);
+          fieldType.typeInfo = {
+            oneofKind: "logicalType",
+            logicalType: {
+              urn: obj.beamLogicalType,
+              payload: new Uint8Array(),
+              representation: logicalTypeInfo?.reprType,
+            },
           };
         } else {
           fieldType.typeInfo = {
@@ -198,14 +265,14 @@ export class RowCoder implements Coder<any> {
             return new BoolCoder();
           default:
             throw new Error(
-              `Encountered an Atomic type that is not currently supported by RowCoder: ${atomicType}`
+              `Encountered an Atomic type that is not currently supported by RowCoder: ${atomicType}`,
             );
         }
         break;
       case "arrayType":
         if (typeInfo.arrayType.elementType !== undefined) {
           return new IterableCoder(
-            this.getCoderFromType(typeInfo.arrayType.elementType)
+            this.getCoderFromType(typeInfo.arrayType.elementType),
           );
         } else {
           throw new Error("ElementType missing on ArrayType");
@@ -219,12 +286,34 @@ export class RowCoder implements Coder<any> {
           throw new Error("Schema missing on RowType");
         }
         break;
-      // case "logicalType":
+      case "logicalType":
+        const logicalTypeInfo = logicalTypes.get(typeInfo.logicalType.urn);
+        if (logicalTypeInfo !== undefined) {
+          const reprCoder = this.getCoderFromType(
+            typeInfo.logicalType.representation!,
+          );
+          return {
+            encode: (element: any, writer: Writer, context: Context) =>
+              reprCoder.encode(
+                logicalTypeInfo.toRepr(element),
+                writer,
+                context,
+              ),
+            decode: (reader: Reader, context: Context) =>
+              logicalTypeInfo.fromRepr(reprCoder.decode(reader, context)),
+            toProto: (pipelineContext: ProtoContext) => {
+              throw new Error("Ephemeral coder.");
+            },
+          };
+        } else {
+          throw new Error(`Unknown logical type: ${typeInfo.logicalType.urn}`);
+        }
+        break;
       default:
         throw new Error(
           `Encountered a type that is not currently supported by RowCoder: ${JSON.stringify(
-            t
-          )}`
+            t,
+          )}`,
         );
     }
   }
@@ -253,7 +342,7 @@ export class RowCoder implements Coder<any> {
       let encPosx = schema.fields.map((f: Field) => f.encodingPosition);
       if (encPosx.length !== this.encodingPositions.length) {
         throw new Error(
-          `Schema with id ${this.schema.id} has encoding_positions_set=True, but not all fields have encoding_position set`
+          `Schema with id ${this.schema.id} has encoding_positions_set=True, but not all fields have encoding_position set`,
         );
       }
       // Checking if positions are in {0, ..., length-1}
@@ -263,7 +352,7 @@ export class RowCoder implements Coder<any> {
     }
 
     this.hasNullableFields = this.schema.fields.some(
-      (f: Field) => f.type?.nullable
+      (f: Field) => f.type?.nullable,
     );
     this.components = this.encodingPositions
       .map((i) => this.schema.fields[i])
@@ -320,7 +409,7 @@ export class RowCoder implements Coder<any> {
       if (attr === null || attr === undefined) {
         if (!this.fieldNullable[i]) {
           throw new Error(
-            `Attempted to encode null for non-nullable field \"${this.schema.fields[i].name}\".`
+            `Attempted to encode null for non-nullable field \"${this.schema.fields[i].name}\".`,
           );
         }
       } else {
@@ -383,7 +472,7 @@ export class RowCoder implements Coder<any> {
       obj = this.addFieldOfType(
         obj,
         this.schema.fields[i],
-        sortedComponents[i]
+        sortedComponents[i],
       );
     });
 
@@ -402,3 +491,10 @@ export class RowCoder implements Coder<any> {
 }
 
 globalRegistry().register(RowCoder.URN, RowCoder);
+
+registerLogicalType({
+  urn: "beam:logical_type:schema:v1",
+  reprType: RowCoder.inferTypeFromJSON(new Uint8Array(), false),
+  toRepr: (schema) => Schema.toBinary(schema),
+  fromRepr: (serialized) => Schema.fromBinary(serialized),
+});

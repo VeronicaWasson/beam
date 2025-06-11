@@ -34,9 +34,11 @@ StandardProtocols = beam_runner_api_pb2_urns.StandardProtocols
 StandardPTransforms = beam_runner_api_pb2_urns.StandardPTransforms
 StandardRequirements = beam_runner_api_pb2_urns.StandardRequirements
 StandardResourceHints = beam_runner_api_pb2_urns.StandardResourceHints
+StandardRunnerProtocols = beam_runner_api_pb2_urns.StandardRunnerProtocols
 StandardSideInputTypes = beam_runner_api_pb2_urns.StandardSideInputTypes
 StandardUserStateTypes = beam_runner_api_pb2_urns.StandardUserStateTypes
 ExpansionMethods = external_transforms_pb2_urns.ExpansionMethods
+ManagedTransforms = external_transforms_pb2_urns.ManagedTransforms
 MonitoringInfo = metrics_pb2_urns.MonitoringInfo
 MonitoringInfoSpecs = metrics_pb2_urns.MonitoringInfoSpecs
 MonitoringInfoTypeUrns = metrics_pb2_urns.MonitoringInfoTypeUrns
@@ -52,6 +54,7 @@ composites = StandardPTransforms.Composites
 combine_components = StandardPTransforms.CombineComponents
 sdf_components = StandardPTransforms.SplittableParDoComponents
 group_into_batches_components = StandardPTransforms.GroupIntoBatchesComponents
+executable_stage = "beam:runner:executable_stage:v1"
 
 user_state = StandardUserStateTypes.Enum
 side_inputs = StandardSideInputTypes.Enum
@@ -73,11 +76,19 @@ monitoring_info_types = MonitoringInfoTypeUrns.Enum
 monitoring_info_labels = MonitoringInfo.MonitoringInfoLabels
 
 protocols = StandardProtocols.Enum
+runner_protocols = StandardRunnerProtocols.Enum
 requirements = StandardRequirements.Enum
 
 displayData = StandardDisplayData.DisplayData
 
 java_class_lookup = ExpansionMethods.Enum.JAVA_CLASS_LOOKUP
+schematransform_based_expand = ExpansionMethods.Enum.SCHEMA_TRANSFORM
 
+decimal = LogicalTypes.Enum.DECIMAL
 micros_instant = LogicalTypes.Enum.MICROS_INSTANT
+millis_instant = LogicalTypes.Enum.MILLIS_INSTANT
 python_callable = LogicalTypes.Enum.PYTHON_CALLABLE
+fixed_bytes = LogicalTypes.Enum.FIXED_BYTES
+var_bytes = LogicalTypes.Enum.VAR_BYTES
+fixed_char = LogicalTypes.Enum.FIXED_CHAR
+var_char = LogicalTypes.Enum.VAR_CHAR

@@ -24,8 +24,6 @@ import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.runners.core.KeyedWorkItem;
 import org.apache.beam.runners.core.KeyedWorkItemCoder;
 import org.apache.beam.runners.core.SystemReduceFn;
-import org.apache.beam.runners.core.construction.graph.PipelineNode;
-import org.apache.beam.runners.core.construction.graph.QueryablePipeline;
 import org.apache.beam.runners.samza.SamzaPipelineOptions;
 import org.apache.beam.runners.samza.runtime.DoFnOp;
 import org.apache.beam.runners.samza.runtime.GroupByKeyOp;
@@ -46,12 +44,15 @@ import org.apache.beam.sdk.transforms.GroupByKey;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.util.AppliedCombineFn;
-import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.graph.PipelineNode;
+import org.apache.beam.sdk.util.construction.graph.QueryablePipeline;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.TupleTag;
+import org.apache.beam.sdk.values.WindowedValue;
+import org.apache.beam.sdk.values.WindowedValues;
 import org.apache.beam.sdk.values.WindowingStrategy;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 import org.apache.samza.operators.MessageStream;
 import org.apache.samza.serializers.KVSerde;
 
@@ -100,8 +101,7 @@ class GroupByKeyTranslator<K, InputT, OutputT>
             windowingStrategy,
             kvInputCoder,
             elementCoder,
-            ctx.getTransformFullName(),
-            ctx.getTransformId(),
+            ctx,
             outputTag,
             input.isBounded());
 
@@ -118,7 +118,7 @@ class GroupByKeyTranslator<K, InputT, OutputT>
     final MessageStream<OpMessage<KV<K, InputT>>> inputStream = ctx.getMessageStreamById(inputId);
     final WindowingStrategy<?, BoundedWindow> windowingStrategy =
         WindowUtils.getWindowStrategy(inputId, pipeline.getComponents());
-    final WindowedValue.WindowedValueCoder<KV<K, InputT>> windowedInputCoder =
+    final WindowedValues.WindowedValueCoder<KV<K, InputT>> windowedInputCoder =
         WindowUtils.instantiateWindowedCoder(inputId, pipeline.getComponents());
     final TupleTag<KV<K, OutputT>> outputTag =
         new TupleTag<>(Iterables.getOnlyElement(transform.getTransform().getOutputsMap().keySet()));
@@ -152,14 +152,14 @@ class GroupByKeyTranslator<K, InputT, OutputT>
       RunnerApi.PCollection input,
       MessageStream<OpMessage<KV<K, InputT>>> inputStream,
       WindowingStrategy<?, BoundedWindow> windowingStrategy,
-      WindowedValue.WindowedValueCoder<KV<K, InputT>> windowedInputCoder,
+      WindowedValues.WindowedValueCoder<KV<K, InputT>> windowedInputCoder,
       TupleTag<KV<K, OutputT>> outputTag,
       PortableTranslationContext ctx) {
-    final boolean needRepartition = ctx.getSamzaPipelineOptions().getMaxSourceParallelism() > 1;
+    final boolean needRepartition = ctx.getPipelineOptions().getMaxSourceParallelism() > 1;
     final Coder<BoundedWindow> windowCoder = windowingStrategy.getWindowFn().windowCoder();
     final KvCoder<K, InputT> kvInputCoder = (KvCoder<K, InputT>) windowedInputCoder.getValueCoder();
     final Coder<WindowedValue<KV<K, InputT>>> elementCoder =
-        WindowedValue.FullWindowedValueCoder.of(kvInputCoder, windowCoder);
+        WindowedValues.FullWindowedValueCoder.of(kvInputCoder, windowCoder);
 
     @SuppressWarnings("unchecked")
     final SystemReduceFn<K, InputT, ?, OutputT, BoundedWindow> reduceFn =
@@ -175,8 +175,7 @@ class GroupByKeyTranslator<K, InputT, OutputT>
         windowingStrategy,
         kvInputCoder,
         elementCoder,
-        ctx.getTransformFullName(),
-        ctx.getTransformId(),
+        ctx,
         outputTag,
         isBounded);
   }
@@ -188,8 +187,7 @@ class GroupByKeyTranslator<K, InputT, OutputT>
       WindowingStrategy<?, BoundedWindow> windowingStrategy,
       KvCoder<K, InputT> kvInputCoder,
       Coder<WindowedValue<KV<K, InputT>>> elementCoder,
-      String transformFullName,
-      String transformId,
+      TranslationContext ctx,
       TupleTag<KV<K, OutputT>> outputTag,
       PCollection.IsBounded isBounded) {
     final MessageStream<OpMessage<KV<K, InputT>>> filteredInputStream =
@@ -207,7 +205,7 @@ class GroupByKeyTranslator<K, InputT, OutputT>
                   KVSerde.of(
                       SamzaCoders.toSerde(kvInputCoder.getKeyCoder()),
                       SamzaCoders.toSerde(elementCoder)),
-                  "gbk-" + escape(transformId))
+                  "gbk-" + escape(ctx.getTransformId()))
               .map(kv -> OpMessage.ofElement(kv.getValue()));
     }
 
@@ -219,7 +217,7 @@ class GroupByKeyTranslator<K, InputT, OutputT>
 
     final MessageStream<OpMessage<KV<K, OutputT>>> outputStream =
         partitionedInputStream
-            .flatMapAsync(OpAdapter.adapt(new KvToKeyedWorkItemOp<>()))
+            .flatMapAsync(OpAdapter.adapt(new KvToKeyedWorkItemOp<>(), ctx))
             .flatMapAsync(
                 OpAdapter.adapt(
                     new GroupByKeyOp<>(
@@ -228,9 +226,10 @@ class GroupByKeyTranslator<K, InputT, OutputT>
                         reduceFn,
                         windowingStrategy,
                         new DoFnOp.SingleOutputManagerFactory<>(),
-                        transformFullName,
-                        transformId,
-                        isBounded)));
+                        ctx.getTransformFullName(),
+                        ctx.getTransformId(),
+                        isBounded),
+                    ctx));
     return outputStream;
   }
 

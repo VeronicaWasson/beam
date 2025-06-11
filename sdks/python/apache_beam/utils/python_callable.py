@@ -43,8 +43,7 @@ class PythonCallableWithSource(object):
 
   is a valid chunk of source code.
   """
-  def __init__(self, source):
-    # type: (str) -> None
+  def __init__(self, source: str) -> None:
     self._source = source
     self._callable = self.load_from_source(source)
 
@@ -77,7 +76,7 @@ class PythonCallableWithSource(object):
     return o
 
   @staticmethod
-  def load_from_script(source):
+  def load_from_script(source, method_name=None):
     lines = [
         line for line in source.split('\n')
         if line.strip() and line.strip()[0] != '#'
@@ -85,29 +84,42 @@ class PythonCallableWithSource(object):
     common_indent = min(len(line) - len(line.lstrip()) for line in lines)
     lines = [line[common_indent:] for line in lines]
 
-    for ix, line in reversed(list(enumerate(lines))):
-      if line[0] != ' ':
-        if line.startswith('def '):
-          name = line[4:line.index('(')].strip()
-        elif line.startswith('class '):
-          name = line[5:line.index('(') if '(' in
-                      line else line.index(':')].strip()
-        else:
-          name = '__python_callable__'
-          lines[ix] = name + ' = ' + line
-        break
-    else:
-      raise ValueError("Unable to identify callable from %r" % source)
+    if method_name is None:
+      for ix, line in reversed(list(enumerate(lines))):
+        if line[0] != ' ':
+          if line.startswith('def '):
+            method_name = line[4:line.index('(')].strip()
+          elif line.startswith('class '):
+            method_name = line[5:line.index('(') if '(' in
+                               line else line.index(':')].strip()
+          else:
+            method_name = '__python_callable__'
+            lines[ix] = method_name + ' = ' + line
+          break
+      else:
+        raise ValueError("Unable to identify callable from %r" % source)
 
     # pylint: disable=exec-used
     # pylint: disable=ungrouped-imports
     import apache_beam as beam
     exec_globals = {'beam': beam}
     exec('\n'.join(lines), exec_globals)
-    return exec_globals[name]
+    return exec_globals[method_name]
 
-  def get_source(self):
-    # type: () -> str
+  def default_label(self):
+    src = self._source.strip()
+    last_line = src.split('\n')[-1]
+    if last_line[0] != ' ' and len(last_line) < 72:
+      return last_line
+    # Avoid circular import.
+    from apache_beam.transforms.ptransform import label_from_callable
+    return label_from_callable(self._callable)
+
+  @property
+  def _argspec_fn(self):
+    return self._callable
+
+  def get_source(self) -> str:
     return self._source
 
   def __call__(self, *args, **kwargs):

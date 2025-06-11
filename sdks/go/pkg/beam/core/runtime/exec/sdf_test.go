@@ -716,6 +716,14 @@ func TestAsSplittableUnit(t *testing.T) {
 				wantProgress:  0.5,
 			},
 			{
+				name:          "SingleWindowZeroWork",
+				windows:       testWindows,
+				doneWork:      0.0,
+				remainingWork: 0.0,
+				currWindow:    0,
+				wantProgress:  0.0,
+			},
+			{
 				name:          "MultipleWindows",
 				windows:       multiWindows,
 				doneWork:      1.0,
@@ -723,6 +731,14 @@ func TestAsSplittableUnit(t *testing.T) {
 				currWindow:    1,
 				// Progress should be halfway through second window.
 				wantProgress: 1.5 / 4.0,
+			},
+			{
+				name:          "MultipleWindowsZeroWork",
+				windows:       multiWindows,
+				doneWork:      0.0,
+				remainingWork: 0.0,
+				currWindow:    1,
+				wantProgress:  1.0 / 4.0,
 			},
 		}
 		for _, test := range tests {
@@ -776,15 +792,19 @@ func TestAsSplittableUnit(t *testing.T) {
 			name          string
 			fn            *graph.DoFn
 			frac          float64
-			doneRt        bool // Result that RTracker will return for IsDone.
+			done          float64
+			remaining     float64
+			isDoneRt      bool // Result that RTracker will return for IsDone.
 			in            FullValue
 			wantPrimaries []*FullValue
 			wantResiduals []*FullValue
 		}{
 			{
-				name: "SingleElem",
-				fn:   dfn,
-				frac: 0.5,
+				name:      "SingleElem",
+				fn:        dfn,
+				frac:      0.5,
+				done:      0.0,
+				remaining: 1.0,
 				in: FullValue{
 					Elm: &FullValue{
 						Elm: 1,
@@ -823,9 +843,11 @@ func TestAsSplittableUnit(t *testing.T) {
 				}},
 			},
 			{
-				name: "SingleElemStatefulWatermarkEstimating",
-				fn:   statefulWeFn,
-				frac: 0.5,
+				name:      "SingleElemStatefulWatermarkEstimating",
+				fn:        statefulWeFn,
+				frac:      0.5,
+				done:      0.0,
+				remaining: 1.0,
 				in: FullValue{
 					Elm: &FullValue{
 						Elm: 1,
@@ -864,9 +886,11 @@ func TestAsSplittableUnit(t *testing.T) {
 				}},
 			},
 			{
-				name: "KvElem",
-				fn:   kvdfn,
-				frac: 0.5,
+				name:      "KvElem",
+				fn:        kvdfn,
+				frac:      0.5,
+				done:      0.0,
+				remaining: 1.0,
 				in: FullValue{
 					Elm: &FullValue{
 						Elm: &FullValue{
@@ -914,10 +938,12 @@ func TestAsSplittableUnit(t *testing.T) {
 				}},
 			},
 			{
-				name:   "DoneRTracker",
-				fn:     dfn,
-				doneRt: true,
-				frac:   0.5,
+				name:      "DoneRTracker",
+				fn:        dfn,
+				frac:      0.5,
+				done:      0.0,
+				remaining: 1.0,
+				isDoneRt:  true,
 				in: FullValue{
 					Elm: &FullValue{
 						Elm: 1,
@@ -936,9 +962,11 @@ func TestAsSplittableUnit(t *testing.T) {
 			{
 				// MultiWindow split where split point lands inside currently
 				// processing restriction tracker.
-				name: "MultiWindow/RestrictionSplit",
-				fn:   dfn,
-				frac: 0.125, // Should be in the middle of the first (current) window.
+				name:      "MultiWindow/RestrictionSplit",
+				fn:        dfn,
+				frac:      0.125, // Should be in the middle of the first (current) window.
+				done:      0.0,
+				remaining: 1.0,
 				in: FullValue{
 					Elm: &FullValue{
 						Elm: 1,
@@ -990,9 +1018,11 @@ func TestAsSplittableUnit(t *testing.T) {
 			{
 				// MultiWindow split where the split lands outside the current
 				// window, and performs a window boundary split instead.
-				name: "MultiWindow/WindowBoundarySplit",
-				fn:   dfn,
-				frac: 0.55,
+				name:      "MultiWindow/WindowBoundarySplit",
+				fn:        dfn,
+				frac:      0.55,
+				done:      0.0,
+				remaining: 1.0,
 				in: FullValue{
 					Elm: &FullValue{
 						Elm: 1,
@@ -1033,10 +1063,12 @@ func TestAsSplittableUnit(t *testing.T) {
 			{
 				// Tests that a MultiWindow split with a Done RTracker will
 				// fallback to a window boundary split.
-				name:   "MultiWindow/DoneRTrackerSplit",
-				fn:     dfn,
-				frac:   0.125,
-				doneRt: true,
+				name:      "MultiWindow/DoneRTrackerSplit",
+				fn:        dfn,
+				frac:      0.125,
+				done:      0.0,
+				remaining: 1.0,
+				isDoneRt:  true,
 				in: FullValue{
 					Elm: &FullValue{
 						Elm: 1,
@@ -1077,9 +1109,34 @@ func TestAsSplittableUnit(t *testing.T) {
 			{
 				// Test that if a window boundary split lands at the end of an
 				// element, it results in a no-op.
-				name: "MultiWindow/NoResidual",
-				fn:   dfn,
-				frac: 0.95, // Should round to end of element and cause a no-op.
+				name:      "MultiWindow/NoResidual",
+				fn:        dfn,
+				frac:      0.95, // Should round to end of element and cause a no-op.
+				done:      0.0,
+				remaining: 1.0,
+				in: FullValue{
+					Elm: &FullValue{
+						Elm: 1,
+						Elm2: &FullValue{
+							Elm:  &VetRestriction{ID: "Sdf"},
+							Elm2: false,
+						},
+					},
+					Elm2:      1.0,
+					Timestamp: testTimestamp,
+					Windows:   testMultiWindows,
+				},
+				wantPrimaries: []*FullValue{},
+				wantResiduals: []*FullValue{},
+			},
+			{
+				// Tests that an RTracker progress of 0.0 done and 0.0 remaining
+				// is treated as a current window progress of 0.0.
+				name:      "MultiWindow/ZeroWork",
+				fn:        dfn,
+				frac:      0.95,
+				done:      0.0,
+				remaining: 0.0,
 				in: FullValue{
 					Elm: &FullValue{
 						Elm: 1,
@@ -1104,9 +1161,9 @@ func TestAsSplittableUnit(t *testing.T) {
 				node := &ProcessSizedElementsAndRestrictions{PDo: n}
 				node.rt = &SplittableUnitRTracker{
 					VetRTracker: VetRTracker{Rest: test.in.Elm.(*FullValue).Elm2.(*FullValue).Elm.(*VetRestriction)},
-					Done:        0,
-					Remaining:   1.0,
-					ThisIsDone:  test.doneRt,
+					Done:        test.done,
+					Remaining:   test.remaining,
+					ThisIsDone:  test.isDoneRt,
 				}
 				node.elm = &test.in
 				node.numW = len(test.in.Windows)
@@ -1114,10 +1171,11 @@ func TestAsSplittableUnit(t *testing.T) {
 
 				// Call from SplittableUnit and check results.
 				su := SplittableUnit(node)
-				if err := node.Up(context.Background()); err != nil {
+				ctx := context.Background()
+				if err := node.Up(ctx); err != nil {
 					t.Fatalf("ProcessSizedElementsAndRestrictions.Up() failed: %v", err)
 				}
-				gotPrimaries, gotResiduals, err := su.Split(test.frac)
+				gotPrimaries, gotResiduals, err := su.Split(ctx, test.frac)
 				if err != nil {
 					t.Fatalf("SplittableUnit.Split(%v) failed: %v", test.frac, err)
 				}
@@ -1184,10 +1242,11 @@ func TestAsSplittableUnit(t *testing.T) {
 
 				// Call from SplittableUnit and check results.
 				su := SplittableUnit(node)
-				if err := node.Up(context.Background()); err != nil {
+				ctx := context.Background()
+				if err := node.Up(ctx); err != nil {
 					t.Fatalf("ProcessSizedElementsAndRestrictions.Up() failed: %v", err)
 				}
-				_, _, err := su.Split(0.5)
+				_, _, err := su.Split(ctx, 0.5)
 				if err == nil {
 					t.Errorf("SplittableUnit.Split(%v) was expected to fail.", test.in)
 				}
@@ -1251,10 +1310,11 @@ func TestAsSplittableUnit(t *testing.T) {
 				node.currW = 0
 				// Call from SplittableUnit and check results.
 				su := SplittableUnit(node)
-				if err := node.Up(context.Background()); err != nil {
+				ctx := context.Background()
+				if err := node.Up(ctx); err != nil {
 					t.Fatalf("ProcessSizedElementsAndRestrictions.Up() failed: %v", err)
 				}
-				gotResiduals, err := su.Checkpoint()
+				gotResiduals, err := su.Checkpoint(ctx)
 
 				if err != nil {
 					t.Fatalf("SplittableUnit.Checkpoint() returned error, got %v", err)
@@ -1401,7 +1461,7 @@ func TestMultiWindowProcessing(t *testing.T) {
 	// Split should hit window boundary between 2 and 3. We don't need to check
 	// the split result here, just the effects it has on currW and numW.
 	frac := 0.5
-	if _, _, err := su.Split(frac); err != nil {
+	if _, _, err := su.Split(context.Background(), frac); err != nil {
 		t.Errorf("Split(%v) failed with error: %v", frac, err)
 	}
 	if got, want := node.currW, blockW; got != want {
@@ -1524,6 +1584,36 @@ func (fn *WindowBlockingSdf) ProcessElement(w typex.Window, rt *sdf.LockRTracker
 	emit(elm)
 }
 
+// CheckpointingSdf is a very basic checkpointing DoFn that always
+// returns a processing continuation.
+type CheckpointingSdf struct {
+	delay time.Duration
+}
+
+// CreateInitialRestriction creates a four-element offset range.
+func (fn *CheckpointingSdf) CreateInitialRestriction(_ int) offsetrange.Restriction {
+	return offsetrange.Restriction{Start: 0, End: 4}
+}
+
+// SplitRestriction is a no-op, and does not split.
+func (fn *CheckpointingSdf) SplitRestriction(_ int, rest offsetrange.Restriction) []offsetrange.Restriction {
+	return []offsetrange.Restriction{rest}
+}
+
+// RestrictionSize defers to the default offset range restriction size.
+func (fn *CheckpointingSdf) RestrictionSize(_ int, rest offsetrange.Restriction) float64 {
+	return rest.Size()
+}
+
+// CreateTracker creates a LockRTracker wrapping an offset range RTracker.
+func (fn *CheckpointingSdf) CreateTracker(rest offsetrange.Restriction) *sdf.LockRTracker {
+	return sdf.NewLockRTracker(offsetrange.NewTracker(rest))
+}
+
+func (fn *CheckpointingSdf) ProcessElement(rt *sdf.LockRTracker, elm int, emit func(int)) sdf.ProcessContinuation {
+	return sdf.ResumeProcessingIn(fn.delay)
+}
+
 // SplittableUnitRTracker is a VetRTracker with some added behavior needed for
 // TestAsSplittableUnit.
 type SplittableUnitRTracker struct {
@@ -1536,7 +1626,7 @@ func (rt *SplittableUnitRTracker) IsDone() bool {
 	return rt.ThisIsDone
 }
 
-func (rt *SplittableUnitRTracker) TrySplit(_ float64) (interface{}, interface{}, error) {
+func (rt *SplittableUnitRTracker) TrySplit(_ float64) (any, any, error) {
 	rest1 := rt.Rest.copy()
 	rest1.ID += ".1"
 	rest2 := rt.Rest.copy()
@@ -1560,7 +1650,7 @@ func (rt *SplittableUnitCheckpointingRTracker) IsDone() bool {
 	return rt.isDone
 }
 
-func (rt *SplittableUnitCheckpointingRTracker) TrySplit(_ float64) (interface{}, interface{}, error) {
+func (rt *SplittableUnitCheckpointingRTracker) TrySplit(_ float64) (any, any, error) {
 	rest1 := rt.Rest.copy()
 	rest1.ID += ".1"
 	rest2 := rt.Rest.copy()

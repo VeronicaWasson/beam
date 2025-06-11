@@ -21,9 +21,9 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.fail;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.anyInt;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -39,7 +39,7 @@ import com.google.api.client.http.HttpTransport;
 import com.google.api.client.http.LowLevelHttpRequest;
 import com.google.api.client.http.LowLevelHttpResponse;
 import com.google.api.client.json.JsonFactory;
-import com.google.api.client.json.jackson2.JacksonFactory;
+import com.google.api.client.json.gson.GsonFactory;
 import com.google.api.client.testing.http.MockHttpTransport;
 import com.google.api.client.testing.http.MockLowLevelHttpRequest;
 import com.google.api.client.testing.http.MockLowLevelHttpResponse;
@@ -55,6 +55,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.beam.sdk.testing.ExpectedLogs;
+import org.apache.beam.sdk.util.FastNanoClockAndSleeper;
 import org.hamcrest.Matchers;
 import org.junit.After;
 import org.junit.Before;
@@ -78,7 +79,7 @@ public class RetryHttpRequestInitializerTest {
   @Mock private LowLevelHttpResponse mockLowLevelResponse;
   @Mock private HttpResponseInterceptor mockHttpResponseInterceptor;
 
-  private final JsonFactory jsonFactory = JacksonFactory.getDefaultInstance();
+  private final JsonFactory jsonFactory = GsonFactory.getDefaultInstance();
   private Storage storage;
 
   // Used to test retrying a request more than the default 10 times.
@@ -314,7 +315,10 @@ public class RetryHttpRequestInitializerTest {
                 transport,
                 Transport.getJsonFactory(),
                 new RetryHttpRequestInitializer(
-                    fakeClockAndSleeper, fakeClockAndSleeper, Collections.emptyList(), null))
+                    fakeClockAndSleeper::nanoTime,
+                    fakeClockAndSleeper::sleep,
+                    Collections.emptyList(),
+                    null))
             .build();
 
     Get getRequest = storage.objects().get("gs://fake", "file");

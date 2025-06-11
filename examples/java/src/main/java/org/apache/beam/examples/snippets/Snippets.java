@@ -45,10 +45,10 @@ import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.Pipeline;
-import org.apache.beam.sdk.coders.AvroCoder;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.DefaultCoder;
 import org.apache.beam.sdk.coders.DoubleCoder;
+import org.apache.beam.sdk.extensions.avro.coders.AvroCoder;
 import org.apache.beam.sdk.extensions.ml.AnnotateText;
 import org.apache.beam.sdk.io.Compression;
 import org.apache.beam.sdk.io.FileIO;
@@ -76,6 +76,7 @@ import org.apache.beam.sdk.transforms.Count;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.DoFn.BoundedPerElement;
+import org.apache.beam.sdk.transforms.Latest;
 import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.PeriodicImpulse;
@@ -107,7 +108,7 @@ import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TypeDescriptor;
 import org.apache.beam.sdk.values.TypeDescriptors;
 import org.apache.beam.sdk.values.ValueInSingleWindow;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
 import org.joda.time.format.DateTimeFormat;
@@ -171,7 +172,7 @@ public class Snippets {
       Pipeline p, String writeProject, String writeDataset, String writeTable) {
     {
       // [START BigQueryTableSpec]
-      String tableSpec = "clouddataflow-readonly:samples.weather_stations";
+      String tableSpec = "apache-beam-testing.samples.weather_stations";
       // [END BigQueryTableSpec]
     }
 
@@ -211,7 +212,7 @@ public class Snippets {
     }
 
     {
-      String tableSpec = "clouddataflow-readonly:samples.weather_stations";
+      String tableSpec = "apache-beam-testing.samples.weather_stations";
       // [START BigQueryReadTable]
       PCollection<Double> maxTemperatures =
           p.apply(BigQueryIO.readTableRows().from(tableSpec))
@@ -223,7 +224,7 @@ public class Snippets {
     }
 
     {
-      String tableSpec = "clouddataflow-readonly:samples.weather_stations";
+      String tableSpec = "apache-beam-testing.samples.weather_stations";
       // [START BigQueryReadFunction]
       PCollection<Double> maxTemperatures =
           p.apply(
@@ -241,7 +242,7 @@ public class Snippets {
               BigQueryIO.read(
                       (SchemaAndRecord elem) -> (Double) elem.getRecord().get("max_temperature"))
                   .fromQuery(
-                      "SELECT max_temperature FROM [clouddataflow-readonly:samples.weather_stations]")
+                      "SELECT max_temperature FROM [apache-beam-testing.samples.weather_stations]")
                   .withCoder(DoubleCoder.of()));
       // [END BigQueryReadQuery]
     }
@@ -279,7 +280,7 @@ public class Snippets {
     // [END BigQuerySchemaJson]
 
     {
-      String tableSpec = "clouddataflow-readonly:samples.weather_stations";
+      String tableSpec = "apache-beam-testing.samples.weather_stations";
       if (!writeProject.isEmpty() && !writeDataset.isEmpty() && !writeTable.isEmpty()) {
         tableSpec = writeProject + ":" + writeDataset + "." + writeTable;
       }
@@ -402,7 +403,7 @@ public class Snippets {
                       })
                   .fromQuery(
                       "SELECT year, month, day, max_temperature "
-                          + "FROM [clouddataflow-readonly:samples.weather_stations] "
+                          + "FROM [apache-beam-testing.samples.weather_stations] "
                           + "WHERE year BETWEEN 2007 AND 2009")
                   .withCoder(AvroCoder.of(WeatherData.class)));
 
@@ -460,7 +461,7 @@ public class Snippets {
               .withWriteDisposition(WriteDisposition.WRITE_TRUNCATE));
       // [END BigQueryWriteDynamicDestinations]
 
-      String tableSpec = "clouddataflow-readonly:samples.weather_stations";
+      String tableSpec = "apache-beam-testing.samples.weather_stations";
       if (!writeProject.isEmpty() && !writeDataset.isEmpty() && !writeTable.isEmpty()) {
         tableSpec = writeProject + ":" + writeDataset + "." + writeTable + "_partitioning";
       }
@@ -605,11 +606,11 @@ public class Snippets {
     // Run in debug mode to see the output.
     Pipeline p = Pipeline.create();
 
-    // Create a side input that updates each second.
-    PCollectionView<Map<String, String>> map =
+    // Create a side input that updates every 5 seconds.
+    // View as an iterable, not singleton, so that if we happen to trigger more
+    // than once before Latest.globally is computed we can handle both elements.
+    PCollectionView<Iterable<Map<String, String>>> mapIterable =
         p.apply(GenerateSequence.from(0).withRate(1, Duration.standardSeconds(5L)))
-            .apply(Window.into(FixedWindows.of(Duration.standardSeconds(5))))
-            .apply(Sum.longsGlobally().withoutDefaults())
             .apply(
                 ParDo.of(
                     new DoFn<Long, Map<String, String>>() {
@@ -628,7 +629,8 @@ public class Snippets {
                 Window.<Map<String, String>>into(new GlobalWindows())
                     .triggering(Repeatedly.forever(AfterProcessingTime.pastFirstElementInPane()))
                     .discardingFiredPanes())
-            .apply(View.asSingleton());
+            .apply(Latest.globally())
+            .apply(View.asIterable());
 
     // Consume side input. GenerateSequence generates test data.
     // Use a real source (like PubSubIO or KafkaIO) in production.
@@ -641,7 +643,9 @@ public class Snippets {
 
                       @ProcessElement
                       public void process(ProcessContext c, @Timestamp Instant timestamp) {
-                        Map<String, String> keyMap = c.sideInput(map);
+                        Iterable<Map<String, String>> si = c.sideInput(mapIterable);
+                        // Take an element from the side input iterable (likely length 1)
+                        Map<String, String> keyMap = si.iterator().next();
                         c.outputWithTimestamp(KV.of(1L, c.element()), Instant.now());
 
                         LOG.info(
@@ -651,7 +655,7 @@ public class Snippets {
                             keyMap.get("Key_A"));
                       }
                     })
-                .withSideInputs(map));
+                .withSideInputs(mapIterable));
 
     p.run();
   }
@@ -1357,27 +1361,28 @@ public class Snippets {
       }
 
       public interface Service {
-        List<Record> readNextRecords(long position) throws ThrottlingException;
+        List<RecordPosition> readNextRecords(long position) throws ThrottlingException;
       }
 
-      public interface Record {
+      public interface RecordPosition {
         long getPosition();
       }
 
       // [START SDF_UserInitiatedCheckpoint]
       @ProcessElement
       public ProcessContinuation processElement(
-          RestrictionTracker<OffsetRange, Long> tracker, OutputReceiver<Record> outputReceiver) {
+          RestrictionTracker<OffsetRange, Long> tracker,
+          OutputReceiver<RecordPosition> outputReceiver) {
         long currentPosition = tracker.currentRestriction().getFrom();
         Service service = initializeService();
         try {
           while (true) {
-            List<Record> records = service.readNextRecords(currentPosition);
+            List<RecordPosition> records = service.readNextRecords(currentPosition);
             if (records.isEmpty()) {
               // Return a short delay if there is no data to process at the moment.
               return ProcessContinuation.resume().withResumeDelay(Duration.standardSeconds(10));
             }
-            for (Record record : records) {
+            for (RecordPosition record : records) {
               if (!tracker.tryClaim(record.getPosition())) {
                 return ProcessContinuation.stop();
               }

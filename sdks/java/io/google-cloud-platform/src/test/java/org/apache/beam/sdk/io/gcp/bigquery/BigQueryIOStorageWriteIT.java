@@ -19,30 +19,40 @@ package org.apache.beam.sdk.io.gcp.bigquery;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import com.google.api.services.bigquery.model.QueryResponse;
 import com.google.api.services.bigquery.model.TableFieldSchema;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.api.services.bigquery.model.TableSchema;
 import java.io.IOException;
+import java.security.SecureRandom;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.extensions.gcp.options.GcpOptions;
 import org.apache.beam.sdk.io.GenerateSequence;
 import org.apache.beam.sdk.io.gcp.testing.BigqueryClient;
-import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.MapElements;
+import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.transforms.SerializableFunction;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.sdk.transforms.PeriodicImpulse;
+import org.apache.beam.sdk.transforms.SimpleFunction;
+import org.apache.beam.sdk.values.PBegin;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.joda.time.Duration;
+import org.joda.time.Instant;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
 /**
- * Integration tests for {@link
- * org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO#write(SerializableFunction)}. This test writes
- * 30MB data to BQ and verify the written row count.
+ * Integration tests for {@link BigQueryIO#write()}. The batch mode tests write 30MB data to BQ and
+ * verify the written row count; the streaming mode tests write 3k rows of data to BQ and verify the
+ * written row count.
  */
 @RunWith(JUnit4.class)
 public class BigQueryIOStorageWriteIT {
@@ -50,37 +60,83 @@ public class BigQueryIOStorageWriteIT {
   private enum WriteMode {
     EXACT_ONCE,
     AT_LEAST_ONCE
-  };
+  }
 
-  private String project;
-  private static final String DATASET_ID = "big_query_storage";
+  private static String project;
+  private static final String DATASET_ID =
+      "big_query_storage_write_it_"
+          + System.currentTimeMillis()
+          + "_"
+          + new SecureRandom().nextInt(32);
   private static final String TABLE_PREFIX = "storage_write_";
 
-  private BigQueryOptions bqOptions;
+  private static TestBigQueryOptions bqOptions;
   private static final BigqueryClient BQ_CLIENT = new BigqueryClient("BigQueryStorageIOWriteIT");
 
+  @BeforeClass
+  public static void setup() throws Exception {
+    bqOptions = TestPipeline.testingPipelineOptions().as(TestBigQueryOptions.class);
+    project = bqOptions.as(GcpOptions.class).getProject();
+    // Create one BQ dataset for all test cases.
+    BQ_CLIENT.createNewDataset(project, DATASET_ID, null, bqOptions.getBigQueryLocation());
+  }
+
+  @AfterClass
+  public static void cleanup() {
+    BQ_CLIENT.deleteDataset(project, DATASET_ID);
+  }
+
   private void setUpTestEnvironment(WriteMode writeMode) {
-    PipelineOptionsFactory.register(BigQueryOptions.class);
-    bqOptions = TestPipeline.testingPipelineOptions().as(BigQueryOptions.class);
-    bqOptions.setProject(TestPipeline.testingPipelineOptions().as(GcpOptions.class).getProject());
     bqOptions.setUseStorageWriteApi(true);
     if (writeMode == WriteMode.AT_LEAST_ONCE) {
       bqOptions.setUseStorageWriteApiAtLeastOnce(true);
     }
     bqOptions.setNumStorageWriteApiStreams(2);
     bqOptions.setStorageWriteApiTriggeringFrequencySec(1);
-    project = TestPipeline.testingPipelineOptions().as(GcpOptions.class).getProject();
   }
 
   static class FillRowFn extends DoFn<Long, TableRow> {
+
     @ProcessElement
     public void processElement(ProcessContext c) {
       c.output(new TableRow().set("number", c.element()).set("str", "aaaaaaaaaa"));
     }
   }
 
-  private void runBigQueryIOStorageWritePipeline(int rowCount, WriteMode writeMode) {
-    String tableName = TABLE_PREFIX + System.currentTimeMillis();
+  static class UnboundedStream extends PTransform<PBegin, PCollection<Long>> {
+
+    private final int rowCount;
+
+    public UnboundedStream(int rowCount) {
+      this.rowCount = rowCount;
+    }
+
+    @Override
+    public PCollection<Long> expand(PBegin input) {
+      int timestampIntervalInMillis = 10;
+      PeriodicImpulse impulse =
+          PeriodicImpulse.create()
+              .stopAfter(Duration.millis((long) timestampIntervalInMillis * rowCount - 1))
+              .withInterval(Duration.millis(timestampIntervalInMillis));
+      return input
+          .apply(impulse)
+          .apply(
+              MapElements.via(
+                  new SimpleFunction<Instant, Long>() {
+                    @Override
+                    public Long apply(Instant input) {
+                      return input.getMillis();
+                    }
+                  }));
+    }
+  }
+
+  private void runBigQueryIOStorageWritePipeline(
+      int rowCount, WriteMode writeMode, Boolean isStreaming) {
+    String tableName =
+        isStreaming
+            ? TABLE_PREFIX + "streaming_" + System.currentTimeMillis()
+            : TABLE_PREFIX + System.currentTimeMillis();
     TableSchema schema =
         new TableSchema()
             .setFields(
@@ -89,7 +145,9 @@ public class BigQueryIOStorageWriteIT {
                     new TableFieldSchema().setName("str").setType("STRING")));
 
     Pipeline p = Pipeline.create(bqOptions);
-    p.apply("Input", GenerateSequence.from(0).to(rowCount))
+    p.apply(
+            "Input",
+            isStreaming ? new UnboundedStream(rowCount) : GenerateSequence.from(0).to(rowCount))
         .apply("GenerateMessage", ParDo.of(new FillRowFn()))
         .apply(
             "WriteToBQ",
@@ -109,22 +167,32 @@ public class BigQueryIOStorageWriteIT {
         assertTrue(
             Integer.parseInt((String) response.getRows().get(0).getF().get(0).getV()) >= rowCount);
       }
-    } catch (IOException e) {
-      assertTrue("Unexpected exception: " + e.toString(), false);
-    } catch (InterruptedException e) {
-      assertTrue("Unexpected exception: " + e.toString(), false);
+    } catch (IOException | InterruptedException e) {
+      fail("Unexpected exception: " + e);
     }
   }
 
   @Test
-  public void testBigQueryStorageWrite30MProto() throws Exception {
+  public void testBigQueryStorageWrite3MProto() {
     setUpTestEnvironment(WriteMode.EXACT_ONCE);
-    runBigQueryIOStorageWritePipeline(3000000, WriteMode.EXACT_ONCE);
+    runBigQueryIOStorageWritePipeline(3_000_000, WriteMode.EXACT_ONCE, false);
   }
 
   @Test
-  public void testBigQueryStorageWrite30MProtoALO() throws Exception {
+  public void testBigQueryStorageWrite3MProtoALO() {
     setUpTestEnvironment(WriteMode.AT_LEAST_ONCE);
-    runBigQueryIOStorageWritePipeline(3000000, WriteMode.AT_LEAST_ONCE);
+    runBigQueryIOStorageWritePipeline(3_000_000, WriteMode.AT_LEAST_ONCE, false);
+  }
+
+  @Test
+  public void testBigQueryStorageWrite3KProtoStreaming() {
+    setUpTestEnvironment(WriteMode.EXACT_ONCE);
+    runBigQueryIOStorageWritePipeline(3000, WriteMode.EXACT_ONCE, true);
+  }
+
+  @Test
+  public void testBigQueryStorageWrite3KProtoALOStreaming() {
+    setUpTestEnvironment(WriteMode.AT_LEAST_ONCE);
+    runBigQueryIOStorageWritePipeline(3000, WriteMode.AT_LEAST_ONCE, true);
   }
 }

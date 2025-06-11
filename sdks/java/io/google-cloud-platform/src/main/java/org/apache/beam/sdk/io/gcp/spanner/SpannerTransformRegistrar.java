@@ -27,8 +27,6 @@ import com.google.cloud.spanner.TimestampBound;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.apache.beam.model.pipeline.v1.SchemaApi;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.expansion.ExternalTransformRegistrar;
 import org.apache.beam.sdk.schemas.Schema;
 import org.apache.beam.sdk.schemas.SchemaTranslation;
@@ -38,8 +36,8 @@ import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PDone;
 import org.apache.beam.sdk.values.Row;
-import org.apache.beam.vendor.grpc.v1p43p2.com.google.protobuf.InvalidProtocolBufferException;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.InvalidProtocolBufferException;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Duration;
@@ -48,7 +46,6 @@ import org.joda.time.Duration;
  * Exposes {@link SpannerIO.WriteRows} and {@link SpannerIO.ReadRows} as an external transform for
  * cross-language usage.
  */
-@Experimental(Kind.PORTABILITY)
 @AutoService(ExternalTransformRegistrar.class)
 public class SpannerTransformRegistrar implements ExternalTransformRegistrar {
   public static final String INSERT_URN = "beam:transform:org.apache.beam:spanner_insert:v1";
@@ -112,7 +109,6 @@ public class SpannerTransformRegistrar implements ExternalTransformRegistrar {
     }
   }
 
-  @Experimental(Kind.PORTABILITY)
   public static class ReadBuilder
       implements ExternalTransformBuilder<ReadBuilder.Configuration, PBegin, PCollection<Row>> {
 
@@ -245,42 +241,36 @@ public class SpannerTransformRegistrar implements ExternalTransformRegistrar {
     }
   }
 
-  @Experimental(Kind.PORTABILITY)
   public static class InsertBuilder extends WriteBuilder {
     public InsertBuilder() {
       super(Mutation.Op.INSERT);
     }
   }
 
-  @Experimental(Kind.PORTABILITY)
   public static class UpdateBuilder extends WriteBuilder {
     public UpdateBuilder() {
       super(Mutation.Op.UPDATE);
     }
   }
 
-  @Experimental(Kind.PORTABILITY)
   public static class InsertOrUpdateBuilder extends WriteBuilder {
     public InsertOrUpdateBuilder() {
       super(Mutation.Op.INSERT_OR_UPDATE);
     }
   }
 
-  @Experimental(Kind.PORTABILITY)
   public static class ReplaceBuilder extends WriteBuilder {
     public ReplaceBuilder() {
       super(Mutation.Op.REPLACE);
     }
   }
 
-  @Experimental(Kind.PORTABILITY)
   public static class DeleteBuilder extends WriteBuilder {
     public DeleteBuilder() {
       super(Mutation.Op.DELETE);
     }
   }
 
-  @Experimental(Kind.PORTABILITY)
   private abstract static class WriteBuilder
       implements ExternalTransformBuilder<WriteBuilder.Configuration, PCollection<Row>, PDone> {
 
@@ -298,6 +288,8 @@ public class SpannerTransformRegistrar implements ExternalTransformRegistrar {
       private @Nullable Integer groupingFactor;
       private @Nullable Duration commitDeadline;
       private @Nullable Duration maxCumulativeBackoff;
+      private @Nullable String failureMode;
+      private Boolean highPriority = false;
 
       public void setTable(String table) {
         this.table = table;
@@ -332,6 +324,14 @@ public class SpannerTransformRegistrar implements ExternalTransformRegistrar {
           this.maxCumulativeBackoff = Duration.standardSeconds(maxCumulativeBackoff);
         }
       }
+
+      public void setFailureMode(@Nullable String failureMode) {
+        this.failureMode = failureMode;
+      }
+
+      public void setHighPriority(Boolean highPriority) {
+        this.highPriority = highPriority;
+      }
     }
 
     @Override
@@ -346,6 +346,9 @@ public class SpannerTransformRegistrar implements ExternalTransformRegistrar {
               .withDatabaseId(configuration.databaseId)
               .withInstanceId(configuration.instanceId);
 
+      if (configuration.highPriority) {
+        writeTransform = writeTransform.withHighPriority();
+      }
       if (configuration.maxBatchSizeBytes != null) {
         writeTransform = writeTransform.withBatchSizeBytes(configuration.maxBatchSizeBytes);
       }
@@ -370,6 +373,11 @@ public class SpannerTransformRegistrar implements ExternalTransformRegistrar {
       if (configuration.maxCumulativeBackoff != null) {
         writeTransform =
             writeTransform.withMaxCumulativeBackoff(configuration.maxCumulativeBackoff);
+      }
+      if (configuration.failureMode != null) {
+        writeTransform =
+            writeTransform.withFailureMode(
+                SpannerIO.FailureMode.valueOf(configuration.failureMode));
       }
       return SpannerIO.WriteRows.of(writeTransform, operation, configuration.table);
     }

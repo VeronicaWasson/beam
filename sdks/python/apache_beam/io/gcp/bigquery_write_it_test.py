@@ -23,7 +23,7 @@
 import base64
 import datetime
 import logging
-import random
+import secrets
 import time
 import unittest
 from decimal import Decimal
@@ -34,6 +34,8 @@ import pytest
 import pytz
 from parameterized import param
 from parameterized import parameterized
+from tenacity import retry
+from tenacity import stop_after_attempt
 
 import apache_beam as beam
 from apache_beam.io.gcp.bigquery import BigQueryWriteFn
@@ -66,10 +68,8 @@ class BigQueryWriteIntegrationTests(unittest.TestCase):
     self.project = self.test_pipeline.get_option('project')
 
     self.bigquery_client = BigQueryWrapper()
-    self.dataset_id = '%s%s%d' % (
-        self.BIG_QUERY_DATASET_ID,
-        str(int(time.time())),
-        random.randint(0, 10000))
+    self.dataset_id = '%s%d%s' % (
+        self.BIG_QUERY_DATASET_ID, int(time.time()), secrets.token_hex(3))
     self.bigquery_client.get_or_create_dataset(self.project, self.dataset_id)
     _LOGGER.info(
         "Created dataset %s in project %s", self.dataset_id, self.project)
@@ -129,10 +129,10 @@ class BigQueryWriteIntegrationTests(unittest.TestCase):
             'number': 2, 'str': 'def'
         },
         {
-            'number': 3, 'str': u'你好'
+            'number': 3, 'str': '你好'
         },
         {
-            'number': 4, 'str': u'привет'
+            'number': 4, 'str': 'привет'
         },
     ]
     table_schema = {
@@ -155,10 +155,10 @@ class BigQueryWriteIntegrationTests(unittest.TestCase):
                 'def',
             ), (
                 3,
-                u'你好',
+                '你好',
             ), (
                 4,
-                u'привет',
+                'привет',
             )])
     ]
 
@@ -180,7 +180,7 @@ class BigQueryWriteIntegrationTests(unittest.TestCase):
     if self.runner_name == 'TestDataflowRunner':
       self.skipTest('DataflowRunner does not support schema autodetection')
 
-    table_name = 'python_write_table'
+    table_name = 'python_write_table_schema_autodetect'
     table_id = '{}.{}'.format(self.dataset_id, table_name)
 
     input_data = [
@@ -381,9 +381,9 @@ class BigQueryWriteIntegrationTests(unittest.TestCase):
   def test_big_query_write_insert_errors_reporting(self):
     """
     Test that errors returned by beam.io.WriteToBigQuery
-    contain both the failed rows amd the reason for it failing.
+    contain both the failed rows and the reason for it failing.
     """
-    table_name = 'python_write_table'
+    table_name = 'python_write_table_insert_errors'
     table_id = '{}.{}'.format(self.dataset_id, table_name)
 
     input_data = [{
@@ -453,7 +453,61 @@ class BigQueryWriteIntegrationTests(unittest.TestCase):
 
       assert_that(
           errors[BigQueryWriteFn.FAILED_ROWS_WITH_ERRORS]
-          | 'ParseErrors' >> beam.Map(lambda err: (err[1], err[2])),
+          | 'ParseErrors' >> beam.Map(lambda err: (err[1], err[2]))
+          | 'ToList' >> beam.combiners.ToList()
+          | 'SortErrors' >> beam.Map(
+              lambda errs: sorted(errs, key=lambda x: x[0].get("number", 0))),
+          equal_to(
+              [sorted(bq_result_errors, key=lambda x: x[0].get("number", 0))]))
+
+  @pytest.mark.it_postcommit
+  def test_big_query_write_insert_non_transient_api_call_error(self):
+    """
+    Test that non-transient GoogleAPICallError errors returned
+    by beam.io.WriteToBigQuery are not retried and result in
+    FAILED_ROWS containing both the failed rows and the reason
+    for failure.
+    """
+    table_name = 'this_table_does_not_exist'
+    table_id = '{}.{}'.format(self.dataset_id, table_name)
+
+    input_data = [{
+        'number': 1,
+        'str': 'some_string',
+    }]
+
+    table_schema = {
+        "fields": [{
+            "name": "number", "type": "INTEGER", 'mode': 'NULLABLE'
+        }, {
+            "name": "str", "type": "STRING", 'mode': 'NULLABLE'
+        }]
+    }
+
+    bq_result_errors = [({
+        'number': 1,
+        'str': 'some_string',
+    }, "Not Found")]
+
+    args = self.test_pipeline.get_full_options_as_args()
+
+    with beam.Pipeline(argv=args) as p:
+      # pylint: disable=expression-not-assigned
+      errors = (
+          p | 'create' >> beam.Create(input_data)
+          | beam.WindowInto(beam.transforms.window.FixedWindows(10))
+          | 'write' >> beam.io.WriteToBigQuery(
+              table_id,
+              schema=table_schema,
+              method='STREAMING_INSERTS',
+              insert_retry_strategy='RETRY_ON_TRANSIENT_ERROR',
+              create_disposition=beam.io.BigQueryDisposition.CREATE_NEVER,
+              write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND))
+
+      assert_that(
+          errors[BigQueryWriteFn.FAILED_ROWS_WITH_ERRORS]
+          |
+          'ParseErrors' >> beam.Map(lambda err: (err[1], err[2][0]["reason"])),
           equal_to(bq_result_errors))
 
   @pytest.mark.it_postcommit
@@ -464,6 +518,7 @@ class BigQueryWriteIntegrationTests(unittest.TestCase):
   ])
   @mock.patch(
       "apache_beam.io.gcp.bigquery_file_loads._MAXIMUM_SOURCE_URIS", new=1)
+  @retry(reraise=True, stop=stop_after_attempt(3))
   def test_big_query_write_temp_table_append_schema_update(self, file_format):
     """
     Test that nested schema update options and schema relaxation
@@ -540,8 +595,10 @@ class BigQueryWriteIntegrationTests(unittest.TestCase):
               max_file_size=1,  # bytes
               method=beam.io.WriteToBigQuery.Method.FILE_LOADS,
               additional_bq_parameters={
-                  'schemaUpdateOptions': ['ALLOW_FIELD_ADDITION',
-                                          'ALLOW_FIELD_RELAXATION']},
+                  'schemaUpdateOptions': [
+                      'ALLOW_FIELD_ADDITION', 'ALLOW_FIELD_RELAXATION'
+                  ]
+              },
               temp_file_format=file_format))
 
 

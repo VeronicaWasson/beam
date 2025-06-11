@@ -17,6 +17,22 @@
 #
 
 # pytype: skip-file
+# pylint:disable=line-too-long
+
+# beam-playground:
+#   name: GroupByKeySort
+#   description: Demonstration of GroupByKey transform usage with per-key sorting.
+#   multifile: false
+#   default_example: false
+#   context_line: 40
+#   categories:
+#     - Core Transforms
+#   complexity: BASIC
+#   tags:
+#     - transforms
+#     - strings
+#     - pairs
+#     - group
 
 
 def groupbykey(test=None):
@@ -24,9 +40,9 @@ def groupbykey(test=None):
   import apache_beam as beam
 
   with beam.Pipeline() as pipeline:
-    produce_counts = (
+    produce_per_season = (
         pipeline
-        | 'Create produce counts' >> beam.Create([
+        | 'Create produce list' >> beam.Create([
             ('spring', '🍓'),
             ('spring', '🥕'),
             ('spring', '🍆'),
@@ -38,9 +54,13 @@ def groupbykey(test=None):
             ('fall', '🍅'),
             ('winter', '🍆'),
         ])
-        | 'Group counts per produce' >> beam.GroupByKey()
+        | 'Group produce per season' >> beam.GroupByKey()
         | beam.MapTuple(lambda k, vs: (k, sorted(vs)))  # sort and format
         | beam.Map(print))
     # [END groupbykey]
     if test:
-      test(produce_counts)
+      test(produce_per_season)
+
+
+if __name__ == '__main__':
+  groupbykey()

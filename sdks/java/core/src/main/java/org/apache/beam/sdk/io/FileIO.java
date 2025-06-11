@@ -19,8 +19,8 @@ package org.apache.beam.sdk.io;
 
 import static org.apache.beam.sdk.io.fs.ResolveOptions.StandardResolveOptions.RESOLVE_FILE;
 import static org.apache.beam.sdk.transforms.Contextful.fn;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import com.google.auto.value.AutoValue;
 import java.io.IOException;
@@ -34,8 +34,6 @@ import java.nio.charset.StandardCharsets;
 import java.text.DecimalFormat;
 import java.util.Collection;
 import java.util.List;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
 import org.apache.beam.sdk.coders.CannotProvideCoderException;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
@@ -63,6 +61,8 @@ import org.apache.beam.sdk.transforms.Watch.Growth.PollFn;
 import org.apache.beam.sdk.transforms.Watch.Growth.TerminationCondition;
 import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.transforms.display.HasDisplayData;
+import org.apache.beam.sdk.transforms.errorhandling.BadRecord;
+import org.apache.beam.sdk.transforms.errorhandling.ErrorHandler;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.GlobalWindow;
 import org.apache.beam.sdk.transforms.windowing.IntervalWindow;
@@ -74,10 +74,10 @@ import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TypeDescriptor;
 import org.apache.beam.sdk.values.TypeDescriptors;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.MoreObjects;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Objects;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.MoreObjects;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Objects;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
@@ -229,7 +229,7 @@ import org.slf4j.LoggerFactory;
  * {@link Sink}, e.g. write different elements to Avro files in different directories with different
  * schemas.
  *
- * <p>This feature is supported by {@link #writeDynamic}. Use {@link Write#by} to specify how to
+ * <p>This feature is supported by {@link #writeDynamic}. Use {@link Write#by} to specify how too
  * partition the elements into groups ("destinations"). Then elements will be grouped by
  * destination, and {@link Write#withNaming(Contextful)} and {@link Write#via(Contextful)} will be
  * applied separately within each group, i.e. different groups will be written using the file naming
@@ -237,6 +237,27 @@ import org.slf4j.LoggerFactory;
  * Write#via(Contextful)} for the respective destinations. Note that currently sharding can not be
  * destination-dependent: every window/pane for every destination will use the same number of shards
  * specified via {@link Write#withNumShards} or {@link Write#withSharding}.
+ *
+ * <h3>Handling Errors</h3>
+ *
+ * <p>When using dynamic destinations, or when using a formatting function to format a record for
+ * writing, it's possible for an individual record to be malformed, causing an exception. By
+ * default, these exceptions are propagated to the runner causing the bundle to fail. These are
+ * usually retried, though this depends on the runner. Alternately, these errors can be routed to
+ * another {@link PTransform} by using {@link Write#withBadRecordErrorHandler(ErrorHandler)}. The
+ * ErrorHandler is registered with the pipeline (see below). See {@link ErrorHandler} for more
+ * documentation. Of note, this error handling only handles errors related to specific records. It
+ * does not handle errors related to connectivity, authorization, etc. as those should be retried by
+ * the runner.
+ *
+ * <pre>{@code
+ * PCollection<> records = ...;
+ * PTransform<PCollection<BadRecord>,?> alternateSink = ...;
+ * try (BadRecordErrorHandler<?> handler = pipeline.registerBadRecordErrorHandler(alternateSink) {
+ *    records.apply("Write", FileIO.writeDynamic().otherConfigs()
+ *        .withBadRecordErrorHandler(handler));
+ * }
+ * }</pre>
  *
  * <h3>Writing custom types to sinks</h3>
  *
@@ -372,6 +393,7 @@ public class FileIO {
         .setDynamic(false)
         .setCompression(Compression.UNCOMPRESSED)
         .setIgnoreWindowing(false)
+        .setAutoSharding(false)
         .setNoSpilling(false)
         .build();
   }
@@ -385,6 +407,7 @@ public class FileIO {
         .setDynamic(true)
         .setCompression(Compression.UNCOMPRESSED)
         .setIgnoreWindowing(false)
+        .setAutoSharding(false)
         .setNoSpilling(false)
         .build();
   }
@@ -514,9 +537,18 @@ public class FileIO {
      * the watching frequency given by the {@code interval}. The pipeline will throw a {@code
      * RuntimeError} if timestamp extraction for the matched file has failed, suggesting the
      * timestamp metadata is not available with the IO connector.
+     *
+     * <p>Matching continuously scales poorly, as it is stateful, and requires storing file ids in
+     * memory. In addition, because it is memory-only, if a pipeline is restarted, already processed
+     * files will be reprocessed. Consider an alternate technique, such as <a
+     * href="https://cloud.google.com/storage/docs/pubsub-notifications">Pub/Sub Notifications</a>
+     * when using GCS if possible.
      */
     public MatchConfiguration continuously(
         Duration interval, TerminationCondition<String, ?> condition, boolean matchUpdatedFiles) {
+      LOG.warn(
+          "Matching Continuously is stateful, and can scale poorly. Consider using Pub/Sub "
+              + "Notifications (https://cloud.google.com/storage/docs/pubsub-notifications) if possible");
       return toBuilder()
           .setWatchInterval(interval)
           .setWatchTerminationCondition(condition)
@@ -899,7 +931,6 @@ public class FileIO {
 
   /** Implementation of {@link #write} and {@link #writeDynamic}. */
   @AutoValue
-  @Experimental(Kind.SOURCE_SINK)
   public abstract static class Write<DestinationT, UserT>
       extends PTransform<PCollection<UserT>, WriteFilesResult<DestinationT>> {
     /** A policy for generating names for shard files. */
@@ -910,7 +941,7 @@ public class FileIO {
        */
       String getFilename(
           BoundedWindow window,
-          PaneInfo pane,
+          PaneInfo paneInfo,
           int numShards,
           int shardIndex,
           Compression compression);
@@ -927,9 +958,9 @@ public class FileIO {
      */
     public static FileNaming defaultNaming(
         final ValueProvider<String> prefix, final ValueProvider<String> suffix) {
-      return (window, pane, numShards, shardIndex, compression) -> {
+      return (window, paneInfo, numShards, shardIndex, compression) -> {
         checkArgument(window != null, "window can not be null");
-        checkArgument(pane != null, "pane can not be null");
+        checkArgument(paneInfo != null, "pane can not be null");
         checkArgument(compression != null, "compression can not be null");
         StringBuilder res = new StringBuilder(prefix.get());
         if (window != GlobalWindow.INSTANCE) {
@@ -945,12 +976,12 @@ public class FileIO {
           IntervalWindow iw = (IntervalWindow) window;
           res.append(iw.start().toString()).append("-").append(iw.end().toString());
         }
-        boolean isOnlyFiring = pane.isFirst() && pane.isLast();
+        boolean isOnlyFiring = paneInfo.isFirst() && paneInfo.isLast();
         if (!isOnlyFiring) {
           if (res.length() > 0) {
             res.append("-");
           }
-          res.append(pane.getIndex());
+          res.append(paneInfo.getIndex());
         }
         if (res.length() > 0) {
           res.append("-");
@@ -968,10 +999,10 @@ public class FileIO {
 
     public static FileNaming relativeFileNaming(
         final ValueProvider<String> baseDirectory, final FileNaming innerNaming) {
-      return (window, pane, numShards, shardIndex, compression) ->
+      return (window, paneInfo, numShards, shardIndex, compression) ->
           FileSystems.matchNewResource(baseDirectory.get(), true /* isDirectory */)
               .resolve(
-                  innerNaming.getFilename(window, pane, numShards, shardIndex, compression),
+                  innerNaming.getFilename(window, paneInfo, numShards, shardIndex, compression),
                   RESOLVE_FILE)
               .toString();
     }
@@ -1008,7 +1039,11 @@ public class FileIO {
 
     abstract boolean getIgnoreWindowing();
 
+    abstract boolean getAutoSharding();
+
     abstract boolean getNoSpilling();
+
+    abstract @Nullable ErrorHandler<BadRecord, ?> getBadRecordErrorHandler();
 
     abstract Builder<DestinationT, UserT> toBuilder();
 
@@ -1054,7 +1089,12 @@ public class FileIO {
 
       abstract Builder<DestinationT, UserT> setIgnoreWindowing(boolean ignoreWindowing);
 
+      abstract Builder<DestinationT, UserT> setAutoSharding(boolean autosharding);
+
       abstract Builder<DestinationT, UserT> setNoSpilling(boolean noSpilling);
+
+      abstract Builder<DestinationT, UserT> setBadRecordErrorHandler(
+          @Nullable ErrorHandler<BadRecord, ?> badRecordErrorHandler);
 
       abstract Write<DestinationT, UserT> build();
     }
@@ -1277,9 +1317,25 @@ public class FileIO {
       return toBuilder().setIgnoreWindowing(true).build();
     }
 
+    public Write<DestinationT, UserT> withAutoSharding() {
+      return toBuilder().setAutoSharding(true).build();
+    }
+
     /** See {@link WriteFiles#withNoSpilling()}. */
     public Write<DestinationT, UserT> withNoSpilling() {
       return toBuilder().setNoSpilling(true).build();
+    }
+
+    /**
+     * Configures a new {@link Write} with an ErrorHandler. For configuring an ErrorHandler, see
+     * {@link ErrorHandler}. Whenever a record is formatted, or a lookup for a dynamic destination
+     * is performed, and that operation fails, the exception is passed to the error handler. This is
+     * intended to handle any errors related to the data of a record, but not any connectivity or IO
+     * errors related to the literal writing of a record.
+     */
+    public Write<DestinationT, UserT> withBadRecordErrorHandler(
+        ErrorHandler<BadRecord, ?> errorHandler) {
+      return toBuilder().setBadRecordErrorHandler(errorHandler).build();
     }
 
     @VisibleForTesting
@@ -1366,6 +1422,7 @@ public class FileIO {
       resolvedSpec.setNumShards(getNumShards());
       resolvedSpec.setSharding(getSharding());
       resolvedSpec.setIgnoreWindowing(getIgnoreWindowing());
+      resolvedSpec.setAutoSharding(getAutoSharding());
       resolvedSpec.setNoSpilling(getNoSpilling());
 
       Write<DestinationT, UserT> resolved = resolvedSpec.build();
@@ -1382,8 +1439,14 @@ public class FileIO {
       if (!getIgnoreWindowing()) {
         writeFiles = writeFiles.withWindowedWrites();
       }
+      if (getAutoSharding()) {
+        writeFiles = writeFiles.withAutoSharding();
+      }
       if (getNoSpilling()) {
         writeFiles = writeFiles.withNoSpilling();
+      }
+      if (getBadRecordErrorHandler() != null) {
+        writeFiles = writeFiles.withBadRecordErrorHandler(getBadRecordErrorHandler());
       }
       return input.apply(writeFiles);
     }

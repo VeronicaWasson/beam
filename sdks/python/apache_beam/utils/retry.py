@@ -28,6 +28,7 @@ needed right now use a @retry.no_retries decorator.
 # pytype: skip-file
 
 import functools
+import json
 import logging
 import random
 import sys
@@ -57,6 +58,7 @@ else:
 # pylint: enable=wrong-import-order, wrong-import-position
 
 _LOGGER = logging.getLogger(__name__)
+_RETRYABLE_REASONS = ["rateLimitExceeded", "internalError", "backendError"]
 
 
 class PermanentException(Exception):
@@ -166,17 +168,38 @@ def retry_on_server_errors_and_timeout_filter(exception):
 
 
 def retry_on_server_errors_timeout_or_quota_issues_filter(exception):
-  """Retry on server, timeout and 403 errors.
+  """Retry on server, timeout, 429, and some 403 errors.
 
-  403 errors can be accessDenied, billingNotEnabled, and also quotaExceeded,
-  rateLimitExceeded."""
+  403 errors from BigQuery include both non-transient (accessDenied,
+  billingNotEnabled) and transient errors (rateLimitExceeded).
+  Only retry transient errors."""
   if HttpError is not None and isinstance(exception, HttpError):
-    if exception.status_code == 403:
+    if exception.status_code == 429:
       return True
+    if exception.status_code == 403:
+      try:
+        # attempt to extract the reason and check if it's retryable
+        content = exception.content
+        if not isinstance(content, dict):
+          content = json.loads(exception.content)
+        return content["error"]["errors"][0]["reason"] in _RETRYABLE_REASONS
+      except (KeyError, IndexError, TypeError) as e:
+        _LOGGER.warning(
+            "Could not determine if HttpError is transient. "
+            "Will not retry: %s",
+            e)
+      return False
   if GoogleAPICallError is not None and isinstance(exception,
                                                    GoogleAPICallError):
-    if exception.code == 403:
+    if exception.code == 429:
       return True
+    if exception.code == 403:
+      if not hasattr(exception, "errors") or len(exception.errors) == 0:
+        # default to not retrying
+        return False
+
+      reason = exception.errors[0]["reason"]
+      return reason in _RETRYABLE_REASONS
   if S3ClientError is not None and isinstance(exception, S3ClientError):
     if exception.code == 403:
       return True
@@ -251,7 +274,9 @@ def with_exponential_backoff(
   The decorator is intended to be used on callables that make HTTP or RPC
   requests that can temporarily timeout or have transient errors. For instance
   the make_http_request() call below will be retried 16 times with exponential
-  backoff and fuzzing of the delay interval (default settings).
+  backoff and fuzzing of the delay interval (default settings). The callable
+  should return values directly instead of yielding them, as generators are not
+  evaluated within the try-catch block and will not be retried on exception.
 
   from apache_beam.utils import retry
   # ...

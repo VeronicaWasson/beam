@@ -26,8 +26,8 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasEntry;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.nullValue;
-import static org.mockito.Matchers.anyBoolean;
-import static org.mockito.Matchers.isA;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.isA;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -67,7 +67,7 @@ import org.apache.beam.sdk.io.BoundedSource;
 import org.apache.beam.sdk.metrics.MetricName;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.Duration;
 import org.junit.Before;
@@ -293,6 +293,23 @@ public class WorkItemStatusClientTest {
     assertThat(updates.get(0).getReportIndex(), equalTo(INITIAL_REPORT_INDEX));
     assertThat(updates.get(1).getReportIndex(), equalTo(INITIAL_REPORT_INDEX + 4));
     assertThat(updates.get(2).getReportIndex(), equalTo(INITIAL_REPORT_INDEX + 8));
+  }
+
+  @Test
+  public void reportAbort() throws Exception {
+    when(worker.extractMetricUpdates()).thenReturn(Collections.emptyList());
+    statusClient.setWorker(worker, executionContext);
+
+    when(workUnitClient.reportWorkItemStatus(isA(WorkItemStatus.class)))
+        .thenReturn(
+            new WorkItemServiceState()
+                .setCompleteWorkStatus(
+                    new Status()
+                        .setCode(com.google.rpc.Code.ABORTED_VALUE)
+                        .setMessage("Worker was asked to abort!")));
+    statusClient.reportUpdate(null, LEASE_DURATION);
+
+    statusClient.reportSuccess();
   }
 
   @Test

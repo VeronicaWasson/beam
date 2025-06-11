@@ -27,6 +27,7 @@ import hamcrest as hc
 import mock
 
 import apache_beam as beam
+from apache_beam import Pipeline
 from apache_beam.io import Read
 from apache_beam.io import Write
 from apache_beam.io.gcp.pubsub import MultipleReadFromPubSub
@@ -38,6 +39,7 @@ from apache_beam.io.gcp.pubsub import WriteStringsToPubSub
 from apache_beam.io.gcp.pubsub import WriteToPubSub
 from apache_beam.io.gcp.pubsub import _PubSubSink
 from apache_beam.io.gcp.pubsub import _PubSubSource
+from apache_beam.metrics.metric import Lineage
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import StandardOptions
 from apache_beam.portability import common_urns
@@ -328,9 +330,9 @@ class TestMultiReadFromPubSubOverride(unittest.TestCase):
         PubSubSourceDescriptor(
             source=source,
             id_label=id_label,
-            timestamp_attribute=timestamp_attribute) for source,
-        id_label,
-        timestamp_attribute in zip(sources, id_labels, timestamp_attributes)
+            timestamp_attribute=timestamp_attribute)
+        for source, id_label, timestamp_attribute in zip(
+            sources, id_labels, timestamp_attributes)
     ]
 
     pcoll = (p | MultipleReadFromPubSub(pubsub_sources) | beam.Map(lambda x: x))
@@ -363,6 +365,7 @@ class TestMultiReadFromPubSubOverride(unittest.TestCase):
 
 @unittest.skipIf(pubsub is None, 'GCP dependencies are not installed')
 class TestWriteStringsToPubSubOverride(unittest.TestCase):
+  @mock.patch.object(Pipeline, '_assert_not_applying_PDone', mock.Mock())
   def test_expand_deprecated(self):
     options = PipelineOptions([])
     options.view_as(StandardOptions).streaming = True
@@ -384,6 +387,7 @@ class TestWriteStringsToPubSubOverride(unittest.TestCase):
     # Ensure that the properties passed through correctly
     self.assertEqual('a_topic', write_transform.dofn.short_topic_name)
 
+  @mock.patch.object(Pipeline, '_assert_not_applying_PDone', mock.Mock())
   def test_expand(self):
     options = PipelineOptions([])
     options.view_as(StandardOptions).streaming = True
@@ -391,6 +395,7 @@ class TestWriteStringsToPubSubOverride(unittest.TestCase):
     pcoll = (
         p
         | ReadFromPubSub('projects/fakeprj/topics/baz')
+        | beam.Map(lambda x: PubsubMessage(x))
         | WriteToPubSub(
             'projects/fakeprj/topics/a_topic', with_attributes=True)
         | beam.Map(lambda x: x))
@@ -530,7 +535,7 @@ class TestReadFromPubSub(unittest.TestCase):
     mock_pubsub.return_value.close.assert_has_calls([mock.call()])
 
   def test_read_strings_success(self, mock_pubsub):
-    data = u'🤷 ¯\\_(ツ)_/¯'
+    data = '🤷 ¯\\_(ツ)_/¯'
     data_encoded = data.encode('utf-8')
     ack_id = 'ack_id'
     pull_response = test_utils.create_pull_response(
@@ -552,7 +557,7 @@ class TestReadFromPubSub(unittest.TestCase):
     mock_pubsub.return_value.close.assert_has_calls([mock.call()])
 
   def test_read_data_success(self, mock_pubsub):
-    data_encoded = u'🤷 ¯\\_(ツ)_/¯'.encode('utf-8')
+    data_encoded = '🤷 ¯\\_(ツ)_/¯'.encode('utf-8')
     ack_id = 'ack_id'
     pull_response = test_utils.create_pull_response(
         [test_utils.PullResponseMessage(data_encoded, ack_id=ack_id)])
@@ -818,6 +823,34 @@ class TestReadFromPubSub(unittest.TestCase):
         'projects/fakeprj/subscriptions/a_subscription',
         transform_from_proto.source.full_subscription)
 
+  def test_read_from_pubsub_no_overwrite(self, unused_mock):
+    expected_elements = [
+        TestWindowedValue(
+            b'apache',
+            timestamp.Timestamp(1520861826.234567), [window.GlobalWindow()]),
+        TestWindowedValue(
+            b'beam',
+            timestamp.Timestamp(1520861824.234567), [window.GlobalWindow()])
+    ]
+    options = PipelineOptions([])
+    options.view_as(StandardOptions).streaming = True
+    # TODO(https://github.com/apache/beam/issues/34549): This test relies on
+    # lineage metrics which Prism doesn't seem to handle correctly. Defaulting
+    # to FnApiRunner instead.
+    options.view_as(StandardOptions).runner = 'FnApiRunner'
+    for test_case in ('topic', 'subscription'):
+      with TestPipeline(options=options) as p:
+        # Direct runner currently overwrites the whole ReadFromPubSub transform.
+        # This test part of composite transform without overwrite.
+        pcoll = p | beam.Create([b'apache', b'beam']) | beam.Map(
+            lambda x: window.TimestampedValue(x, 1520861820.234567 + len(x)))
+        args = {test_case: f'projects/fakeprj/{test_case}s/topic_or_sub'}
+        pcoll = ReadFromPubSub(**args).expand_continued(pcoll)
+        assert_that(pcoll, equal_to(expected_elements), reify_windows=True)
+      self.assertSetEqual(
+          Lineage.query(p.result.metrics(), Lineage.SOURCE),
+          set([f"pubsub:{test_case}:fakeprj.topic_or_sub"]))
+
 
 @unittest.skipIf(pubsub is None, 'GCP dependencies are not installed')
 @mock.patch('google.cloud.pubsub.PublisherClient')
@@ -875,7 +908,8 @@ class TestWriteToPubSub(unittest.TestCase):
 
     options = PipelineOptions([])
     options.view_as(StandardOptions).streaming = True
-    with self.assertRaisesRegex(AttributeError, r'str.*has no attribute.*data'):
+    with self.assertRaisesRegex(Exception,
+                                r'requires.*PubsubMessage.*applied.*str'):
       with TestPipeline(options=options) as p:
         _ = (
             p
@@ -897,7 +931,9 @@ class TestWriteToPubSub(unittest.TestCase):
             p
             | Create(payloads)
             | WriteToPubSub(
-                'projects/fakeprj/topics/a_topic', id_label='a_label'))
+                'projects/fakeprj/topics/a_topic',
+                id_label='a_label',
+                with_attributes=True))
 
     options = PipelineOptions([])
     options.view_as(StandardOptions).streaming = True
@@ -909,7 +945,8 @@ class TestWriteToPubSub(unittest.TestCase):
             | Create(payloads)
             | WriteToPubSub(
                 'projects/fakeprj/topics/a_topic',
-                timestamp_attribute='timestamp'))
+                timestamp_attribute='timestamp',
+                with_attributes=True))
 
   def test_runner_api_transformation(self, unused_mock_pubsub):
     sink = _PubSubSink(
@@ -969,6 +1006,46 @@ class TestWriteToPubSub(unittest.TestCase):
     self.assertTrue(isinstance(transform_from_proto.sink, _PubSubSink))
     self.assertIsNone(transform_from_proto.sink.id_label)
     self.assertIsNone(transform_from_proto.sink.timestamp_attribute)
+
+  def test_write_to_pubsub_no_overwrite(self, unused_mock):
+    data = 'data'
+    payloads = [data]
+
+    options = PipelineOptions([])
+    options.view_as(StandardOptions).streaming = True
+    # TODO(https://github.com/apache/beam/issues/34549): This test relies on
+    # lineage metrics which Prism doesn't seem to handle correctly. Defaulting
+    # to FnApiRunner instead.
+    options.view_as(StandardOptions).runner = 'FnApiRunner'
+    with TestPipeline(options=options) as p:
+      pcoll = p | Create(payloads)
+      WriteToPubSub(
+          'projects/fakeprj/topics/a_topic',
+          with_attributes=False).expand(pcoll)
+    self.assertSetEqual(
+        Lineage.query(p.result.metrics(), Lineage.SINK),
+        set(["pubsub:topic:fakeprj.a_topic"]))
+
+  def test_write_to_pubsub_with_attributes_no_overwrite(self, unused_mock):
+    data = b'data'
+    attributes = {'key': 'value'}
+    payloads = [PubsubMessage(data, attributes)]
+
+    options = PipelineOptions([])
+    options.view_as(StandardOptions).streaming = True
+    # TODO(https://github.com/apache/beam/issues/34549): This test relies on
+    # lineage metrics which Prism doesn't seem to handle correctly. Defaulting
+    # to FnApiRunner instead.
+    options.view_as(StandardOptions).runner = 'FnApiRunner'
+    with TestPipeline(options=options) as p:
+      pcoll = p | Create(payloads)
+      # Avoid direct runner overwrites WriteToPubSub
+      WriteToPubSub(
+          'projects/fakeprj/topics/a_topic',
+          with_attributes=True).expand(pcoll)
+    self.assertSetEqual(
+        Lineage.query(p.result.metrics(), Lineage.SINK),
+        set(["pubsub:topic:fakeprj.a_topic"]))
 
 
 if __name__ == '__main__':

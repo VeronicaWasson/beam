@@ -17,9 +17,7 @@
  */
 package org.apache.beam.runners.core.metrics;
 
-import static java.util.Collections.singleton;
 import static java.util.stream.Collectors.toList;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables.concat;
 
 import java.io.Serializable;
 import java.util.ArrayList;
@@ -28,6 +26,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import org.apache.beam.model.jobmanagement.v1.JobApi;
 import org.apache.beam.model.jobmanagement.v1.JobApi.GetJobMetricsResponse;
 import org.apache.beam.model.pipeline.v1.MetricsApi.MonitoringInfo;
@@ -35,10 +34,11 @@ import org.apache.beam.runners.core.metrics.MetricUpdates.MetricUpdate;
 import org.apache.beam.sdk.metrics.MetricKey;
 import org.apache.beam.sdk.metrics.MetricResult;
 import org.apache.beam.sdk.metrics.MetricResults;
-import org.apache.beam.vendor.grpc.v1p43p2.com.google.protobuf.ByteString;
-import org.apache.beam.vendor.grpc.v1p43p2.com.google.protobuf.InvalidProtocolBufferException;
-import org.apache.beam.vendor.grpc.v1p43p2.com.google.protobuf.util.JsonFormat;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.sdk.util.HistogramData;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.ByteString;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.InvalidProtocolBufferException;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.util.JsonFormat;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
@@ -92,9 +92,7 @@ public class MetricsContainerStepMap implements Serializable {
 
   /** Reset the metric containers. */
   public void reset() {
-    for (MetricsContainerImpl metricsContainer : metricsContainers.values()) {
-      metricsContainer.reset();
-    }
+    metricsContainers.forEach((key, value) -> value.reset());
     unboundContainer.reset();
   }
 
@@ -139,21 +137,34 @@ public class MetricsContainerStepMap implements Serializable {
     Map<MetricKey, MetricResult<Long>> counters = new HashMap<>();
     Map<MetricKey, MetricResult<DistributionData>> distributions = new HashMap<>();
     Map<MetricKey, MetricResult<GaugeData>> gauges = new HashMap<>();
+    Map<MetricKey, MetricResult<StringSetData>> sets = new HashMap<>();
+    Map<MetricKey, MetricResult<BoundedTrieData>> boundedTries = new HashMap<>();
+    Map<MetricKey, MetricResult<HistogramData>> histograms = new HashMap<>();
 
-    for (MetricsContainerImpl container : attemptedMetricsContainers.getMetricsContainers()) {
-      MetricUpdates cumulative = container.getCumulative();
-      mergeAttemptedResults(counters, cumulative.counterUpdates(), (l, r) -> l + r);
-      mergeAttemptedResults(
-          distributions, cumulative.distributionUpdates(), DistributionData::combine);
-      mergeAttemptedResults(gauges, cumulative.gaugeUpdates(), GaugeData::combine);
-    }
-    for (MetricsContainerImpl container : committedMetricsContainers.getMetricsContainers()) {
-      MetricUpdates cumulative = container.getCumulative();
-      mergeCommittedResults(counters, cumulative.counterUpdates(), (l, r) -> l + r);
-      mergeCommittedResults(
-          distributions, cumulative.distributionUpdates(), DistributionData::combine);
-      mergeCommittedResults(gauges, cumulative.gaugeUpdates(), GaugeData::combine);
-    }
+    attemptedMetricsContainers.forEachMetricContainer(
+        container -> {
+          MetricUpdates cumulative = container.getCumulative();
+          mergeAttemptedResults(counters, cumulative.counterUpdates(), (l, r) -> l + r);
+          mergeAttemptedResults(
+              distributions, cumulative.distributionUpdates(), DistributionData::combine);
+          mergeAttemptedResults(gauges, cumulative.gaugeUpdates(), GaugeData::combine);
+          mergeAttemptedResults(sets, cumulative.stringSetUpdates(), StringSetData::combine);
+          mergeAttemptedResults(
+              boundedTries, cumulative.boundedTrieUpdates(), BoundedTrieData::combine);
+          mergeAttemptedResults(histograms, cumulative.histogramsUpdates(), HistogramData::combine);
+        });
+    committedMetricsContainers.forEachMetricContainer(
+        container -> {
+          MetricUpdates cumulative = container.getCumulative();
+          mergeCommittedResults(counters, cumulative.counterUpdates(), (l, r) -> l + r);
+          mergeCommittedResults(
+              distributions, cumulative.distributionUpdates(), DistributionData::combine);
+          mergeCommittedResults(gauges, cumulative.gaugeUpdates(), GaugeData::combine);
+          mergeCommittedResults(sets, cumulative.stringSetUpdates(), StringSetData::combine);
+          mergeCommittedResults(
+              boundedTries, cumulative.boundedTrieUpdates(), BoundedTrieData::combine);
+          mergeCommittedResults(histograms, cumulative.histogramsUpdates(), HistogramData::combine);
+        });
 
     return new DefaultMetricResults(
         counters.values(),
@@ -162,6 +173,15 @@ public class MetricsContainerStepMap implements Serializable {
             .collect(toList()),
         gauges.values().stream()
             .map(result -> result.transform(GaugeData::extractResult))
+            .collect(toList()),
+        sets.values().stream()
+            .map(result -> result.transform(StringSetData::extractResult))
+            .collect(toList()),
+        boundedTries.values().stream()
+            .map(result -> result.transform(BoundedTrieData::extractResult))
+            .collect(toList()),
+        histograms.values().stream()
+            .map(result -> result.transform(HistogramData::extractResult))
             .collect(toList()));
   }
 
@@ -169,11 +189,12 @@ public class MetricsContainerStepMap implements Serializable {
   public Iterable<MonitoringInfo> getMonitoringInfos() {
     // Extract user metrics and store as MonitoringInfos.
     ArrayList<MonitoringInfo> monitoringInfos = new ArrayList<>();
-    for (MetricsContainerImpl container : getMetricsContainers()) {
-      for (MonitoringInfo mi : container.getMonitoringInfos()) {
-        monitoringInfos.add(mi);
-      }
-    }
+    forEachMetricContainer(
+        container -> {
+          for (MonitoringInfo mi : container.getMonitoringInfos()) {
+            monitoringInfos.add(mi);
+          }
+        });
     return monitoringInfos;
   }
 
@@ -181,9 +202,7 @@ public class MetricsContainerStepMap implements Serializable {
   public Map<String, ByteString> getMonitoringData(ShortIdMap shortIds) {
     // Extract user metrics and store as MonitoringInfos.
     ImmutableMap.Builder<String, ByteString> builder = ImmutableMap.builder();
-    for (MetricsContainerImpl container : getMetricsContainers()) {
-      builder.putAll(container.getMonitoringData(shortIds));
-    }
+    forEachMetricContainer((container) -> builder.putAll(container.getMonitoringData(shortIds)));
     return builder.build();
   }
 
@@ -200,8 +219,9 @@ public class MetricsContainerStepMap implements Serializable {
     }
   }
 
-  private Iterable<MetricsContainerImpl> getMetricsContainers() {
-    return concat(metricsContainers.values(), singleton(unboundContainer));
+  private void forEachMetricContainer(Consumer<MetricsContainerImpl> c) {
+    metricsContainers.forEach((key, value) -> c.accept(value));
+    c.accept(unboundContainer);
   }
 
   @SuppressWarnings("ConstantConditions")

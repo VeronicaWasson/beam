@@ -17,8 +17,8 @@
  */
 package org.apache.beam.sdk.transforms;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
-import static org.hamcrest.Matchers.isA;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -28,15 +28,14 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.Serializable;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.NoSuchElementException;
 import org.apache.beam.sdk.Pipeline;
-import org.apache.beam.sdk.Pipeline.PipelineExecutionException;
 import org.apache.beam.sdk.coders.AtomicCoder;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.CoderException;
@@ -46,16 +45,20 @@ import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.coders.VarIntCoder;
 import org.apache.beam.sdk.coders.VarLongCoder;
 import org.apache.beam.sdk.coders.VoidCoder;
+import org.apache.beam.sdk.io.GenerateSequence;
 import org.apache.beam.sdk.testing.NeedsRunner;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.testing.TestStream;
 import org.apache.beam.sdk.testing.UsesSideInputs;
 import org.apache.beam.sdk.testing.UsesTestStream;
+import org.apache.beam.sdk.testing.UsesTriggeredSideInputs;
 import org.apache.beam.sdk.testing.ValidatesRunner;
+import org.apache.beam.sdk.transforms.windowing.AfterProcessingTime;
 import org.apache.beam.sdk.transforms.windowing.FixedWindows;
 import org.apache.beam.sdk.transforms.windowing.GlobalWindows;
 import org.apache.beam.sdk.transforms.windowing.IntervalWindow;
+import org.apache.beam.sdk.transforms.windowing.Repeatedly;
 import org.apache.beam.sdk.transforms.windowing.Window;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PBegin;
@@ -63,7 +66,7 @@ import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TimestampedValue;
 import org.apache.beam.sdk.values.WindowingStrategy;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.hamcrest.Matchers;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
@@ -72,6 +75,7 @@ import org.junit.Test;
 import org.junit.experimental.categories.Category;
 import org.junit.internal.matchers.ThrowableMessageMatcher;
 import org.junit.rules.ExpectedException;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
@@ -88,6 +92,8 @@ public class ViewTest implements Serializable {
   @Rule public final transient TestPipeline pipeline = TestPipeline.create();
 
   @Rule public transient ExpectedException thrown = ExpectedException.none();
+
+  @Rule public transient Timeout globalTimeout = Timeout.seconds(1200);
 
   @Test
   @Category(ValidatesRunner.class)
@@ -196,7 +202,7 @@ public class ViewTest implements Serializable {
   }
 
   @Test
-  @Category(NeedsRunner.class)
+  @Category(ValidatesRunner.class)
   public void testEmptySingletonSideInput() throws Exception {
 
     final PCollectionView<Integer> view =
@@ -217,17 +223,14 @@ public class ViewTest implements Serializable {
                     })
                 .withSideInputs(view));
 
-    thrown.expect(PipelineExecutionException.class);
-    thrown.expectCause(isA(NoSuchElementException.class));
-    thrown.expectMessage("Empty");
-    thrown.expectMessage("PCollection");
-    thrown.expectMessage("singleton");
+    // As long as we get an error, be flexible with how a runner surfaces it
+    thrown.expect(Exception.class);
 
     pipeline.run();
   }
 
   @Test
-  @Category(NeedsRunner.class)
+  @Category(ValidatesRunner.class)
   public void testNonSingletonSideInput() throws Exception {
 
     PCollection<Integer> oneTwoThree = pipeline.apply(Create.of(1, 2, 3));
@@ -244,11 +247,87 @@ public class ViewTest implements Serializable {
                 })
             .withSideInputs(view));
 
-    thrown.expect(PipelineExecutionException.class);
-    thrown.expectCause(isA(IllegalArgumentException.class));
-    thrown.expectMessage("PCollection");
-    thrown.expectMessage("more than one");
-    thrown.expectMessage("singleton");
+    // As long as we get an error, be flexible with how a runner surfaces it
+    thrown.expect(Exception.class);
+
+    pipeline.run();
+  }
+
+  @Test
+  @Category(ValidatesRunner.class)
+  public void testDiscardingNonSingletonSideInput() throws Exception {
+
+    PCollection<Integer> oneTwoThree = pipeline.apply(Create.of(1, 2, 3));
+    final PCollectionView<Integer> view =
+        oneTwoThree
+            .apply(Window.<Integer>configure().discardingFiredPanes())
+            .apply(View.asSingleton());
+
+    oneTwoThree.apply(
+        "OutputSideInputs",
+        ParDo.of(
+                new DoFn<Integer, Integer>() {
+                  @ProcessElement
+                  public void processElement(ProcessContext c) {
+                    c.output(c.sideInput(view));
+                  }
+                })
+            .withSideInputs(view));
+
+    // As long as we get an error, be flexible with how a runner surfaces it
+    thrown.expect(Exception.class);
+
+    pipeline.run();
+  }
+
+  @Test
+  @Category({ValidatesRunner.class, UsesTriggeredSideInputs.class})
+  public void testTriggeredLatestSingleton() {
+    IntervalWindow zeroWindow = new IntervalWindow(new Instant(0), new Instant(1000));
+
+    PCollectionView<Long> view =
+        pipeline
+            .apply(
+                GenerateSequence.from(0)
+                    .withRate(1, Duration.millis(100))
+                    .withTimestampFn(Instant::new)
+                    .withMaxReadTime(Duration.standardSeconds(10)))
+            .apply(
+                "Window side input",
+                Window.<Long>into(FixedWindows.of(Duration.standardSeconds(1)))
+                    .triggering(Repeatedly.forever(AfterProcessingTime.pastFirstElementInPane()))
+                    .withAllowedLateness(Duration.ZERO)
+                    .discardingFiredPanes())
+            .apply(Reify.timestamps())
+            .apply(Combine.globally(Latest.<Long>combineFn()).withoutDefaults().asSingletonView());
+
+    final String tag = "singleton";
+    PCollection<Long> pc =
+        pipeline
+            .apply(Impulse.create())
+            .apply(WithTimestamps.of(impulse -> new Instant(0)))
+            .apply("Window main input", Window.into(FixedWindows.of(Duration.standardSeconds(1))))
+            .apply(
+                ParDo.of(
+                        new DoFn<byte[], Long>() {
+                          @ProcessElement
+                          public void process(
+                              @SideInput(tag) Long sideInput, OutputReceiver<Long> out)
+                              throws InterruptedException {
+                            // waiting to ensure multiple outputs to side input before reading it
+                            Thread.sleep(1000L);
+                            out.output(sideInput);
+                          }
+                        })
+                    .withSideInput(tag, view));
+
+    PAssert.that(pc)
+        .inWindow(zeroWindow)
+        .satisfies(
+            (Iterable<Long> values) -> {
+              assertThat(values, Matchers.iterableWithSize(1));
+              return null;
+            });
 
     pipeline.run();
   }
@@ -259,6 +338,72 @@ public class ViewTest implements Serializable {
 
     final PCollectionView<List<Integer>> view =
         pipeline.apply("CreateSideInput", Create.of(11, 13, 17, 23)).apply(View.asList());
+
+    PCollection<Integer> output =
+        pipeline
+            .apply("CreateMainInput", Create.of(29, 31))
+            .apply(
+                "OutputSideInputs",
+                ParDo.of(
+                        new DoFn<Integer, Integer>() {
+                          @ProcessElement
+                          public void processElement(ProcessContext c) {
+                            checkArgument(c.sideInput(view).size() == 4);
+                            checkArgument(
+                                c.sideInput(view).get(0).equals(c.sideInput(view).get(0)));
+                            for (Integer i : c.sideInput(view)) {
+                              c.output(i);
+                            }
+                          }
+                        })
+                    .withSideInputs(view));
+
+    PAssert.that(output).containsInAnyOrder(11, 13, 17, 23, 11, 13, 17, 23);
+
+    pipeline.run();
+  }
+
+  @Test
+  @Category(ValidatesRunner.class)
+  public void testListWithRandomAccessSideInput() {
+
+    final PCollectionView<List<Integer>> view =
+        pipeline
+            .apply("CreateSideInput", Create.of(11, 13, 17, 23))
+            .apply(View.<Integer>asList().withRandomAccess());
+
+    PCollection<Integer> output =
+        pipeline
+            .apply("CreateMainInput", Create.of(29, 31))
+            .apply(
+                "OutputSideInputs",
+                ParDo.of(
+                        new DoFn<Integer, Integer>() {
+                          @ProcessElement
+                          public void processElement(ProcessContext c) {
+                            checkArgument(c.sideInput(view).size() == 4);
+                            checkArgument(
+                                c.sideInput(view).get(0).equals(c.sideInput(view).get(0)));
+                            for (Integer i : c.sideInput(view)) {
+                              c.output(i);
+                            }
+                          }
+                        })
+                    .withSideInputs(view));
+
+    PAssert.that(output).containsInAnyOrder(11, 13, 17, 23, 11, 13, 17, 23);
+
+    pipeline.run();
+  }
+
+  @Test
+  @Category(NeedsRunner.class)
+  public void testListInMemorySideInput() {
+
+    final PCollectionView<List<Integer>> view =
+        pipeline
+            .apply("CreateSideInput", Create.of(11, 13, 17, 23))
+            .apply(View.<Integer>asList().inMemory());
 
     PCollection<Integer> output =
         pipeline
@@ -620,6 +765,44 @@ public class ViewTest implements Serializable {
 
     PAssert.that(output)
         .containsInAnyOrder(KV.of("a", 1), KV.of("a", 1), KV.of("a", 2), KV.of("b", 3));
+
+    pipeline.run();
+  }
+
+  @Test
+  @Category(NeedsRunner.class)
+  public void testMultimapInMemorySideInput() {
+
+    final PCollectionView<Map<String, Iterable<Integer>>> view =
+        pipeline
+            .apply(
+                "CreateSideInput",
+                Create.of(KV.of("a", 1), KV.of("a", 1), KV.of("a", 2), KV.of("b", 3)))
+            .apply(View.<String, Integer>asMultimap().inMemory());
+
+    PCollection<KV<String, Integer>> output =
+        pipeline
+            .apply("CreateMainInput", Create.of("apple", "banana", "blackberry"))
+            .apply(
+                "OutputSideInputs",
+                ParDo.of(
+                        new DoFn<String, KV<String, Integer>>() {
+                          @ProcessElement
+                          public void processElement(ProcessContext c) {
+                            for (Integer v : c.sideInput(view).get(c.element().substring(0, 1))) {
+                              c.output(KV.of(c.element(), v));
+                            }
+                          }
+                        })
+                    .withSideInputs(view));
+
+    PAssert.that(output)
+        .containsInAnyOrder(
+            KV.of("apple", 1),
+            KV.of("apple", 1),
+            KV.of("apple", 2),
+            KV.of("banana", 3),
+            KV.of("blackberry", 3));
 
     pipeline.run();
   }
@@ -1021,6 +1204,78 @@ public class ViewTest implements Serializable {
   }
 
   @Test
+  @Category(NeedsRunner.class)
+  public void testMapInMemorySideInput() {
+
+    final PCollectionView<Map<String, Integer>> view =
+        pipeline
+            .apply("CreateSideInput", Create.of(KV.of("a", 1), KV.of("b", 3)))
+            .apply(View.<String, Integer>asMap().inMemory());
+
+    PCollection<KV<String, Integer>> output =
+        pipeline
+            .apply("CreateMainInput", Create.of("apple", "banana", "blackberry"))
+            .apply(
+                "OutputSideInputs",
+                ParDo.of(
+                        new DoFn<String, KV<String, Integer>>() {
+                          @ProcessElement
+                          public void processElement(ProcessContext c) {
+                            c.output(
+                                KV.of(
+                                    c.element(),
+                                    c.sideInput(view).get(c.element().substring(0, 1))));
+                          }
+                        })
+                    .withSideInputs(view));
+
+    PAssert.that(output)
+        .containsInAnyOrder(KV.of("apple", 1), KV.of("banana", 3), KV.of("blackberry", 3));
+
+    pipeline.run();
+  }
+
+  @Test
+  @Category(NeedsRunner.class)
+  public void testMapInMemorySideInputWithNonStructuralKey() {
+
+    final PCollectionView<Map<byte[], Integer>> view =
+        pipeline
+            .apply(
+                "CreateSideInput",
+                Create.of(
+                    KV.of("a".getBytes(StandardCharsets.UTF_8), 1),
+                    KV.of("b".getBytes(StandardCharsets.UTF_8), 3)))
+            .apply(View.<byte[], Integer>asMap().inMemory());
+
+    PCollection<KV<String, Integer>> output =
+        pipeline
+            .apply("CreateMainInput", Create.of("apple", "banana", "blackberry"))
+            .apply(
+                "OutputSideInputs",
+                ParDo.of(
+                        new DoFn<String, KV<String, Integer>>() {
+                          @ProcessElement
+                          public void processElement(ProcessContext c) {
+                            c.output(
+                                KV.of(
+                                    c.element(),
+                                    c.sideInput(view)
+                                        .get(
+                                            c.element()
+                                                .substring(0, 1)
+                                                .getBytes(StandardCharsets.UTF_8))));
+                          }
+                        })
+                    .withSideInputs(view));
+
+    PAssert.that(output)
+        .containsInAnyOrder(KV.of("apple", 1), KV.of("banana", 3), KV.of("blackberry", 3));
+
+    pipeline.run();
+  }
+
+  @Test
   @Category({ValidatesRunner.class})
   public void testMapSideInputWithNonDeterministicKeyCoder() {
 
@@ -1255,7 +1510,7 @@ public class ViewTest implements Serializable {
   }
 
   @Test
-  @Category(NeedsRunner.class)
+  @Category(ValidatesRunner.class)
   public void testMapSideInputWithNullValuesCatchesDuplicates() {
 
     final PCollectionView<Map<String, Integer>> view =
@@ -1288,10 +1543,9 @@ public class ViewTest implements Serializable {
     PAssert.that(output)
         .containsInAnyOrder(KV.of("apple", 1), KV.of("banana", 3), KV.of("blackberry", 3));
 
-    // PipelineExecutionException is thrown with cause having a message stating that a
-    // duplicate is not allowed.
-    thrown.expectCause(
-        ThrowableMessageMatcher.hasMessage(Matchers.containsString("Duplicate values for a")));
+    // As long as we get an error, be flexible with how a runner surfaces it
+    thrown.expect(Exception.class);
+
     pipeline.run();
   }
 

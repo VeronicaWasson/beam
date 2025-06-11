@@ -23,7 +23,7 @@
 import base64
 import datetime
 import logging
-import random
+import secrets
 import time
 import unittest
 import uuid
@@ -44,6 +44,7 @@ from apache_beam.runners.interactive.interactive_runner import InteractiveRunner
 from apache_beam.testing.test_pipeline import TestPipeline
 from apache_beam.testing.util import assert_that
 from apache_beam.testing.util import equal_to
+from apache_beam.utils.timestamp import Timestamp
 
 # Protect against environments where bigquery library is not available.
 # pylint: disable=wrong-import-order, wrong-import-position
@@ -97,10 +98,8 @@ class BigQueryReadIntegrationTests(unittest.TestCase):
     cls.project = cls.test_pipeline.get_option('project')
 
     cls.bigquery_client = BigQueryWrapper()
-    cls.dataset_id = '%s%s%d' % (
-        cls.BIG_QUERY_DATASET_ID,
-        str(int(time.time())),
-        random.randint(0, 10000))
+    cls.dataset_id = '%s%d%s' % (
+        cls.BIG_QUERY_DATASET_ID, int(time.time()), secrets.token_hex(3))
     cls.bigquery_client.get_or_create_dataset(cls.project, cls.dataset_id)
     _LOGGER.info(
         "Created dataset %s in project %s", cls.dataset_id, cls.project)
@@ -110,11 +109,11 @@ class BigQueryReadIntegrationTests(unittest.TestCase):
     request = bigquery.BigqueryDatasetsDeleteRequest(
         projectId=cls.project, datasetId=cls.dataset_id, deleteContents=True)
     try:
-      _LOGGER.info(
+      _LOGGER.debug(
           "Deleting dataset %s in project %s", cls.dataset_id, cls.project)
       cls.bigquery_client.client.datasets.Delete(request)
     except HttpError:
-      _LOGGER.debug(
+      _LOGGER.warning(
           'Failed to clean up dataset %s in project %s',
           cls.dataset_id,
           cls.project)
@@ -126,9 +125,9 @@ class ReadTests(BigQueryReadIntegrationTests):
   }, {
       'number': 2, 'str': 'def'
   }, {
-      'number': 3, 'str': u'你好'
+      'number': 3, 'str': '你好'
   }, {
-      'number': 4, 'str': u'привет'
+      'number': 4, 'str': 'привет'
   }]
 
   @classmethod
@@ -159,6 +158,8 @@ class ReadTests(BigQueryReadIntegrationTests):
     request = bigquery.BigqueryTablesInsertRequest(
         projectId=cls.project, datasetId=cls.dataset_id, table=table)
     cls.bigquery_client.client.tables.Insert(request)
+    # Call get_table so that we wait until the table is visible.
+    _ = cls.bigquery_client.get_table(cls.project, cls.dataset_id, table_name)
     cls.bigquery_client.insert_rows(
         cls.project, cls.dataset_id, table_name, cls.TABLE_DATA)
 
@@ -185,7 +186,7 @@ class ReadTests(BigQueryReadIntegrationTests):
     the_table = bigquery_tools.BigQueryWrapper().get_table(
         project_id="apache-beam-testing",
         dataset_id="beam_bigquery_io_test",
-        table_id="dfsqltable_3c7d6fd5_16e0460dfd0")
+        table_id="table_schema_retrieve")
     table = the_table.schema
     utype = bigquery_schema_tools.\
         generate_user_type_from_bq_schema(table)
@@ -194,16 +195,32 @@ class ReadTests(BigQueryReadIntegrationTests):
           p | apache_beam.io.gcp.bigquery.ReadFromBigQuery(
               gcs_location="gs://bqio_schema_test",
               dataset="beam_bigquery_io_test",
-              table="dfsqltable_3c7d6fd5_16e0460dfd0",
+              table="table_schema_retrieve",
               project="apache-beam-testing",
               output_type='BEAM_ROW'))
       assert_that(
           result,
           equal_to([
-              utype(id=3, name='customer1', type='test'),
-              utype(id=1, name='customer1', type='test'),
-              utype(id=2, name='customer2', type='test'),
-              utype(id=4, name='customer2', type='test')
+              utype(
+                  id=1,
+                  name='customer1',
+                  type='test',
+                  times=Timestamp(1633262400)),
+              utype(
+                  id=3,
+                  name='customer1',
+                  type='test',
+                  times=Timestamp(1664798400)),
+              utype(
+                  id=2,
+                  name='customer2',
+                  type='test',
+                  times=Timestamp(1601726400)),
+              utype(
+                  id=4,
+                  name='customer2',
+                  type='test',
+                  times=Timestamp(1570104000))
           ]))
 
   @pytest.mark.it_postcommit
@@ -211,7 +228,7 @@ class ReadTests(BigQueryReadIntegrationTests):
     the_table = bigquery_tools.BigQueryWrapper().get_table(
         project_id="apache-beam-testing",
         dataset_id="beam_bigquery_io_test",
-        table_id="dfsqltable_3c7d6fd5_16e0460dfd0")
+        table_id="table_schema_retrieve")
     table = the_table.schema
     utype = bigquery_schema_tools.\
         generate_user_type_from_bq_schema(table)
@@ -221,15 +238,31 @@ class ReadTests(BigQueryReadIntegrationTests):
               gcs_location="gs://bqio_schema_test",
               table="apache-beam-testing:"
               "beam_bigquery_io_test."
-              "dfsqltable_3c7d6fd5_16e0460dfd0",
+              "table_schema_retrieve",
               output_type='BEAM_ROW'))
       assert_that(
           result,
           equal_to([
-              utype(id=3, name='customer1', type='test'),
-              utype(id=1, name='customer1', type='test'),
-              utype(id=2, name='customer2', type='test'),
-              utype(id=4, name='customer2', type='test')
+              utype(
+                  id=1,
+                  name='customer1',
+                  type='test',
+                  times=Timestamp(1633262400)),
+              utype(
+                  id=3,
+                  name='customer1',
+                  type='test',
+                  times=Timestamp(1664798400)),
+              utype(
+                  id=2,
+                  name='customer2',
+                  type='test',
+                  times=Timestamp(1601726400)),
+              utype(
+                  id=4,
+                  name='customer2',
+                  type='test',
+                  times=Timestamp(1570104000))
           ]))
 
   @pytest.mark.it_postcommit
@@ -237,7 +270,7 @@ class ReadTests(BigQueryReadIntegrationTests):
     the_table = bigquery_tools.BigQueryWrapper().get_table(
         project_id="apache-beam-testing",
         dataset_id="beam_bigquery_io_test",
-        table_id="dfsqltable_3c7d6fd5_16e0460dfd0")
+        table_id="table_schema_retrieve")
     table = the_table.schema
     utype = bigquery_schema_tools.\
         generate_user_type_from_bq_schema(table)
@@ -247,29 +280,46 @@ class ReadTests(BigQueryReadIntegrationTests):
               method=beam.io.ReadFromBigQuery.Method.DIRECT_READ,
               table="apache-beam-testing:"
               "beam_bigquery_io_test."
-              "dfsqltable_3c7d6fd5_16e0460dfd0",
+              "table_schema_retrieve",
               output_type='BEAM_ROW'))
       assert_that(
           result,
           equal_to([
-              utype(id=3, name='customer1', type='test'),
-              utype(id=1, name='customer1', type='test'),
-              utype(id=2, name='customer2', type='test'),
-              utype(id=4, name='customer2', type='test')
+              utype(
+                  id=1,
+                  name='customer1',
+                  type='test',
+                  times=Timestamp(1633262400)),
+              utype(
+                  id=3,
+                  name='customer1',
+                  type='test',
+                  times=Timestamp(1664798400)),
+              utype(
+                  id=2,
+                  name='customer2',
+                  type='test',
+                  times=Timestamp(1601726400)),
+              utype(
+                  id=4,
+                  name='customer2',
+                  type='test',
+                  times=Timestamp(1570104000))
           ]))
 
 
 class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
+  BIG_QUERY_DATASET_ID = 'python_read_table_'
   TABLE_DATA = [{
       'number': 1,
-      'string': u'你好',
+      'string': '你好',
       'time': '12:44:31',
       'datetime': '2018-12-31 12:44:31',
       'rec': None
   },
                 {
                     'number': 4,
-                    'string': u'привет',
+                    'string': 'привет',
                     'time': '12:44:31',
                     'datetime': '2018-12-31 12:44:31',
                     'rec': {
@@ -283,7 +333,8 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
   @classmethod
   def setUpClass(cls):
     super(ReadUsingStorageApiTests, cls).setUpClass()
-    cls.table_name = 'python_read_table'
+    cls.table_name = '%s%d%s' % (
+        cls.BIG_QUERY_DATASET_ID, int(time.time()), secrets.token_hex(3))
     cls._create_table(cls.table_name)
 
     table_id = '{}.{}'.format(cls.dataset_id, cls.table_name)
@@ -346,6 +397,8 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
     request = bigquery.BigqueryTablesInsertRequest(
         projectId=cls.project, datasetId=cls.dataset_id, table=table)
     cls.bigquery_client.client.tables.Insert(request)
+    # Call get_table so that we wait until the table is visible.
+    _ = cls.bigquery_client.get_table(cls.project, cls.dataset_id, table_name)
     cls.bigquery_client.insert_rows(
         cls.project, cls.dataset_id, table_name, cls.TABLE_DATA)
 
@@ -360,7 +413,7 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
         'materializing_table_before_reading',
         str(uuid.uuid4())[0:10],
         bigquery_tools.BigQueryJobTypes.QUERY,
-        '%s_%s' % (int(time.time()), random.randint(0, 1000)))
+        '%d_%s' % (int(time.time()), secrets.token_hex(3)))
     cls._setup_temporary_dataset(cls.project, cls.query)
     job = cls.bigquery_client._start_query_job(
         project,
@@ -378,14 +431,14 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
     EXPECTED_TABLE_DATA = [
         {
             'number': 1,
-            'string': u'你好',
+            'string': '你好',
             'time': datetime.time(12, 44, 31),
             'datetime': '2018-12-31T12:44:31',
             'rec': None,
         },
         {
             'number': 4,
-            'string': u'привет',
+            'string': 'привет',
             'time': datetime.time(12, 44, 31),
             'datetime': '2018-12-31T12:44:31',
             'rec': {
@@ -408,14 +461,14 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
     EXPECTED_TABLE_DATA = [
         {
             'number': 1,
-            'string': u'你好',
+            'string': '你好',
             'time': datetime.time(12, 44, 31),
             'datetime': datetime.datetime(2018, 12, 31, 12, 44, 31),
             'rec': None,
         },
         {
             'number': 4,
-            'string': u'привет',
+            'string': 'привет',
             'time': datetime.time(12, 44, 31),
             'datetime': datetime.datetime(2018, 12, 31, 12, 44, 31),
             'rec': {
@@ -450,7 +503,7 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
   def test_iobase_source_with_row_restriction(self):
     EXPECTED_TABLE_DATA = [{
         'number': 1,
-        'string': u'你好',
+        'string': '你好',
         'time': datetime.time(12, 44, 31),
         'datetime': datetime.datetime(2018, 12, 31, 12, 44, 31),
         'rec': None
@@ -466,7 +519,7 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
 
   @pytest.mark.it_postcommit
   def test_iobase_source_with_column_selection_and_row_restriction(self):
-    EXPECTED_TABLE_DATA = [{'string': u'привет'}]
+    EXPECTED_TABLE_DATA = [{'string': 'привет'}]
     with beam.Pipeline(argv=self.args) as p:
       result = (
           p | 'Read with BigQuery Storage API' >> beam.io.ReadFromBigQuery(
@@ -475,6 +528,19 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
               row_restriction='number > 2',
               selected_fields=['string']))
       assert_that(result, equal_to(EXPECTED_TABLE_DATA))
+
+  @pytest.mark.it_postcommit
+  def test_iobase_source_with_column_selection_and_row_restriction_rows(self):
+    with beam.Pipeline(argv=self.args) as p:
+      result = (
+          p | 'Read with BigQuery Storage API' >> beam.io.ReadFromBigQuery(
+              method=beam.io.ReadFromBigQuery.Method.DIRECT_READ,
+              table=self.temp_table_reference,
+              row_restriction='number > 2',
+              selected_fields=['string'],
+              output_type='BEAM_ROW'))
+      assert_that(
+          result | beam.Map(lambda row: row.string), equal_to(['привет']))
 
   @pytest.mark.it_postcommit
   def test_iobase_source_with_very_selective_filters(self):
@@ -494,14 +560,14 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
     EXPECTED_TABLE_DATA = [
         {
             'number': 1,
-            'string': u'你好',
+            'string': '你好',
             'time': datetime.time(12, 44, 31),
             'datetime': datetime.datetime(2018, 12, 31, 12, 44, 31),
             'rec': None,
         },
         {
             'number': 4,
-            'string': u'привет',
+            'string': 'привет',
             'time': datetime.time(12, 44, 31),
             'datetime': datetime.datetime(2018, 12, 31, 12, 44, 31),
             'rec': {
@@ -526,7 +592,7 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
 
   @pytest.mark.it_postcommit
   def test_iobase_source_with_query_and_filters(self):
-    EXPECTED_TABLE_DATA = [{'string': u'привет'}]
+    EXPECTED_TABLE_DATA = [{'string': 'привет'}]
     query = StaticValueProvider(str, self.query)
     with beam.Pipeline(argv=self.args) as p:
       result = (
@@ -594,6 +660,8 @@ class ReadNewTypesTests(BigQueryReadIntegrationTests):
     request = bigquery.BigqueryTablesInsertRequest(
         projectId=cls.project, datasetId=cls.dataset_id, table=table)
     cls.bigquery_client.client.tables.Insert(request)
+    # Call get_table so that we wait until the table is visible.
+    _ = cls.bigquery_client.get_table(cls.project, cls.dataset_id, table_name)
     row_data = {
         'float': 0.33,
         'numeric': Decimal('10'),
@@ -661,14 +729,16 @@ class ReadNewTypesTests(BigQueryReadIntegrationTests):
 
 
 class ReadAllBQTests(BigQueryReadIntegrationTests):
+  TABLE_DATA_AVAILABILITY_WAIT_SECONDS = 30
+
   TABLE_DATA_1 = [{
       'number': 1, 'str': 'abc'
   }, {
       'number': 2, 'str': 'def'
   }, {
-      'number': 3, 'str': u'你好'
+      'number': 3, 'str': '你好'
   }, {
-      'number': 4, 'str': u'привет'
+      'number': 4, 'str': 'привет'
   }]
 
   TABLE_DATA_2 = [{
@@ -676,9 +746,9 @@ class ReadAllBQTests(BigQueryReadIntegrationTests):
   }, {
       'number': 20, 'str': 'defg'
   }, {
-      'number': 30, 'str': u'你好'
+      'number': 30, 'str': '你好'
   }, {
-      'number': 40, 'str': u'привет'
+      'number': 40, 'str': 'привет'
   }]
 
   TABLE_DATA_3 = [{'number': 10, 'str': 'abcde', 'extra': 3}]
@@ -698,8 +768,8 @@ class ReadAllBQTests(BigQueryReadIntegrationTests):
     cls.table_name2 = 'python_rd_table_2'
     cls.table_schema2 = cls.create_table(
         cls.table_name2, cls.TABLE_DATA_2, cls.SCHEMA_BQ)
-    table_id2 = '{}.{}'.format(cls.dataset_id, cls.table_name2)
-    cls.query2 = 'SELECT number, str FROM %s' % table_id2
+    cls.query2 = 'SELECT number, str FROM [%s:%s.%s]' % (
+        cls.project, cls.dataset_id, cls.table_name2)
 
     cls.table_name3 = 'python_rd_table_3'
     cls.table_schema3 = cls.create_table(
@@ -717,8 +787,11 @@ class ReadAllBQTests(BigQueryReadIntegrationTests):
     request = bigquery.BigqueryTablesInsertRequest(
         projectId=cls.project, datasetId=cls.dataset_id, table=table)
     cls.bigquery_client.client.tables.Insert(request)
+    # Call get_table so that we wait until the table is visible.
+    _ = cls.bigquery_client.get_table(cls.project, cls.dataset_id, table_name)
     cls.bigquery_client.insert_rows(
         cls.project, cls.dataset_id, table_name, data)
+    time.sleep(cls.TABLE_DATA_AVAILABILITY_WAIT_SECONDS)
     return table_schema
 
   @classmethod
@@ -745,10 +818,7 @@ class ReadAllBQTests(BigQueryReadIntegrationTests):
   @skip(['PortableRunner', 'FlinkRunner'])
   @pytest.mark.it_postcommit
   def test_read_queries(self):
-    # TODO(https://github.com/apache/beam/issues/20610): Remove experiment when
-    # tests run on r_v2.
-    args = self.args + ["--experiments=use_runner_v2"]
-    with beam.Pipeline(argv=args) as p:
+    with beam.Pipeline(argv=self.args) as p:
       result = (
           p
           | beam.Create([

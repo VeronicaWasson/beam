@@ -50,7 +50,7 @@ import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1.WriteFailure;
 import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1WriteFn.BatchWriteFnWithDeadLetterQueue;
 import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1WriteFn.WriteElement;
 import org.apache.beam.sdk.io.gcp.firestore.RpcQos.RpcWriteAttempt.Element;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.junit.Test;
 import org.mockito.ArgumentCaptor;
 
@@ -177,7 +177,7 @@ public final class FirestoreV1FnBatchWriteWithDeadLetterQueueTest
 
     when(rpcQos.newWriteAttempt(any())).thenReturn(attempt);
     when(attempt.awaitSafeToProceed(any())).thenReturn(true);
-    when(attempt.<Write, Element<Write>>newFlushBuffer(any()))
+    when(attempt.<Element<Write>>newFlushBuffer(any()))
         .thenReturn(newFlushBuffer(options))
         .thenReturn(newFlushBuffer(options))
         .thenThrow(new IllegalStateException("too many attempt#newFlushBuffer calls"));

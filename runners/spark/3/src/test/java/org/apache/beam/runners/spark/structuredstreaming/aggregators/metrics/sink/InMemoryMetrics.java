@@ -23,7 +23,7 @@ import com.codahale.metrics.MetricRegistry;
 import java.util.Collection;
 import java.util.Properties;
 import org.apache.beam.runners.spark.structuredstreaming.metrics.WithMetricsSupport;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 import org.apache.spark.metrics.sink.Sink;
 
 /** An in-memory {@link Sink} implementation for tests. */
@@ -49,7 +49,7 @@ public class InMemoryMetrics implements Sink {
     internalMetricRegistry = metricRegistry;
   }
 
-  @SuppressWarnings({"TypeParameterUnusedInFormals", "rawtypes"})
+  @SuppressWarnings({"TypeParameterUnusedInFormals", "rawtypes"}) // because of getGauges
   public static <T> T valueOf(final String name) {
     // this might fail in case we have multiple aggregators with the same suffix after
     // the last dot, but it should be good enough for tests.

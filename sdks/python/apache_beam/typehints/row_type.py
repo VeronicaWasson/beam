@@ -21,26 +21,36 @@ from __future__ import annotations
 
 from typing import Any
 from typing import Dict
-from typing import List
 from typing import Optional
 from typing import Sequence
 from typing import Tuple
 
 from apache_beam.typehints import typehints
 from apache_beam.typehints.native_type_compatibility import match_is_named_tuple
+from apache_beam.typehints.schema_registry import SchemaTypeRegistry
 
 # Name of the attribute added to user types (existing and generated) to store
 # the corresponding schema ID
 _BEAM_SCHEMA_ID = "_beam_schema_id"
 
 
+def _user_type_is_generated(user_type: type) -> bool:
+  if not hasattr(user_type, _BEAM_SCHEMA_ID):
+    return False
+
+  schema_id = getattr(user_type, _BEAM_SCHEMA_ID)
+  type_name = 'BeamSchema_{}'.format(schema_id.replace('-', '_'))
+  return user_type.__name__ == type_name
+
+
 class RowTypeConstraint(typehints.TypeConstraint):
   def __init__(
       self,
-      fields: List[Tuple[str, type]],
-      user_type=None,
-      schema_options: Optional[List[Tuple[str, Any]]] = None,
-      field_options: Optional[Dict[str, List[Tuple[str, Any]]]] = None):
+      fields: Sequence[Tuple[str, type]],
+      user_type,
+      schema_options: Optional[Sequence[Tuple[str, Any]]] = None,
+      field_options: Optional[Dict[str, Sequence[Tuple[str, Any]]]] = None,
+      field_descriptions: Optional[Dict[str, str]] = None):
     """For internal use only, no backwards comatibility guaratees.  See
     https://beam.apache.org/documentation/programming-guide/#schemas-for-pl-types
     for guidance on creating PCollections with inferred schemas.
@@ -75,31 +85,38 @@ class RowTypeConstraint(typehints.TypeConstraint):
     """
     # Recursively wrap row types in a RowTypeConstraint
     self._fields = tuple((name, RowTypeConstraint.from_user_type(typ) or typ)
-                         for name,
-                         typ in fields)
+                         for name, typ in fields)
 
     self._user_type = user_type
 
     # Note schema ID can be None if the schema is not registered yet.
     # Currently registration happens when converting to schema protos, in
     # apache_beam.typehints.schemas
-    if self._user_type is not None:
-      self._schema_id = getattr(self._user_type, _BEAM_SCHEMA_ID, None)
-    else:
-      self._schema_id = None
+    self._schema_id = getattr(self._user_type, _BEAM_SCHEMA_ID, None)
 
     self._schema_options = schema_options or []
     self._field_options = field_options or {}
+    self._field_descriptions = field_descriptions or {}
 
   @staticmethod
   def from_user_type(
       user_type: type,
-      schema_options: Optional[List[Tuple[str, Any]]] = None,
-      field_options: Optional[Dict[str, List[Tuple[str, Any]]]] = None
+      schema_options: Optional[Sequence[Tuple[str, Any]]] = None,
+      field_options: Optional[Dict[str, Sequence[Tuple[str, Any]]]] = None
   ) -> Optional[RowTypeConstraint]:
     if match_is_named_tuple(user_type):
       fields = [(name, user_type.__annotations__[name])
                 for name in user_type._fields]
+
+      field_descriptions = getattr(user_type, '_field_descriptions', None)
+
+      if _user_type_is_generated(user_type):
+        return RowTypeConstraint.from_fields(
+            fields,
+            schema_id=getattr(user_type, _BEAM_SCHEMA_ID),
+            schema_options=schema_options,
+            field_options=field_options,
+            field_descriptions=field_descriptions)
 
       # TODO(https://github.com/apache/beam/issues/22125): Add user API for
       # specifying schema/field options
@@ -107,13 +124,35 @@ class RowTypeConstraint(typehints.TypeConstraint):
           fields=fields,
           user_type=user_type,
           schema_options=schema_options,
-          field_options=field_options)
+          field_options=field_options,
+          field_descriptions=field_descriptions)
 
     return None
 
   @staticmethod
-  def from_fields(fields: Sequence[Tuple[str, type]]) -> RowTypeConstraint:
-    return RowTypeConstraint(fields=fields, user_type=None)
+  def from_fields(
+      fields: Sequence[Tuple[str, type]],
+      schema_id: Optional[str] = None,
+      schema_options: Optional[Sequence[Tuple[str, Any]]] = None,
+      field_options: Optional[Dict[str, Sequence[Tuple[str, Any]]]] = None,
+      schema_registry: Optional[SchemaTypeRegistry] = None,
+      field_descriptions: Optional[Dict[str, str]] = None,
+  ) -> RowTypeConstraint:
+    return GeneratedClassRowTypeConstraint(
+        fields,
+        schema_id=schema_id,
+        schema_options=schema_options,
+        field_options=field_options,
+        schema_registry=schema_registry,
+        field_descriptions=field_descriptions)
+
+  def __call__(self, *args, **kwargs):
+    # We make RowTypeConstraint callable (defers to constructing the user type)
+    # so that Python will recognize it as a type. This allows RowTypeConstraint
+    # to be used in conjunction with native typehints, like Optional.
+    # CPython (prior to 3.11) considers anything callable to be a type:
+    # https://github.com/python/cpython/blob/d348afa15d5a997e7a8e51c0f789f41cb15cc651/Lib/typing.py#L137-L167
+    return self._user_type(*args, **kwargs)
 
   @property
   def user_type(self):
@@ -155,8 +194,57 @@ class RowTypeConstraint(typehints.TypeConstraint):
 
   def __repr__(self):
     return 'Row(%s)' % ', '.join(
-        '%s=%s' % (name, typehints._unified_repr(t)) for name,
-        t in self._fields)
+        '%s=%s' % (name, repr(t)) for name, t in self._fields)
 
   def get_type_for(self, name):
-    return dict(self._fields)[name]
+    try:
+      return dict(self._fields)[name]
+    except KeyError:
+      return typehints.Any
+
+
+class GeneratedClassRowTypeConstraint(RowTypeConstraint):
+  """Specialization of RowTypeConstraint which relies on a generated user_type.
+
+  Since the generated user_type cannot be pickled, we supply a custom __reduce__
+  function that will regenerate the user_type.
+  """
+  def __init__(
+      self,
+      fields,
+      schema_id: Optional[str] = None,
+      schema_options: Optional[Sequence[Tuple[str, Any]]] = None,
+      field_options: Optional[Dict[str, Sequence[Tuple[str, Any]]]] = None,
+      schema_registry: Optional[SchemaTypeRegistry] = None,
+      field_descriptions: Optional[Dict[str, str]] = None,
+  ):
+    from apache_beam.typehints.schemas import named_fields_to_schema
+    from apache_beam.typehints.schemas import named_tuple_from_schema
+
+    kwargs = {'schema_registry': schema_registry} if schema_registry else {}
+
+    schema = named_fields_to_schema(
+        fields,
+        schema_id=schema_id,
+        schema_options=schema_options,
+        field_options=field_options,
+        **kwargs)
+    user_type = named_tuple_from_schema(schema, **kwargs)
+
+    super().__init__(
+        fields,
+        user_type,
+        schema_options=schema_options,
+        field_options=field_options,
+        field_descriptions=field_descriptions)
+
+  def __reduce__(self):
+    return (
+        RowTypeConstraint.from_fields,
+        (
+            self._fields,
+            self._schema_id,
+            self._schema_options,
+            self._field_options,
+            None,
+        ))

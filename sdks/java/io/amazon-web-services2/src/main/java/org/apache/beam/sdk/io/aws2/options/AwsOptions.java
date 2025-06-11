@@ -18,8 +18,8 @@
 package org.apache.beam.sdk.io.aws2.options;
 
 import java.net.URI;
-import org.apache.beam.sdk.annotations.Experimental;
-import org.apache.beam.sdk.annotations.Experimental.Kind;
+import org.apache.beam.sdk.io.aws2.auth.StsAssumeRoleForFederatedCredentialsProvider;
+import org.apache.beam.sdk.io.aws2.auth.WebIdTokenProvider;
 import org.apache.beam.sdk.io.aws2.common.ClientBuilderFactory;
 import org.apache.beam.sdk.io.aws2.common.HttpClientConfiguration;
 import org.apache.beam.sdk.options.Default;
@@ -39,11 +39,11 @@ import software.amazon.awssdk.http.apache.ProxyConfiguration;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.regions.providers.DefaultAwsRegionProviderChain;
 import software.amazon.awssdk.services.sts.auth.StsAssumeRoleCredentialsProvider;
+import software.amazon.awssdk.services.sts.auth.StsAssumeRoleWithWebIdentityCredentialsProvider;
 
 /**
  * Options used to configure Amazon Web Services specific options such as credentials and region.
  */
-@Experimental(Kind.SOURCE_SINK)
 public interface AwsOptions extends PipelineOptions {
 
   /** Region used to configure AWS service clients. */
@@ -78,42 +78,88 @@ public interface AwsOptions extends PipelineOptions {
    * <p>The class name of the provider must be set in the {@code @type} field. Note: Not all
    * available providers are supported and some configuration options might be ignored.
    *
-   * <p>Most providers rely on system's environment to follow AWS conventions, there's no further
-   * configuration:
+   * <p>Most providers must use the system environment following AWS conventions. Programmatic
+   * configuration for these providers is NOT supported:
    * <li>{@link DefaultCredentialsProvider}
    * <li>{@link EnvironmentVariableCredentialsProvider}
    * <li>{@link SystemPropertyCredentialsProvider}
-   * <li>{@link ProfileCredentialsProvider}
    * <li>{@link ContainerCredentialsProvider}
    *
    *     <p>Example:
    *
-   *     <pre>{@code --awsCredentialsProvider={"@type": "ProfileCredentialsProvider"}}</pre>
+   *     <pre>{@code --awsCredentialsProvider={"@type": "EnvironmentVariableCredentialsProvider"}}
+   *     </pre>
    *
-   *     <p>Some other providers require additional configuration:
+   *     <p>Some other providers support additional configuration:
    * <li>{@link StaticCredentialsProvider}
-   * <li>{@link StsAssumeRoleCredentialsProvider}
    *
    *     <p>Examples:
    *
    *     <pre>{@code --awsCredentialsProvider={
    *   "@type": "StaticCredentialsProvider",
-   *   "awsAccessKeyId": "key_id_value",
-   *   "awsSecretKey": "secret_value"
+   *   "accessKeyId": "key_id_value",
+   *   "secretAccessKey": "secret_value"
    * }
    *
    * --awsCredentialsProvider={
    *   "@type": "StaticCredentialsProvider",
-   *   "awsAccessKeyId": "key_id_value",
-   *   "awsSecretKey": "secret_value",
+   *   "accessKeyId": "key_id_value",
+   *   "secretAccessKey": "secret_value",
    *   "sessionToken": "token_value"
+   * }}</pre>
+   *
+   * <li>{@link ProfileCredentialsProvider}
+   *
+   *     <p>{@code profileName} is optional, if not set the environment default is used. Be careful
+   *     if using this provider programmatically, it can behave unexpectedly.
+   *
+   *     <p>Examples:
+   *
+   *     <pre>{@code --awsCredentialsProvider={
+   *   "@type": "ProfileCredentialsProvider"
    * }
    *
    * --awsCredentialsProvider={
+   *   "@type": "ProfileCredentialsProvider",
+   *   "profileName": "my_profile"
+   * }}</pre>
+   *
+   * <li>{@link StsAssumeRoleCredentialsProvider}
+   *
+   *     <pre>{@code --awsCredentialsProvider={
    *   "@type": "StsAssumeRoleCredentialsProvider",
    *   "roleArn": "role_arn_Value",
    *   "roleSessionName": "session_name_value",
    *   "policy": "policy_value",
+   *   "durationSeconds": 3600
+   * }}</pre>
+   *
+   * <li>{@link StsAssumeRoleWithWebIdentityCredentialsProvider}
+   *
+   *     <p>Please note that this works for batch pipelines which can be completed within the
+   *     expiration of the web identity token. Long batch or streaming pipelines wouldn't work with
+   *     this Provider.
+   *
+   *     <pre>{@code --awsCredentialsProvider={
+   *   "@type": "StsAssumeRoleWithWebIdentityCredentialsProvider",
+   *   "roleArn": "role_arn_Value",
+   *   "roleSessionName": "session_name_value",
+   *   "webIdentityToken": "web_identity_token_value",
+   *   "durationSeconds": 3600
+   * }}</pre>
+   *
+   * <li>{@link StsAssumeRoleForFederatedCredentialsProvider}
+   *
+   *     <p>Similar to {@link StsAssumeRoleWithWebIdentityCredentialsProvider} but supporting
+   *     long-running jobs. The configuration expects the FQCN for an implementation of {@link
+   *     WebIdTokenProvider} which will be used to retrieve a fresh token with each STS auth
+   *     request.
+   *
+   *     <pre>{@code --awsCredentialsProvider={
+   *   "@type": "StsAssumeRoleWithDynamicWebIdentityCredentialsProvider",
+   *   "roleArn": "role_arn_Value",
+   *   "audience": "audience_value",
+   *   "webIdTokenProviderFQCN": "fully_qualified_class_name",
    *   "durationSeconds": 3600
    * }}</pre>
    *

@@ -29,7 +29,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.beam.sdk.io.cassandra.CassandraIO.Read;
 import org.apache.beam.sdk.transforms.DoFn;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Joiner;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Joiner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,7 +42,7 @@ class ReadFn<T> extends DoFn<Read<T>, T> {
   private static final Logger LOG = LoggerFactory.getLogger(ReadFn.class);
 
   @ProcessElement
-  public void processElement(@Element Read<T> read, OutputReceiver<T> receiver) {
+  public void processElement(@Element Read<T> read, OutputReceiver<T> receiver) throws Exception {
     try {
       Session session = ConnectionManager.getSession(read);
       Mapper<T> mapper = read.mapperFactoryFn().apply(session);
@@ -89,6 +89,7 @@ class ReadFn<T> extends DoFn<Read<T>, T> {
       }
     } catch (Exception ex) {
       LOG.error("error", ex);
+      throw ex;
     }
   }
 
@@ -107,7 +108,7 @@ class ReadFn<T> extends DoFn<Read<T>, T> {
     String finalHighQuery =
         (spec.query() == null)
             ? buildInitialQuery(spec, true) + highestClause
-            : spec.query() + " AND " + highestClause;
+            : spec.query().get() + getJoinerClause(spec.query().get()) + highestClause;
     LOG.debug("CassandraIO generated a wrapAround query : {}", finalHighQuery);
     return finalHighQuery;
   }
@@ -117,7 +118,7 @@ class ReadFn<T> extends DoFn<Read<T>, T> {
     String finalLowQuery =
         (spec.query() == null)
             ? buildInitialQuery(spec, true) + lowestClause
-            : spec.query() + " AND " + lowestClause;
+            : spec.query().get() + getJoinerClause(spec.query().get()) + lowestClause;
     LOG.debug("CassandraIO generated a wrapAround query : {}", finalLowQuery);
     return finalLowQuery;
   }
@@ -141,6 +142,10 @@ class ReadFn<T> extends DoFn<Read<T>, T> {
     return (spec.query() == null)
         ? String.format("SELECT * FROM %s.%s", spec.keyspace().get(), spec.table().get())
             + " WHERE "
-        : spec.query().get() + (hasRingRange ? " AND " : "");
+        : spec.query().get() + (hasRingRange ? getJoinerClause(spec.query().get()) : "");
+  }
+
+  private static String getJoinerClause(String queryString) {
+    return queryString.toUpperCase().contains("WHERE") ? " AND " : " WHERE ";
   }
 }

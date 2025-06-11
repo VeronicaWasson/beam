@@ -59,16 +59,16 @@ the portable Runner. For more information on portability, please visit the
 <nav class="language-switcher">
   <strong>Adapt for:</strong>
   <ul>
-    <li data-type="language-java">Non portable (Java)</li>
-    <li data-type="language-py">Portable (Java/Python/Go)</li>
+    <li data-value="java">Non portable (Java)</li>
+    <li data-value="py">Portable (Java/Python/Go)</li>
   </ul>
 </nav>
 
 
 ## Spark Runner prerequisites and setup
 
-The Spark runner currently supports Spark's 3.1.x branch.
-> **Note:** Support for Spark 2.4.x is deprecated and will be dropped with the release of Beam 2.44.0 (or soon after).
+The Spark runner currently supports Spark's 3.2.x branch.
+> **Note:** Support for Spark 2.4.x was dropped with Beam 2.46.0.
 
 {{< paragraph class="language-java" >}}
 You can add a dependency on the latest version of the Spark runner by adding to your pom.xml the following:
@@ -293,7 +293,7 @@ python -m apache_beam.examples.wordcount \
 - `--runner`(required): `SparkRunner`.
 - `--output_executable_path`(required): path for the bundle jar to be created.
 - `--output`(required): where output shall be written.
-- `--spark_version`(optional): select spark version 2 (default) or 3.
+- `--spark_version`(optional): select spark version 3 (default) or 2 (deprecated!).
 
 5. Submit spark job to Dataproc cluster's master node.
 
@@ -325,6 +325,7 @@ When executing your pipeline with the Spark Runner, you should consider the foll
 <br><b>For RDD/DStream based runner:</b><br>
 {{< /paragraph >}}
 
+<div class="table-container-wrapper">
 <table class="language-java table table-bordered">
 <tr>
   <th>Field</th>
@@ -362,11 +363,13 @@ When executing your pipeline with the Spark Runner, you should consider the foll
   <td>false</td>
 </tr>
 </table>
+</div>
 
 {{< paragraph class="language-java" >}}
 <br><b>For Structured Streaming based runner:</b><br>
 {{< /paragraph >}}
 
+<div class="table-container-wrapper">
 <table class="language-java table table-bordered">
 <tr>
   <th>Field</th>
@@ -409,7 +412,9 @@ When executing your pipeline with the Spark Runner, you should consider the foll
   <td>true</td>
 </tr>
 </table>
+</div>
 
+<div class="table-container-wrapper">
 <table class="language-py table table-bordered">
 <tr>
   <th>Field</th>
@@ -427,6 +432,7 @@ When executing your pipeline with the Spark Runner, you should consider the foll
   <td>Set to match your job service endpoint (localhost:8099 by default)</td>
 </tr>
 </table>
+</div>
 
 ## Additional notes
 
@@ -481,5 +487,48 @@ Provided SparkContext and StreamingListeners are not supported on the Spark port
 {{< /paragraph >}}
 
 ### Kubernetes
+#### Submit beam job without job server
+To submit a beam job directly on spark kubernetes cluster without spinning up an extra job server, you can do:
+```
+spark-submit --master MASTER_URL \
+  --conf spark.kubernetes.driver.podTemplateFile=driver_pod_template.yaml \
+  --conf spark.kubernetes.executor.podTemplateFile=executor_pod_template.yaml \
+  --class org.apache.beam.runners.spark.SparkPipelineRunner \
+  --conf spark.kubernetes.container.image=apache/spark:v3.3.2 \
+  ./wc_job.jar
+```
+Similar to run the beam job on Dataproc, you can bundle the job jar like below. The example use the `PROCESS` type of [SDK harness](https://beam.apache.org/documentation/runtime/sdk-harness-config/) to execute the job by processes.
+```
+python -m beam_example_wc \
+    --runner=SparkRunner \
+    --output_executable_path=./wc_job.jar \
+    --environment_type=PROCESS \
+    --environment_config='{\"command\": \"/opt/apache/beam/boot\"}' \
+    --spark_version=3
+```
 
-An [example](https://github.com/cometta/python-apache-beam-spark) of configuring Spark to run Apache beam job
+And below is an example of kubernetes executor pod template, the `initContainer` is required to download the beam SDK harness to run the beam pipelines.
+```
+spec:
+  containers:
+    - name: spark-kubernetes-executor
+      volumeMounts:
+      - name: beam-data
+        mountPath: /opt/apache/beam/
+  initContainers:
+  - name: init-beam
+    image: apache/beam_python3.7_sdk
+    command:
+    - cp
+    - /opt/apache/beam/boot
+    - /init-container/data/boot
+    volumeMounts:
+    - name: beam-data
+      mountPath: /init-container/data
+  volumes:
+  - name: beam-data
+    emptyDir: {}
+```
+
+#### Submit beam job with job server
+An [example](https://github.com/cometta/python-apache-beam-spark) of configuring Spark to run Apache beam job with a job server.

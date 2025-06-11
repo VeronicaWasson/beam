@@ -25,10 +25,12 @@ import {
 } from "./transform";
 import { flatten } from "./flatten";
 import { PCollection } from "../pvalue";
-import { PValue, P } from "../pvalue";
+import { P } from "../pvalue";
 import { Coder } from "../coders/coders";
 import * as internal from "./internal";
 import { count } from "./combiners";
+import { requireForSerialization } from "../serialization";
+import { packageName } from "../utils/packageJson";
 
 // TODO: (API) Consider groupBy as a top-level method on PCollections.
 // TBD how to best express the combiners.
@@ -37,6 +39,16 @@ import { count } from "./combiners";
 //               chain-able combining() method. We'd want the intermediates to
 //               still be usable, but lazy.
 
+/**
+ * An interface for performing possibly distributed, commutative, associative
+ * combines (such as sum) to a set of values
+ * (e.g. in `groupBy(...).combining(...)`.
+ *
+ * Several implementations (such as summation) are provided in the combiners
+ * module.
+ *
+ * See also https://beam.apache.org/documentation/programming-guide/#transforms
+ */
 export interface CombineFn<I, A, O> {
   createAccumulator: () => A;
   addInput: (A, I) => A;
@@ -70,7 +82,7 @@ export class GroupBy<T, K> extends PTransformClass<
    */
   constructor(
     key: string | string[] | ((element: T) => K),
-    keyName: string | undefined = undefined
+    keyName: string | undefined = undefined,
   ) {
     super();
     [this.keyFn, this.keyNames] = extractFnAndName(key, keyName || "key");
@@ -78,6 +90,7 @@ export class GroupBy<T, K> extends PTransformClass<
     this.keyName = typeof this.keyNames === "string" ? this.keyNames : "key";
   }
 
+  /** @internal */
   expand(input: PCollection<T>): PCollection<KV<K, Iterable<T>>> {
     const keyFn = this.keyFn;
     return input
@@ -88,26 +101,34 @@ export class GroupBy<T, K> extends PTransformClass<
   combining<I>(
     expr: string | ((element: T) => I),
     combiner: Combiner<I>,
-    resultName: string
+    resultName: string,
   ) {
     return withName(
       extractName(this),
       new GroupByAndCombine(this.keyFn, this.keyNames, []).combining(
         expr,
         combiner,
-        resultName
-      )
+        resultName,
+      ),
     );
   }
 }
 
+/**
+ * Returns a PTransform that takes a PCollection of elements, and returns a
+ * PCollection of elements grouped by a field, multiple fields, an expression
+ * that is used as the grouping key.
+ *
+ * Various fields may be further aggregated with `CombineFns` by invoking
+ * `groupBy(...).combining(...)`.
+ */
 export function groupBy<T, K>(
   key: string | string[] | ((element: T) => K),
-  keyName: string | undefined = undefined
+  keyName: string | undefined = undefined,
 ): GroupBy<T, K> {
   return withName(
     `groupBy(${extractName(key)}`,
-    new GroupBy<T, K>(key, keyName)
+    new GroupBy<T, K>(key, keyName),
   );
 }
 
@@ -126,6 +147,7 @@ export class GroupGlobally<T> extends PTransformClass<
     super();
   }
 
+  /** @internal */
   expand(input) {
     return input.apply(new GroupBy((_) => null)).map((kv) => kv[1]);
   }
@@ -133,19 +155,29 @@ export class GroupGlobally<T> extends PTransformClass<
   combining<I>(
     expr: string | ((element: T) => I),
     combiner: Combiner<I>,
-    resultName: string
+    resultName: string,
   ) {
     return withName(
       extractName(this),
       new GroupByAndCombine((_) => null, undefined, []).combining(
         expr,
         combiner,
-        resultName
-      )
+        resultName,
+      ),
     );
   }
 }
 
+/**
+ * Returns a PTransform grouping all elements of the input PCollection together.
+ *
+ * This is generally used with one or more combining specifications, as one
+ * loses parallelization benefits in bringing all elements of a distributed
+ * PCollection together on a single machine.
+ *
+ * Various fields may be further aggregated with `CombineFns` by invoking
+ * `groupGlobally(...).combining(...)`.
+ */
 export function groupGlobally<T>() {
   return new GroupGlobally<T>();
 }
@@ -160,7 +192,7 @@ class GroupByAndCombine<T, O> extends PTransformClass<
   constructor(
     keyFn: (element: T) => any,
     keyNames: string | string[] | undefined,
-    combiners: CombineSpec<T, any, any>[]
+    combiners: CombineSpec<T, any, any>[],
   ) {
     super();
     this.keyFn = keyFn;
@@ -172,7 +204,7 @@ class GroupByAndCombine<T, O> extends PTransformClass<
   combining<I, O>(
     expr: string | ((element: T) => I),
     combiner: Combiner<I>,
-    resultName: string // TODO: (Unique names) Optionally derive from expr and combineFn?
+    resultName: string, // TODO: (Unique names) Optionally derive from expr and combineFn?
   ) {
     return withName(
       extractName(this),
@@ -185,8 +217,8 @@ class GroupByAndCombine<T, O> extends PTransformClass<
             combineFn: toCombineFn(combiner),
             resultName: resultName,
           },
-        ])
-      )
+        ]),
+      ),
     );
   }
 
@@ -201,8 +233,8 @@ class GroupByAndCombine<T, O> extends PTransformClass<
       })
       .apply(
         internal.combinePerKey(
-          multiCombineFn(this_.combiners.map((c) => c.combineFn))
-        )
+          multiCombineFn(this_.combiners.map((c) => c.combineFn)),
+        ),
       )
       .map(function constructResult(kv) {
         const result = {};
@@ -229,7 +261,7 @@ export function countPerElement<T>(): PTransform<
 > {
   return withName(
     "countPerElement",
-    groupBy((e) => e, "element").combining((e) => e, count, "count")
+    groupBy((e) => e, "element").combining((e) => e, count, "count"),
   );
 }
 
@@ -240,7 +272,7 @@ export function countGlobally<T>(): PTransform<
   return withName("countGlobally", (input) =>
     input
       .apply(new GroupGlobally().combining((e) => e, count, "count"))
-      .map((o) => o.count)
+      .map((o) => o.count),
   );
 }
 
@@ -258,8 +290,12 @@ interface CombineSpec<T, I, O> {
   resultName: string;
 }
 
-function binaryCombineFn<I>(
-  combiner: (a: I, b: I) => I
+/**
+ * Creates a CombineFn<I, ..., I> out of a binary operator (which must be
+ * commutative and associative).
+ */
+export function binaryCombineFn<I>(
+  combiner: (a: I, b: I) => I,
 ): CombineFn<I, I | undefined, I> {
   return {
     createAccumulator: () => undefined,
@@ -273,7 +309,7 @@ function binaryCombineFn<I>(
 // TODO: (Typescript) Is there a way to indicate type parameters match the above?
 function multiCombineFn(
   combineFns: CombineFn<any, any, any>[],
-  batchSize: number = 100
+  batchSize: number = 100,
 ): CombineFn<any[], any[], any[]> {
   return {
     createAccumulator: () => combineFns.map((fn) => fn.createAccumulator()),
@@ -319,7 +355,7 @@ function multiCombineFn(
 // TODO: Consider adding valueFn(s) rather than using the full value.
 export function coGroupBy<T, K>(
   key: string | string[] | ((element: T) => K),
-  keyName: string | undefined = undefined
+  keyName: string | undefined = undefined,
 ): PTransform<
   { [key: string]: PCollection<any> },
   PCollection<{ key: K; values: { [key: string]: Iterable<any> } }>
@@ -336,22 +372,22 @@ export function coGroupBy<T, K>(
             key: keyFn(element),
             tag,
             element,
-          }))
-        )
+          })),
+        ),
       );
       return P(tagged)
         .apply(flatten())
         .apply(groupBy("key"))
         .map(function groupValues({ key, value }) {
           const groupedValues: { [key: string]: any[] } = Object.fromEntries(
-            tags.map((tag) => [tag, []])
+            tags.map((tag) => [tag, []]),
           );
           for (const { tag, element } of value) {
             groupedValues[tag].push(element);
           }
           return { key, values: groupedValues };
         });
-    }
+    },
   );
 }
 
@@ -364,7 +400,7 @@ export function coGroupBy<T, K>(
 // ): [(element: T) => K, P | P[]] {
 function extractFnAndName<T, K>(
   extractor: string | string[] | ((T) => K),
-  defaultName: string
+  defaultName: string,
 ): [(T) => K, string | string[]] {
   if (
     typeof extractor === "string" ||
@@ -386,8 +422,7 @@ function extractFn<T, K>(extractor: string | string[] | ((T) => K)) {
   return extractFnAndName(extractor, undefined!)[0];
 }
 
-import { requireForSerialization } from "../serialization";
-requireForSerialization("apache-beam/transforms/pardo", exports);
-requireForSerialization("apache-beam/transforms/pardo", {
+requireForSerialization(`${packageName}/transforms/group_and_combine`, exports);
+requireForSerialization(`${packageName}/transforms/group_and_combine`, {
   GroupByAndCombine: GroupByAndCombine,
 });

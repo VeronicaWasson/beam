@@ -15,8 +15,6 @@
 # limitations under the License.
 #
 
-# cython: language_level=3
-
 """Compiled version of the Stream objects used by CoderImpl.
 
 For internal use only; no backwards-compatibility guarantees.
@@ -59,6 +57,12 @@ cdef class OutputStream(object):
   cpdef write_var_int64(self, libc.stdint.int64_t signed_v):
     """Encode a long using variable-length encoding to a stream."""
     cdef libc.stdint.uint64_t v = signed_v
+    # Inline common case.
+    if v <= 0x7F and self.pos < self.buffer_size - 1:
+      self.data[self.pos] = v
+      self.pos += 1
+      return
+
     cdef long bits
     while True:
       bits = v & 0x7F
@@ -68,6 +72,12 @@ cdef class OutputStream(object):
       self.write_byte(<unsigned char>bits)
       if not v:
         break
+
+  cpdef write_var_int32(self, libc.stdint.int64_t signed_v):
+    """Encode an int using variable-length encoding to a stream."""
+    # for backward compatibility, input type is int64_t thus tolerates overflow
+    cdef libc.stdint.int64_t v = signed_v & 0xFFFFFFFF
+    self.write_var_int64(v)
 
   cpdef write_bigendian_int64(self, libc.stdint.int64_t signed_v):
     self.write_bigendian_uint64(signed_v)
@@ -87,7 +97,7 @@ cdef class OutputStream(object):
 
   cpdef write_bigendian_int32(self, libc.stdint.int32_t signed_v):
     cdef libc.stdint.uint32_t v = signed_v
-    if  self.buffer_size < self.pos + 4:
+    if self.buffer_size < self.pos + 4:
       self.extend(4)
     self.data[self.pos    ] = <unsigned char>(v >> 24)
     self.data[self.pos + 1] = <unsigned char>(v >> 16)
@@ -95,8 +105,19 @@ cdef class OutputStream(object):
     self.data[self.pos + 3] = <unsigned char>(v      )
     self.pos += 4
 
+  cpdef write_bigendian_int16(self, libc.stdint.int16_t signed_v):
+    cdef libc.stdint.uint16_t v = signed_v
+    if  self.buffer_size < self.pos + 2:
+      self.extend(2)
+    self.data[self.pos    ] = <unsigned char>(v >>  8)
+    self.data[self.pos + 1] = <unsigned char>(v      )
+    self.pos += 2
+
   cpdef write_bigendian_double(self, double d):
     self.write_bigendian_int64((<libc.stdint.int64_t*><char*>&d)[0])
+
+  cpdef write_bigendian_float(self, float f):
+    self.write_bigendian_int32((<libc.stdint.int32_t*><char*>&f)[0])
 
   cpdef bytes get(self):
     return self.data[:self.pos]
@@ -133,6 +154,15 @@ cdef class ByteCountingOutputStream(OutputStream):
       self.write_var_int64(blen)
     self.count += blen
 
+  cpdef write_var_int64(self, libc.stdint.int64_t signed_v):
+    self.count += get_varint_size(signed_v)
+
+  cpdef write_var_int32(self, libc.stdint.int64_t signed_v):
+    if signed_v < 0:
+      self.count += 5
+    else:
+      self.count += get_varint_size(signed_v)
+
   cpdef write_byte(self, unsigned char _):
     self.count += 1
 
@@ -144,6 +174,9 @@ cdef class ByteCountingOutputStream(OutputStream):
 
   cpdef write_bigendian_int32(self, libc.stdint.int32_t _):
     self.count += 4
+
+  cpdef write_bigendian_int16(self, libc.stdint.int16_t _):
+    self.count += 2
 
   cpdef size_t get_count(self):
     return self.count
@@ -180,15 +213,16 @@ cdef class InputStream(object):
 
   cpdef libc.stdint.int64_t read_var_int64(self) except? -1:
     """Decode a variable-length encoded long from a stream."""
-    cdef long byte
+    # Inline common case.
+    cdef long byte = <unsigned char> self.allc[self.pos]
+    self.pos += 1
+    if byte <= 0x7F:
+      return byte
+
     cdef libc.stdint.int64_t bits
     cdef long shift = 0
     cdef libc.stdint.int64_t result = 0
     while True:
-      byte = self.read_byte()
-      if byte < 0:
-        raise RuntimeError('VarInt not terminated.')
-
       bits = byte & 0x7F
       if (shift >= sizeof(libc.stdint.int64_t) * 8 or
           (shift >= (sizeof(libc.stdint.int64_t) * 8 - 1) and bits > 1)):
@@ -197,7 +231,16 @@ cdef class InputStream(object):
       shift += 7
       if not (byte & 0x80):
         break
+      byte = self.read_byte()
+      if byte < 0:
+        raise RuntimeError('VarInt not terminated.')
+
     return result
+
+  cpdef libc.stdint.int32_t read_var_int32(self) except? -1:
+    """Decode a variable-length encoded int32 from a stream."""
+    cdef libc.stdint.int64_t v = self.read_var_int64()
+    return <libc.stdint.int32_t>(v);
 
   cpdef libc.stdint.int64_t read_bigendian_int64(self) except? -1:
     return self.read_bigendian_uint64()
@@ -220,9 +263,18 @@ cdef class InputStream(object):
       | <libc.stdint.uint32_t><unsigned char>self.allc[self.pos - 3] << 16
       | <libc.stdint.uint32_t><unsigned char>self.allc[self.pos - 4] << 24)
 
+  cpdef libc.stdint.int16_t read_bigendian_int16(self) except? -1:
+    self.pos += 2
+    return (<unsigned char>self.allc[self.pos - 1]
+      | <libc.stdint.uint16_t><unsigned char>self.allc[self.pos - 2] <<  8)
+
   cpdef double read_bigendian_double(self) except? -1:
     cdef libc.stdint.int64_t as_long = self.read_bigendian_int64()
     return (<double*><char*>&as_long)[0]
+
+  cpdef float read_bigendian_float(self) except? -1:
+    cdef libc.stdint.int32_t as_int = self.read_bigendian_int32()
+    return (<float*><char*>&as_int)[0]
 
 cpdef libc.stdint.int64_t get_varint_size(libc.stdint.int64_t value):
   """Returns the size of the given integer value when encode as a VarInt."""

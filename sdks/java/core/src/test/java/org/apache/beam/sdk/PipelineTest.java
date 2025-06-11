@@ -66,8 +66,8 @@ import org.apache.beam.sdk.values.PInput;
 import org.apache.beam.sdk.values.POutput;
 import org.apache.beam.sdk.values.TaggedPValue;
 import org.apache.beam.sdk.values.TupleTag;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 import org.hamcrest.BaseMatcher;
 import org.hamcrest.Description;
 import org.hamcrest.Matchers;
@@ -75,6 +75,7 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 import org.junit.rules.ExpectedException;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
@@ -88,6 +89,7 @@ public class PipelineTest {
   @Rule public final TestPipeline pipeline = TestPipeline.create();
   @Rule public ExpectedLogs logged = ExpectedLogs.none(Pipeline.class);
   @Rule public ExpectedException thrown = ExpectedException.none();
+  @Rule public transient Timeout globalTimeout = Timeout.seconds(1200);
 
   // Mock class that throws a user code exception during the call to
   // Pipeline.run().
@@ -416,7 +418,7 @@ public class PipelineTest {
   }
 
   /**
-   * Tests that {@link Pipeline#replaceAll(List)} throws when one of the PTransformOverride still
+   * Tests that {@link Pipeline#replaceAll(List)} succeeds when one of the PTransformOverride still
    * matches.
    */
   @Test
@@ -424,8 +426,7 @@ public class PipelineTest {
     pipeline.enableAbandonedNodeEnforcement(false);
     pipeline.apply(GenerateSequence.from(0));
 
-    // The order is such that the output of the second will match the first, which is not permitted
-    thrown.expect(IllegalStateException.class);
+    // The order is such that the output of the second will match the first, which is permitted.
     pipeline.replaceAll(
         ImmutableList.of(
             PTransformOverride.of(

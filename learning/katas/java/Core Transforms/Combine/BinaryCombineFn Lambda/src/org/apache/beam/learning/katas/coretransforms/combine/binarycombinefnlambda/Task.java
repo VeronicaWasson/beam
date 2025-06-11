@@ -22,10 +22,14 @@ package org.apache.beam.learning.katas.coretransforms.combine.binarycombinefnlam
 //   name: BinaryCombineFnLambda
 //   description: Task from katas to implement the summation of BigIntegers using lambda.
 //   multifile: false
-//   context_line: 39
+//   context_line: 45
 //   categories:
 //     - Combiners
 //     - Core Transforms
+//   complexity: BASIC
+//   tags:
+//     - transforms
+//     - numbers
 
 import java.math.BigInteger;
 import org.apache.beam.learning.katas.util.Log;

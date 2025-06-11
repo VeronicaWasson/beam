@@ -17,6 +17,9 @@
  */
 package org.apache.beam.sdk.io.gcp.pubsub;
 
+import static org.apache.beam.sdk.io.gcp.pubsub.PubsubIO.ENABLE_CUSTOM_PUBSUB_SINK;
+import static org.apache.beam.sdk.io.gcp.pubsub.PubsubIO.ENABLE_CUSTOM_PUBSUB_SOURCE;
+
 import com.google.auto.service.AutoService;
 import java.util.Collections;
 import java.util.Map;
@@ -24,22 +27,24 @@ import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.model.pipeline.v1.RunnerApi.FunctionSpec;
 import org.apache.beam.model.pipeline.v1.RunnerApi.PubSubReadPayload;
 import org.apache.beam.model.pipeline.v1.RunnerApi.PubSubWritePayload;
-import org.apache.beam.runners.core.construction.PTransformTranslation;
-import org.apache.beam.runners.core.construction.PTransformTranslation.TransformPayloadTranslator;
-import org.apache.beam.runners.core.construction.SdkComponents;
-import org.apache.beam.runners.core.construction.TransformPayloadTranslatorRegistrar;
 import org.apache.beam.sdk.io.Read;
 import org.apache.beam.sdk.io.Read.Unbounded;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubClient.SubscriptionPath;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubClient.TopicPath;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubUnboundedSource.PubsubSource;
+import org.apache.beam.sdk.options.ExperimentalOptions;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.options.ValueProvider.NestedValueProvider;
 import org.apache.beam.sdk.runners.AppliedPTransform;
 import org.apache.beam.sdk.transforms.PTransform;
+import org.apache.beam.sdk.util.Preconditions;
+import org.apache.beam.sdk.util.construction.PTransformTranslation;
+import org.apache.beam.sdk.util.construction.PTransformTranslation.TransformPayloadTranslator;
+import org.apache.beam.sdk.util.construction.SdkComponents;
+import org.apache.beam.sdk.util.construction.TransformPayloadTranslatorRegistrar;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 
 @SuppressWarnings({
-  "rawtypes", // TODO(https://github.com/apache/beam/issues/20447)
   "nullness" // TODO(https://github.com/apache/beam/issues/20497)
 })
 /**
@@ -51,16 +56,17 @@ public class PubSubPayloadTranslation {
       implements TransformPayloadTranslator<Read.Unbounded<?>> {
 
     @Override
-    public String getUrn(Read.Unbounded<?> transform) {
-      if (!(transform.getSource() instanceof PubsubUnboundedSource.PubsubSource)) {
-        return null;
-      }
+    public String getUrn() {
       return PTransformTranslation.PUBSUB_READ;
     }
 
     @Override
     public RunnerApi.FunctionSpec translate(
         AppliedPTransform<?, ?, Unbounded<?>> transform, SdkComponents components) {
+      if (ExperimentalOptions.hasExperiment(
+          transform.getPipeline().getOptions(), ENABLE_CUSTOM_PUBSUB_SOURCE)) {
+        return null;
+      }
       if (!(transform.getTransform().getSource() instanceof PubsubUnboundedSource.PubsubSource)) {
         return null;
       }
@@ -104,9 +110,8 @@ public class PubSubPayloadTranslation {
 
   static class PubSubWritePayloadTranslator
       implements TransformPayloadTranslator<PubsubUnboundedSink.PubsubSink> {
-
     @Override
-    public String getUrn(PubsubUnboundedSink.PubsubSink transform) {
+    public String getUrn() {
       return PTransformTranslation.PUBSUB_WRITE;
     }
 
@@ -114,8 +119,13 @@ public class PubSubPayloadTranslation {
     public RunnerApi.FunctionSpec translate(
         AppliedPTransform<?, ?, PubsubUnboundedSink.PubsubSink> transform,
         SdkComponents components) {
+      if (ExperimentalOptions.hasExperiment(
+          transform.getPipeline().getOptions(), ENABLE_CUSTOM_PUBSUB_SINK)) {
+        return null;
+      }
       PubSubWritePayload.Builder payloadBuilder = PubSubWritePayload.newBuilder();
-      ValueProvider<TopicPath> topicProvider = transform.getTransform().outer.getTopicProvider();
+      ValueProvider<TopicPath> topicProvider =
+          Preconditions.checkStateNotNull(transform.getTransform().outer.getTopicProvider());
       if (topicProvider.isAccessible()) {
         payloadBuilder.setTopic(topicProvider.get().getFullPath());
       } else {
@@ -136,14 +146,48 @@ public class PubSubPayloadTranslation {
     }
   }
 
+  static class PubSubDynamicWritePayloadTranslator
+      implements TransformPayloadTranslator<PubsubUnboundedSink.PubsubDynamicSink> {
+    @Override
+    public String getUrn() {
+      return PTransformTranslation.PUBSUB_WRITE_DYNAMIC;
+    }
+
+    @Override
+    public RunnerApi.FunctionSpec translate(
+        AppliedPTransform<?, ?, PubsubUnboundedSink.PubsubDynamicSink> transform,
+        SdkComponents components) {
+      if (ExperimentalOptions.hasExperiment(
+          transform.getPipeline().getOptions(), ENABLE_CUSTOM_PUBSUB_SINK)) {
+        return null;
+      }
+      PubSubWritePayload.Builder payloadBuilder = PubSubWritePayload.newBuilder();
+      if (transform.getTransform().outer.getTimestampAttribute() != null) {
+        payloadBuilder.setTimestampAttribute(
+            transform.getTransform().outer.getTimestampAttribute());
+      }
+      if (transform.getTransform().outer.getIdAttribute() != null) {
+        payloadBuilder.setIdAttribute(transform.getTransform().outer.getIdAttribute());
+      }
+      return FunctionSpec.newBuilder()
+          .setUrn(getUrn(transform.getTransform()))
+          .setPayload(payloadBuilder.build().toByteString())
+          .build();
+    }
+  }
+
   @AutoService(TransformPayloadTranslatorRegistrar.class)
   public static class WriteRegistrar implements TransformPayloadTranslatorRegistrar {
 
     @Override
+    @SuppressWarnings("rawtypes")
     public Map<? extends Class<? extends PTransform>, ? extends TransformPayloadTranslator>
         getTransformPayloadTranslators() {
-      return Collections.singletonMap(
-          PubsubUnboundedSink.PubsubSink.class, new PubSubWritePayloadTranslator());
+      return ImmutableMap.of(
+          PubsubUnboundedSink.PubsubSink.class,
+          new PubSubWritePayloadTranslator(),
+          PubsubUnboundedSink.PubsubDynamicSink.class,
+          new PubSubDynamicWritePayloadTranslator());
     }
   }
 
@@ -151,6 +195,7 @@ public class PubSubPayloadTranslation {
   public static class ReadRegistrar implements TransformPayloadTranslatorRegistrar {
 
     @Override
+    @SuppressWarnings("rawtypes")
     public Map<? extends Class<? extends PTransform>, ? extends TransformPayloadTranslator>
         getTransformPayloadTranslators() {
       return Collections.singletonMap(Read.Unbounded.class, new PubSubReadPayloadTranslator());

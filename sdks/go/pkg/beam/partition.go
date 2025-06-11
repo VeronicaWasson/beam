@@ -39,8 +39,21 @@ var (
 //
 // A PartitionFn has the signature `func(T) int.`
 //
+//	func lenToTen(s string) int {
+//		if len(s) > 9 {
+//			return 10
+//		}
+//		return len(s)
+//	}
+//
+//	// Partition functions must be registered with Beam, and must not be closures.
+//	func init() { register.Function1x1(lenToTen) }
+//
+//	// The number of partitions goes up to 11 since we can return 0 through 10
+//	wordsByLength := beam.Partition(s, 11, lenToTen, inputStrings)
+//
 // T is permitted to be a KV.
-func Partition(s Scope, n int, fn interface{}, col PCollection) []PCollection {
+func Partition(s Scope, n int, fn any, col PCollection) []PCollection {
 	s = s.Scope(fmt.Sprintf("Partition(%v)", n))
 
 	if n < 1 {
@@ -86,7 +99,7 @@ type partitionData struct {
 
 // partitionFn is a Func with the following underlying type:
 //
-//     fn : (EventTime, T, emit_1, emit_2, ..., emit_N) -> error
+//	fn : (EventTime, T, emit_1, emit_2, ..., emit_N) -> error
 //
 // where emit_i : (EventTime, T) -> () and N is given by the encoded
 // partitionData value. For any input element, it invokes to the
@@ -106,25 +119,25 @@ func (f *partitionFn) Type() reflect.Type {
 	return f.t
 }
 
-func (f *partitionFn) Call(args []interface{}) []interface{} {
+func (f *partitionFn) Call(args []any) []any {
 	timestamp := args[0]
 	value := args[1]
 
 	n := f.fn.Call1x1(value).(int)
 	if n < 0 || n >= f.n {
-		return []interface{}{errors.Errorf("partitionFn(%v) = %v, want [0,%v)", value, n, f.n)}
+		return []any{errors.Errorf("partitionFn(%v) = %v, want [0,%v)", value, n, f.n)}
 	}
 
 	emit := args[n+2]
 	reflectx.MakeFunc2x0(emit).Call2x0(timestamp, value)
 
 	var err error
-	return []interface{}{err}
+	return []any{err}
 }
 
 // partitionFnKV is a Func with the following underlying type:
 //
-//     fn : (EventTime, K, V, emit_1, emit_2, ..., emit_N) -> error
+//	fn : (EventTime, K, V, emit_1, emit_2, ..., emit_N) -> error
 //
 // where emit_i : (EventTime, K, V) -> () and N is given by the encoded
 // partitionData value. For any input element, it invokes to the
@@ -144,21 +157,21 @@ func (f *partitionFnKV) Type() reflect.Type {
 	return f.t
 }
 
-func (f *partitionFnKV) Call(args []interface{}) []interface{} {
+func (f *partitionFnKV) Call(args []any) []any {
 	timestamp := args[0]
 	key := args[1]
 	value := args[2]
 
 	n := f.fnKV.Call2x1(key, value).(int)
 	if n < 0 || n >= f.n {
-		return []interface{}{errors.Errorf("partitionFn(%v) = %v, want [0,%v)", value, n, f.n)}
+		return []any{errors.Errorf("partitionFn(%v) = %v, want [0,%v)", value, n, f.n)}
 	}
 
 	emit := args[n+3]
 	reflectx.MakeFunc3x0(emit).Call3x0(timestamp, key, value)
 
 	var err error
-	return []interface{}{err}
+	return []any{err}
 }
 
 func makePartitionFn(name string, t reflect.Type, enc []byte) reflectx.Func {

@@ -17,15 +17,15 @@
  */
 package org.apache.beam.sdk.io.aws2.kinesis;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists.newArrayList;
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists.partition;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists.newArrayList;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists.partition;
 
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.Iterator;
 import java.util.List;
 import org.apache.beam.sdk.io.UnboundedSource;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 
 /**
  * Checkpoint representing a total progress in a set of shards in single stream. The set of shards
@@ -34,6 +34,16 @@ import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Immutabl
  */
 class KinesisReaderCheckpoint
     implements Iterable<ShardCheckpoint>, UnboundedSource.CheckpointMark, Serializable {
+
+  /**
+   * Extracted from org.apache.beam:beam-sdks-java-io-amazon-web-services2:2.46.0.
+   *
+   * <pre>{@code
+   * serialver -classpath "..<dependencies dir>/*" \
+   *     org.apache.beam.sdk.io.aws2.kinesis.KinesisReaderCheckpoint
+   * }</pre>
+   */
+  private static final long serialVersionUID = -6788209457261206071L;
 
   private final List<ShardCheckpoint> shardCheckpoints;
 

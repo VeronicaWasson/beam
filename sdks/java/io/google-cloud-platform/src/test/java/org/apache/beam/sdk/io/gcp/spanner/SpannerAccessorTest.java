@@ -17,11 +17,14 @@
  */
 package org.apache.beam.sdk.io.gcp.spanner;
 
+import static org.junit.Assert.assertEquals;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import com.google.cloud.spanner.DatabaseId;
+import com.google.cloud.spanner.SpannerOptions;
+import org.apache.beam.sdk.extensions.gcp.auth.TestCredential;
 import org.apache.beam.sdk.options.ValueProvider.StaticValueProvider;
 import org.junit.Before;
 import org.junit.Test;
@@ -98,5 +101,154 @@ public class SpannerAccessorTest {
     verify(serviceFactory.mockSpanner(), times(1))
         .getDatabaseClient(eq(DatabaseId.of("project", "test2", "test2")));
     verify(serviceFactory.mockSpanner(), times(2)).close();
+  }
+
+  @Test
+  public void testCreateWithValidDatabaseRole() {
+    SpannerConfig config1 =
+        SpannerConfig.create()
+            .toBuilder()
+            .setServiceFactory(serviceFactory)
+            .setProjectId(StaticValueProvider.of("project"))
+            .setInstanceId(StaticValueProvider.of("test1"))
+            .setDatabaseId(StaticValueProvider.of("test1"))
+            .setDatabaseRole(StaticValueProvider.of("test-role"))
+            .build();
+
+    SpannerAccessor acc1 = SpannerAccessor.getOrCreate(config1);
+    acc1.close();
+
+    // getDatabaseClient and close() only called once.
+    verify(serviceFactory.mockSpanner(), times(1))
+        .getDatabaseClient(DatabaseId.of("project", "test1", "test1"));
+    verify(serviceFactory.mockSpanner(), times(1)).close();
+  }
+
+  @Test
+  public void testCreateWithEmptyDatabaseRole() {
+    SpannerConfig config1 =
+        SpannerConfig.create()
+            .toBuilder()
+            .setServiceFactory(serviceFactory)
+            .setProjectId(StaticValueProvider.of("project"))
+            .setInstanceId(StaticValueProvider.of("test1"))
+            .setDatabaseId(StaticValueProvider.of("test1"))
+            .setDatabaseRole(StaticValueProvider.of(""))
+            .build();
+
+    SpannerAccessor acc1 = SpannerAccessor.getOrCreate(config1);
+    acc1.close();
+
+    // getDatabaseClient and close() only called once.
+    verify(serviceFactory.mockSpanner(), times(1))
+        .getDatabaseClient(DatabaseId.of("project", "test1", "test1"));
+    verify(serviceFactory.mockSpanner(), times(1)).close();
+  }
+
+  @Test
+  public void testBuildSpannerOptionsWithCredential() {
+    TestCredential testCredential = new TestCredential();
+    SpannerConfig config1 =
+        SpannerConfig.create()
+            .toBuilder()
+            .setServiceFactory(serviceFactory)
+            .setProjectId(StaticValueProvider.of("project"))
+            .setInstanceId(StaticValueProvider.of("test-instance"))
+            .setDatabaseId(StaticValueProvider.of("test-db"))
+            .setDatabaseRole(StaticValueProvider.of("test-role"))
+            .setCredentials(StaticValueProvider.of(testCredential))
+            .build();
+
+    SpannerOptions options = SpannerAccessor.buildSpannerOptions(config1);
+    assertEquals("project", options.getProjectId());
+    assertEquals("test-role", options.getDatabaseRole());
+    assertEquals(testCredential, options.getCredentials());
+  }
+
+  private static final String DEFAULT_HOST = "https://batch-spanner.googleapis.com/";
+
+  @Test
+  public void testBuildSpannerOptionsWithNoHost() {
+    SpannerConfig config1 =
+        SpannerConfig.create()
+            .toBuilder()
+            .setServiceFactory(serviceFactory)
+            .setProjectId(StaticValueProvider.of("project"))
+            .setInstanceId(StaticValueProvider.of("test1"))
+            .setDatabaseId(StaticValueProvider.of("test1"))
+            .build();
+
+    assertEquals(DEFAULT_HOST, config1.getHostValue());
+    SpannerOptions options = SpannerAccessor.buildSpannerOptions(config1);
+    assertEquals(DEFAULT_HOST, options.getHost());
+  }
+
+  @Test
+  public void testBuildSpannerOptionsWithNullHost() {
+    SpannerConfig config1 =
+        SpannerConfig.create()
+            .toBuilder()
+            .setServiceFactory(serviceFactory)
+            .setHost((StaticValueProvider<String>) null)
+            .setProjectId(StaticValueProvider.of("project"))
+            .setInstanceId(StaticValueProvider.of("test1"))
+            .setDatabaseId(StaticValueProvider.of("test1"))
+            .build();
+
+    assertEquals(DEFAULT_HOST, config1.getHostValue());
+    SpannerOptions options = SpannerAccessor.buildSpannerOptions(config1);
+    assertEquals(DEFAULT_HOST, options.getHost());
+  }
+
+  @Test
+  public void testBuildSpannerOptionsWithNullHostValue() {
+    SpannerConfig config1 =
+        SpannerConfig.create()
+            .toBuilder()
+            .setServiceFactory(serviceFactory)
+            .setHost(StaticValueProvider.of((String) null))
+            .setProjectId(StaticValueProvider.of("project"))
+            .setInstanceId(StaticValueProvider.of("test1"))
+            .setDatabaseId(StaticValueProvider.of("test1"))
+            .build();
+
+    assertEquals(DEFAULT_HOST, config1.getHostValue());
+    SpannerOptions options = SpannerAccessor.buildSpannerOptions(config1);
+    assertEquals(DEFAULT_HOST, options.getHost());
+  }
+
+  @Test
+  public void testBuildSpannerOptionsWithEmptyHost() {
+    SpannerConfig config1 =
+        SpannerConfig.create()
+            .toBuilder()
+            .setServiceFactory(serviceFactory)
+            .setHost(StaticValueProvider.of(""))
+            .setProjectId(StaticValueProvider.of("project"))
+            .setInstanceId(StaticValueProvider.of("test1"))
+            .setDatabaseId(StaticValueProvider.of("test1"))
+            .build();
+
+    assertEquals(DEFAULT_HOST, config1.getHostValue());
+    SpannerOptions options = SpannerAccessor.buildSpannerOptions(config1);
+    assertEquals(DEFAULT_HOST, options.getHost());
+  }
+
+  @Test
+  public void testBuildSpannerOptionsWithCustomHost() {
+    final String host = "https://alternative-host.example.org";
+    SpannerConfig config1 =
+        SpannerConfig.create()
+            .toBuilder()
+            .setServiceFactory(serviceFactory)
+            .setHost(StaticValueProvider.of(host))
+            .setProjectId(StaticValueProvider.of("project"))
+            .setInstanceId(StaticValueProvider.of("test1"))
+            .setDatabaseId(StaticValueProvider.of("test1"))
+            .build();
+
+    assertEquals(host, config1.getHostValue());
+    SpannerOptions options = SpannerAccessor.buildSpannerOptions(config1);
+    assertEquals(host, options.getHost());
   }
 }

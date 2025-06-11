@@ -28,6 +28,9 @@ angoenka:
 anton:
   name: Anton Kedin
   email: anton@apache.org
+bvolpato:
+  name: Bruno Volpato
+  email: bvolpato@google.com
 ccy:
   name: Charles Chen
   email: ccy@apache.org
@@ -40,6 +43,9 @@ chamikara:
 damccorm:
   name: Danny McCormick
   email: dannymccormick@google.com
+davidcavazos:
+  name: David Cavazos
+  email: dcavazos@google.com
 davor:
   name: Davor Bonaci
   email: davor@apache.org
@@ -78,10 +84,21 @@ jamesmalone:
 jesseanderson:
   name: Jesse Anderson
   twitter: jessetanderson
+johncasey:
+  name: John Casey
+  email: johncasey@apache.org
 jphalip:
   name: Julien Phalip
   email: jphalip@google.com
   twitter: julienphalip
+jrmccluskey:
+  name: Jack R. McCluskey
+  email: jrmccluskey@apache.org
+  twitter: jrmccluskey
+kileysok:
+  name: Kiley Sok
+  email: kileysok@apache.org
+  twitter:
 klk:
   name: Kenneth Knowles
   email: kenn@apache.org
@@ -90,6 +107,9 @@ lkuligin:
   name: Leonid Kuligin
   email: kuligin@google.com
   twitter: lkulighin
+liferoad:
+  name: XQ Hu
+  email: xqhu@google.com
 markliu:
   name: Mark Liu
   email: markliu@apache.org
@@ -231,9 +251,42 @@ alexkosolapov:
 hermannb:
   name: Brittany Hermann
   email: hermannb@google.com
+svetakvsundhar:
+  name: Svetak Sundhar
+  email: svetaksundhar@google.com
+  twitter: svetaksundhar
 iht:
   name: Israel Herraiz
   email: ihr@google.com
+  twitter: herraiz
 yichi:
   name: Yichi Zhang
   email: yichi@apache.org
+sysede:
+  name: Danielle Syse
+  email: syse@google.com
+  linkedin: desyse
+riteshghorse:
+  name: Ritesh Ghorse
+  email: riteshghorse@apache.org
+yhu:
+  name: Yi Hu
+  email: yhu@apache.org
+pabs:
+  name: Pablo Rodriguez Defino
+  email: prodriguezdefino@gmail.com
+namitasharma:
+  name: Namita Sharma
+  email: namitasharma@google.com
+talat:
+  name: Talat Uyarer
+  email: talat@apache.org
+jkinard:
+  name: Jeff Kinard
+  email: jkinard@google.com
+jkim:
+  name: Jaehyeon Kim
+  email: dottami@gmail.com
+ffernandez92:
+  name: Ferran Fernandez
+  email: ffernandez.upc@gmail.com

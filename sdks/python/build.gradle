@@ -30,7 +30,8 @@ def buildPython = tasks.register("buildPython") {
     logger.info('Building Python Dependencies')
     exec {
       executable 'sh'
-      args '-c', ". ${envdir}/bin/activate && python setup.py build --build-base ${buildDir}"
+      // args '-c', ". ${envdir}/bin/activate && python setup.py build --build-base ${buildDir}"
+      args '-c', ". ${envdir}/bin/activate && pip install -e ."
     }
   }
 }
@@ -39,13 +40,14 @@ build.dependsOn tasks.named("buildPython")
 // Create a Python source distribution tarball.
 def tarball = "apache-beam.tar.gz"
 def sdist = tasks.register("sdist") {
+  description "Create a Python source distribution tarball"
   dependsOn setupVirtualenv
 
   doLast {
     // Build artifact
     exec {
       executable 'sh'
-      args '-c', ". ${envdir}/bin/activate && python setup.py -q sdist --formats zip,gztar --dist-dir ${buildDir}"
+      args '-c', ". ${envdir}/bin/activate && pip install -U build && python -m build --sdist --outdir=${buildDir}"
     }
 
     def collection = fileTree(buildDir){ include "**/*${project.sdk_version}*.tar.gz" exclude 'srcs/**'}
@@ -62,6 +64,161 @@ def sdist = tasks.register("sdist") {
 
 artifacts {
   distTarBall file: file("${buildDir}/${tarball}"), builtBy: sdist
+}
+
+tasks.register("generateExternalTransformsConfig") {
+  description "Discovers external transforms and regenerates the config at sdks/standard_expansion_services.yaml"
+
+  dependsOn buildPython
+  // Need to build all expansion services listed in sdks/standard_expansion_services.yaml
+  dependsOn ":sdks:java:io:google-cloud-platform:expansion-service:build"
+  dependsOn ":sdks:java:io:expansion-service:build"
+  // Keep this in-sync with pyproject.toml
+  def PyYaml = "'pyyaml>=3.12,<7.0.0'"
+
+  doLast {
+    exec {
+      executable 'sh'
+      args '-c', "pip install $PyYaml && " +
+              "python gen_xlang_wrappers.py --cleanup --generate-config-only"
+    }
+  }
+}
+
+tasks.register("generateManagedIOPage") {
+  description "Generages the Managed Connectors Beam page based on SchemaTransform metadata"
+
+  dependsOn buildPython
+  // Need to build all expansion services listed in apache_beam/transforms/managed.py
+  dependsOn ":sdks:java:io:google-cloud-platform:expansion-service:build"
+  dependsOn ":sdks:java:io:expansion-service:build"
+
+  doLast {
+    exec {
+      executable 'sh'
+      args '-c', "python gen_managed_doc.py"
+    }
+  }
+}
+
+tasks.register("generateYamlDocs") {
+  description "Generates the reference documentation for all YAML transforms."
+
+  dependsOn buildPython
+  // Need to build all expansion services referenced in apache_beam/yaml/*.*
+  // grep -oh 'sdk.*Jar' sdks/python/apache_beam/yaml/*.yaml | sort | uniq
+  dependsOn ":sdks:java:extensions:schemaio-expansion-service:shadowJar"
+  dependsOn ":sdks:java:extensions:sql:expansion-service:shadowJar"
+  dependsOn ":sdks:java:io:expansion-service:build"
+  dependsOn ":sdks:java:io:google-cloud-platform:expansion-service:build"
+  def extraPackages = "pyyaml markdown docstring_parser pandas pygments Jinja2 virtualenv-clone"
+
+  doLast {
+    exec {
+      executable 'sh'
+      args '-c', "${envdir}/bin/pip install $extraPackages && " +
+              "${envdir}/bin/python -m apache_beam.yaml.generate_yaml_docs --html_file=${buildDir}/yaml-ref.html --examples_file=${buildDir}/yaml-examples.html"
+    }
+  }
+  outputs.file "${buildDir}/yaml-ref.html"
+  outputs.file "${buildDir}/yaml-examples.html"
+}
+
+tasks.register("yamlIntegrationTests") {
+  description "Runs precommit integration tests for yaml pipelines."
+
+  dependsOn installGcpTest
+  // Need to build all expansion services referenced in apache_beam/yaml/*.*
+  // grep -oh 'sdk.*Jar' sdks/python/apache_beam/yaml/*.yaml | sort | uniq
+  dependsOn ":sdks:java:extensions:schemaio-expansion-service:shadowJar"
+  dependsOn ":sdks:java:extensions:sql:expansion-service:shadowJar"
+  dependsOn ":sdks:java:io:expansion-service:build"
+  dependsOn ":sdks:java:io:google-cloud-platform:expansion-service:build"
+
+  doLast {
+    exec {
+      executable 'sh'
+      args '-c', "${envdir}/bin/pytest -v apache_beam/yaml/integration_tests.py --deselect apache_beam/yaml/integration_tests.py::BigqueryTest::test_ReadFromBigQuery_ExternalJavaProvider_0"
+    }
+  }
+}
+
+tasks.register("postCommitYamlIntegrationTests") {
+  description "Runs postcommit integration tests for yaml pipelines."
+
+  dependsOn installGcpTest
+  // Need to build all expansion services referenced in apache_beam/yaml/*.*
+  // grep -oh 'sdk.*Jar' sdks/python/apache_beam/yaml/*.yaml | sort | uniq
+  dependsOn ":sdks:java:extensions:schemaio-expansion-service:shadowJar"
+  dependsOn ":sdks:java:extensions:sql:expansion-service:shadowJar"
+  dependsOn ":sdks:java:io:expansion-service:build"
+  dependsOn ":sdks:java:io:google-cloud-platform:expansion-service:build"
+
+  doLast {
+    exec {
+      executable 'sh'
+      args '-c', "${envdir}/bin/pytest -v apache_beam/yaml/integration_tests.py --deselect apache_beam/yaml/integration_tests.py::BigqueryTest::test_ReadFromBigQuery_ExternalJavaProvider_0 --test_files_dir='extended_tests'"
+    }
+  }
+}
+
+// Create Python wheels for given platform and Python version
+// build identifiers for cibuildwheel
+def platform_identifiers_map = [
+  linux: 'manylinux_*64*', // e.g. manylinux_x86_64, manylinux_aarch64
+  macos:'macosx_*64*',     // e.g. macosx_x86_64, macosx_arm64
+  windows: 'win_*64*',     // e.g. win_amd64, win_arm64
+]
+
+platform_identifiers_map.each { platform, idsuffix ->
+  def archs = 'auto'
+  // note: A fix for arm64 platform in gradle environment. For some reason the
+  // task fails with "Invalid archs option {<Architecture.arm64: 'arm64'>}."
+  // even though os.arch is 'aarch64'
+  // Running cibuildwheel command directly in shell it succeeded, however
+  if (platform == 'linux' && 'aarch64'.equalsIgnoreCase(System.getProperty("os.arch"))) {
+    archs = 'aarch64'
+  }
+  getVersionsAsList('python_versions').each { it ->
+    def pyversion = it.replace('.', '')
+
+    project.tasks.register("bdistPy${pyversion}${platform}") {
+      description "Build a Python wheel distribution for Py${pyversion} ${platform}"
+      dependsOn setupVirtualenv
+      // need sdist task to generate protos
+      dependsOn ':sdks:python:sdist'
+
+      // generated installable Python SDK package
+      doLast {
+        int maxRetries = 3
+        int retryCount = 0
+        // note(https://github.com/pypa/cibuildwheel/issues/1692): cibuildwheel appears to timeout occasionally.
+        while (retryCount < maxRetries) {
+          try {
+            exec {
+             environment CIBW_BUILD: "cp${pyversion}-${idsuffix}"
+             executable 'sh'
+             args '-c', ". ${envdir}/bin/activate && " +
+                 // note: sync cibuildwheel version with GitHub Action
+                 // .github/workflows/build_wheel.yml:build_wheels "Install cibuildwheel" step
+                 "pip install cibuildwheel==2.17.0 setuptools && " +
+                 "cibuildwheel --print-build-identifiers --platform ${platform} --archs ${archs} && " +
+                 "cibuildwheel --output-dir ${buildDir} --platform ${platform} --archs ${archs} "
+           }
+           break;
+         }
+         catch (Exception e) {
+            retryCount++
+            if (retryCount < maxRetries) {
+                println "cibuildwheel failed on attempt ${retryCount}. Will retry."
+            } else {
+                throw e
+            }
+         }
+        }
+      }
+    }
+  }
 }
 
 
@@ -87,11 +244,6 @@ def depSnapshot = tasks.register("depSnapshot") {
       args '-c', ". ${envdir}/bin/activate && pip freeze --local --all | grep -v \"pkg-resources\" > ${requirementsFile}"
     }
   }
-}
-
-tasks.register("dependencyUpdates") {
-  dependsOn ':dependencyUpdates'
-  dependsOn ':sdks:python:test-suites:tox:pycommon:dependency-check'
 }
 
 tasks.register("buildSnapshot") {

@@ -44,7 +44,131 @@ from typing import Tuple
 
 import dill
 
+from apache_beam.internal.code_object_pickler import get_normalized_path
+from apache_beam.internal.set_pickler import save_frozenset
+from apache_beam.internal.set_pickler import save_set
+
 settings = {'dill_byref': None}
+
+patch_save_code = sys.version_info >= (3, 10) and dill.__version__ == "0.3.1.1"
+
+if patch_save_code:
+  # The following function is based on 'save_code' from 'dill'
+  # Author: Mike McKerns (mmckerns @caltech and @uqfoundation)
+  # Copyright (c) 2008-2015 California Institute of Technology.
+  # Copyright (c) 2016-2023 The Uncertainty Quantification Foundation.
+  # License: 3-clause BSD.  The full license text is available at:
+  #  - https://github.com/uqfoundation/dill/blob/master/LICENSE
+
+  # The following function is also based on 'save_codeobject' from 'cloudpickle'
+  # Copyright (c) 2012, Regents of the University of California.
+  # Copyright (c) 2009 `PiCloud, Inc. <http://www.picloud.com>`_.
+  # License: 3-clause BSD.  The full license text is available at:
+  #  - https://github.com/cloudpipe/cloudpickle/blob/master/LICENSE
+
+  from types import CodeType
+
+  @dill.register(CodeType)
+  def save_code(pickler, obj):
+    co_filename = get_normalized_path(obj.co_filename)
+    if hasattr(obj, "co_endlinetable"):  # python 3.11a (20 args)
+      args = (
+          obj.co_argcount,
+          obj.co_posonlyargcount,
+          obj.co_kwonlyargcount,
+          obj.co_nlocals,
+          obj.co_stacksize,
+          obj.co_flags,
+          obj.co_code,
+          obj.co_consts,
+          obj.co_names,
+          obj.co_varnames,
+          co_filename,
+          obj.co_name,
+          obj.co_qualname,
+          obj.co_firstlineno,
+          obj.co_linetable,
+          obj.co_endlinetable,
+          obj.co_columntable,
+          obj.co_exceptiontable,
+          obj.co_freevars,
+          obj.co_cellvars)
+    elif hasattr(obj, "co_exceptiontable"):  # python 3.11 (18 args)
+      args = (
+          obj.co_argcount,
+          obj.co_posonlyargcount,
+          obj.co_kwonlyargcount,
+          obj.co_nlocals,
+          obj.co_stacksize,
+          obj.co_flags,
+          obj.co_code,
+          obj.co_consts,
+          obj.co_names,
+          obj.co_varnames,
+          co_filename,
+          obj.co_name,
+          obj.co_qualname,
+          obj.co_firstlineno,
+          obj.co_linetable,
+          obj.co_exceptiontable,
+          obj.co_freevars,
+          obj.co_cellvars)
+    elif hasattr(obj, "co_linetable"):  # python 3.10 (16 args)
+      args = (
+          obj.co_argcount,
+          obj.co_posonlyargcount,
+          obj.co_kwonlyargcount,
+          obj.co_nlocals,
+          obj.co_stacksize,
+          obj.co_flags,
+          obj.co_code,
+          obj.co_consts,
+          obj.co_names,
+          obj.co_varnames,
+          co_filename,
+          obj.co_name,
+          obj.co_firstlineno,
+          obj.co_linetable,
+          obj.co_freevars,
+          obj.co_cellvars)
+    elif hasattr(obj, "co_posonlyargcount"):  # python 3.8 (16 args)
+      args = (
+          obj.co_argcount,
+          obj.co_posonlyargcount,
+          obj.co_kwonlyargcount,
+          obj.co_nlocals,
+          obj.co_stacksize,
+          obj.co_flags,
+          obj.co_code,
+          obj.co_consts,
+          obj.co_names,
+          obj.co_varnames,
+          co_filename,
+          obj.co_name,
+          obj.co_firstlineno,
+          obj.co_lnotab,
+          obj.co_freevars,
+          obj.co_cellvars)
+    else:  # python 3.7 (15 args)
+      args = (
+          obj.co_argcount,
+          obj.co_kwonlyargcount,
+          obj.co_nlocals,
+          obj.co_stacksize,
+          obj.co_flags,
+          obj.co_code,
+          obj.co_consts,
+          obj.co_names,
+          obj.co_varnames,
+          obj.co_filename,
+          obj.co_name,
+          obj.co_firstlineno,
+          obj.co_lnotab,
+          obj.co_freevars,
+          obj.co_cellvars)
+    pickler.save_reduce(CodeType, args, obj=obj)
+
+  dill._dill.save_code = save_code
 
 
 class _NoOpContextManager(object):
@@ -69,6 +193,12 @@ if not getattr(dill, 'dill', None):
 if not getattr(dill, '_dill', None):
   dill._dill = dill.dill
   sys.modules['dill._dill'] = dill.dill
+
+dill_log = getattr(dill.dill, 'log', None)
+
+# dill v0.3.6 changed the attribute name from 'log' to 'logger'
+if not dill_log:
+  dill_log = getattr(dill.dill, 'logger')
 
 
 def _is_nested_class(cls):
@@ -96,6 +226,14 @@ def _find_containing_class(nested_class):
         if res: return res
 
   return _find_containing_class_inner(sys.modules[nested_class.__module__])
+
+
+def _dict_from_mappingproxy(mp):
+  d = mp.copy()
+  d.pop('__dict__', None)
+  d.pop('__prepare__', None)
+  d.pop('__weakref__', None)
+  return d
 
 
 def _nested_type_wrapper(fun):
@@ -130,7 +268,7 @@ def _nested_type_wrapper(fun):
               type(obj),
               obj.__name__,
               obj.__bases__,
-              dill.dill._dict_from_dictproxy(obj.__dict__)),
+              _dict_from_mappingproxy(obj.__dict__)),
           obj=obj)
       # pylint: enable=protected-access
 
@@ -167,17 +305,17 @@ if 'save_module' in dir(dill.dill):
     if dill.dill.is_dill(pickler) and obj is pickler._main:
       return old_save_module(pickler, obj)
     else:
-      dill.dill.log.info('M2: %s' % obj)
+      dill_log.info('M2: %s' % obj)
       # pylint: disable=protected-access
-      pickler.save_reduce(dill.dill._import_module, (obj.__name__, ), obj=obj)
+      pickler.save_reduce(
+          dill.dill._import_module, (obj.__name__, ), obj=obj)
       # pylint: enable=protected-access
-      dill.dill.log.info('# M2')
+      dill_log.info('# M2')
 
   # Pickle module dictionaries (commonly found in lambda's globals)
   # by referencing their module.
   old_save_module_dict = dill.dill.save_module_dict
-  known_module_dicts = {
-  }  # type: Dict[int, Tuple[types.ModuleType, Dict[str, Any]]]
+  known_module_dicts: Dict[int, Tuple[types.ModuleType, Dict[str, Any]]] = {}
 
   @dill.dill.register(dict)
   def new_save_module_dict(pickler, obj):
@@ -222,7 +360,7 @@ if 'save_module' in dir(dill.dill):
 
     Useful for debugging pickling of deeply nested structures.
     """
-    old_log_info = dill.dill.log.info
+    old_log_info = dill_log.info
 
     def new_log_info(msg, *args, **kwargs):
       old_log_info(
@@ -230,18 +368,25 @@ if 'save_module' in dir(dill.dill):
           *args,
           **kwargs)
 
-    dill.dill.log.info = new_log_info
+    dill_log.info = new_log_info
 
 
 # Turn off verbose logging from the dill pickler.
 logging.getLogger('dill').setLevel(logging.WARN)
 
 
-def dumps(o, enable_trace=True, use_zlib=False):
-  # type: (...) -> bytes
-
+def dumps(
+    o,
+    enable_trace=True,
+    use_zlib=False,
+    enable_best_effort_determinism=False) -> bytes:
   """For internal use only; no backwards-compatibility guarantees."""
   with _pickle_lock:
+    if enable_best_effort_determinism:
+      old_save_set = dill.dill.Pickler.dispatch[set]
+      old_save_frozenset = dill.dill.Pickler.dispatch[frozenset]
+      dill.dill.pickle(set, save_set)
+      dill.dill.pickle(frozenset, save_frozenset)
     try:
       s = dill.dumps(o, byref=settings['dill_byref'])
     except Exception:  # pylint: disable=broad-except
@@ -252,6 +397,9 @@ def dumps(o, enable_trace=True, use_zlib=False):
         raise
     finally:
       dill.dill._trace(False)  # pylint: disable=protected-access
+      if enable_best_effort_determinism:
+        dill.dill.pickle(set, old_save_set)
+        dill.dill.pickle(frozenset, old_save_frozenset)
 
   # Compress as compactly as possible (compresslevel=9) to decrease peak memory
   # usage (of multiple in-memory copies) and to avoid hitting protocol buffer

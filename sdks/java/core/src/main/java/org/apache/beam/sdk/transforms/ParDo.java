@@ -17,7 +17,7 @@
  */
 package org.apache.beam.sdk.transforms;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import java.io.Serializable;
 import java.lang.reflect.ParameterizedType;
@@ -65,7 +65,7 @@ import org.apache.beam.sdk.values.PValue;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TupleTagList;
 import org.apache.beam.sdk.values.TypeDescriptor;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableMap;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
@@ -446,8 +446,8 @@ public class ParDo {
     } catch (Coder.NonDeterministicException exc) {
       throw new IllegalArgumentException(
           String.format(
-              "%s requires a deterministic key coder in order to use state and timers",
-              ParDo.class.getSimpleName()));
+              "%s requires a deterministic key coder in order to use state and timers, the reason is:%n %s",
+              ParDo.class.getSimpleName(), exc.getMessage()));
     }
   }
 
@@ -1063,6 +1063,11 @@ public class ParDo {
           @Override
           public String dispatchSet(Coder<?> elementCoder) {
             return "SetState<" + elementCoder + ">";
+          }
+
+          @Override
+          public String dispatchMultimap(Coder<?> keyCoder, Coder<?> valueCoder) {
+            return "MultimapState<" + keyCoder + ", " + valueCoder + ">";
           }
         });
   }

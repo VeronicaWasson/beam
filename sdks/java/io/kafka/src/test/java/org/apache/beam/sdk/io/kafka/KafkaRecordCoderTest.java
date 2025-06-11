@@ -35,9 +35,6 @@ import org.junit.runners.JUnit4;
 
 /** Tests for {@link KafkaRecordCoder}. */
 @RunWith(JUnit4.class)
-@SuppressWarnings({
-  "rawtypes" // TODO(https://github.com/apache/beam/issues/20447)
-})
 public class KafkaRecordCoderTest {
   @Test
   public void testCoderIsSerializableWithWellKnownCoderType() {
@@ -54,8 +51,15 @@ public class KafkaRecordCoderTest {
 
   @Test
   public void testKafkaRecordSerializableWithoutHeaders() throws IOException {
-    ConsumerRecord consumerRecord = new ConsumerRecord<>("", 0, 0L, "", "");
+    ConsumerRecord<String, String> consumerRecord = new ConsumerRecord<>("", 0, 0L, "", "");
     verifySerialization(consumerRecord.headers());
+  }
+
+  @Test
+  public void testKafkaRecordSerializableWithNullValueHeader() throws IOException {
+    RecordHeaders headers = new RecordHeaders();
+    headers.add("headerKey", null);
+    verifySerialization(headers);
   }
 
   private void verifySerialization(Headers headers) throws IOException {
@@ -64,7 +68,7 @@ public class KafkaRecordCoderTest {
             "topic", 0, 0, 0, KafkaTimestampType.CREATE_TIME, headers, "key", "value");
 
     ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-    KafkaRecordCoder kafkaRecordCoder =
+    KafkaRecordCoder<String, String> kafkaRecordCoder =
         KafkaRecordCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of());
 
     kafkaRecordCoder.encode(kafkaRecord, outputStream);

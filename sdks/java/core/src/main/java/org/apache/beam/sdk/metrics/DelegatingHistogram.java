@@ -18,6 +18,7 @@
 package org.apache.beam.sdk.metrics;
 
 import java.io.Serializable;
+import java.util.Optional;
 import org.apache.beam.sdk.annotations.Internal;
 import org.apache.beam.sdk.util.HistogramData;
 
@@ -28,6 +29,12 @@ public class DelegatingHistogram implements Metric, Histogram, Serializable {
   private final HistogramData.BucketType bucketType;
   private final boolean processWideContainer;
 
+  /**
+   * @param name Metric name for this metric.
+   * @param bucketType Histogram bucketing strategy.
+   * @param processWideContainer Whether this Counter is stored in the ProcessWide container or the
+   *     current thread's container.
+   */
   public DelegatingHistogram(
       MetricName name, HistogramData.BucketType bucketType, boolean processWideContainer) {
     this.name = name;
@@ -35,15 +42,25 @@ public class DelegatingHistogram implements Metric, Histogram, Serializable {
     this.processWideContainer = processWideContainer;
   }
 
-  @Override
-  public void update(double value) {
+  private Optional<Histogram> getHistogram() {
     MetricsContainer container =
         processWideContainer
             ? MetricsEnvironment.getProcessWideContainer()
             : MetricsEnvironment.getCurrentContainer();
-    if (container != null) {
-      container.getHistogram(name, bucketType).update(value);
+    if (container == null) {
+      return Optional.empty();
     }
+    return Optional.of(container.getHistogram(name, bucketType));
+  }
+
+  @Override
+  public void update(double value) {
+    getHistogram().ifPresent(histogram -> histogram.update(value));
+  }
+
+  @Override
+  public void update(double... values) {
+    getHistogram().ifPresent(histogram -> histogram.update(values));
   }
 
   @Override
