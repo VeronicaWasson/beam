@@ -14,6 +14,10 @@ jobs:
       - name: Get changed files
         id: changed-files
         uses: tj-actions/changed-files@ed68ef82c095e0d48ec87eccea555d944a631a4c # v46
+        with:
+          files: |
+            **.md
+          
       # NOTE: `since_last_remote_commit: true` is implied by default and falls back to the previous local commit.
 
       - name: List all changed files
